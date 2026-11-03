@@ -1,0 +1,224 @@
+# ============================================================
+# MyEmail — .gitignore
+#
+# 原则：仓库只跟踪「源码 + 构建必需的输入 + 项目文档」。
+#       构建产物、本地运行状态、打包产物、密钥一律不入库。
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. 显式保留（放在最前，防止下方宽泛规则误伤源码）
+#    Git 的规则是「后匹配者胜」，所以下面各节仍可覆盖这些保留项。
+# ------------------------------------------------------------
+!/Cargo.toml
+!/Cargo.lock
+!/rust-toolchain.toml
+!/deny.toml
+!/crates/**
+!/assets/fonts/cjk-subset.ttf
+!/assets/fonts/OFL.txt
+!/doc/**
+!/scripts/**
+!/tests/**
+!/.github/**
+
+
+# ------------------------------------------------------------
+# 1. Rust / Cargo 构建产物
+# ------------------------------------------------------------
+/target/
+**/target/
+**/incremental/
+**/deps/
+*.rs.bk
+*.rsorig
+*.profraw
+*.profdata
+*.pdb
+*.dll
+*.exe
+*.lib
+*.rlib
+*.rmeta
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+*.gcda
+*.gcno
+
+# Cargo.lock 本身必须入库：本项目发布二进制应用，
+# 锁文件用于锁定可复现的依赖版本（配合 deny.toml 与 CI 的 cargo-deny）。
+# 若将来拆出纯库 crate，再为该 crate 单独加 !Cargo.lock 规则。
+
+# 本地 Cargo 配置（可能含私有源与凭证）
+/.cargo/config.toml.local
+/.cargo/credentials.toml
+/.cargo/credentials
+
+
+# ------------------------------------------------------------
+# 2. 打包与发布产物
+# ------------------------------------------------------------
+/dist/
+/release/
+/installer/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.msi
+*.msix
+*.appx
+*.appinstaller
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.pkg
+
+# 字体子集生成脚本的中间产物（scripts/build-cjk-subset.py）
+/scripts/NotoSansSC-Regular.ttf
+
+
+# ------------------------------------------------------------
+# 3. 本地运行数据（数据库 / 缓存 / 索引）
+# ------------------------------------------------------------
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db3
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlitedb
+/test-data/
+/tests/tmp/
+*.idx
+*.index
+
+
+# ------------------------------------------------------------
+# 4. 密钥、证书与本地私有配置
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+secrets.json
+secrets.toml
+credentials.json
+credentials.toml
+service-account*.json
+*.ovpn
+
+
+# ------------------------------------------------------------
+# 5. 日志与临时文件
+# ------------------------------------------------------------
+*.log
+/logs/
+tmp/
+temp/
+.cache/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+
+# ------------------------------------------------------------
+# 6. IDE / 编辑器状态
+# ------------------------------------------------------------
+/.vscode/
+/.idea/
+/.fleet/
+/.zed/
+*.iml
+*.ipr
+*.iws
+*.code-workspace
+.history/
+.vs/
+.nvim.log
+
+
+# ------------------------------------------------------------
+# 7. 操作系统垃圾文件
+# ------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.stackdump
+*.dmp
+*.core
+
+
+# ------------------------------------------------------------
+# 8. 测试覆盖率与性能分析
+# ------------------------------------------------------------
+/coverage/
+/lcov.info
+/tarpaulin-report.html
+*.lcov
+/codecov*.json
+/playwright-report/
+/test-results/
+
+
+# ------------------------------------------------------------
+# 9. Python 辅助脚本产物（scripts/build-cjk-subset.py）
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+
+# ------------------------------------------------------------
+# 10. Agent / 评审工具的本地状态（不属于源码）
+#     这些目录保留在本地，只是不入库。
+# ------------------------------------------------------------
+/.review/
+/.workbuddy/
+/.claude/
+/.codex/
+/.cursor/
+/.gemini/
+/.aider*
+/.plan/
+/plans/
