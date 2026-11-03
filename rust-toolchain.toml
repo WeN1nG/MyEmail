@@ -1,0 +1,7 @@
+# 固定到本机已安装的 stable（当前 rustc 1.99.1，2026-10-13）。
+# 不写死具体版本号：镜像上不存在 1.99.1 的独立 toolchain 包，写死会导致 rustup 尝试下载失败。
+# CI 与本机漂移由 Cargo.lock + CI 镜像控制。
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

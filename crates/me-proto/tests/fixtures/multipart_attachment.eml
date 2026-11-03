@@ -1,0 +1,21 @@
+From: =?UTF-8?B?5byg5LiJ?= <zhang@example.com>
+To: "Doe, John" <john@example.com>
+Cc: carol@example.com
+Subject: =?UTF-8?B?5Lit5paH5Li76aKY?=
+Date: Tue, 02 Jan 2024 12:30:00 +0800
+Message-ID: <multi-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUND"
+
+--BOUND
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+正文正文
+--BOUND
+Content-Type: application/pdf; name="report.pdf"
+Content-Disposition: attachment; filename="report.pdf"
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQK
+--BOUND--

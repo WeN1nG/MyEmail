@@ -1,0 +1,42 @@
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Only fail on unmaintained crates that are direct workspace dependencies.
+# Transitive Linux D-Bus/font crates are tracked upstream.
+unmaintained = "workspace"
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+# Internal workspace/path dependencies are intentionally versionless.
+# Registry dependencies are still pinned by Cargo.lock.
+wildcards = "allow"
+deny = [
+    # Protocol stack uses rustls only; OpenSSL / native-tls are forbidden.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

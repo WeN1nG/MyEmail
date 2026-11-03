@@ -1,0 +1,8 @@
+From: no-date@example.com
+To: receiver@example.com
+Subject: Missing Date
+Message-ID: <no-date-1@example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+No Date header here.

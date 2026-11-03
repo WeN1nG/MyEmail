@@ -1,0 +1,45 @@
+[package]
+name = "me-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MyEmail eframe desktop application"
+
+[[bin]]
+name = "myemail"
+path = "src/main.rs"
+
+[dependencies]
+me-core = { workspace = true }
+me-store = { workspace = true }
+me-sync = { workspace = true }
+eframe = { workspace = true }
+egui_extras = { workspace = true }
+rfd = { workspace = true }
+fs2 = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+base64 = { workspace = true }
+image = { workspace = true }
+resvg = { workspace = true }
+scraper = { workspace = true }
+cssparser = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+tokio = { workspace = true }
+dirs = { workspace = true }
+rodio = { workspace = true }
+symphonia = { workspace = true }
+walkdir = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,13 @@
+services:
+  greenmail:
+    image: greenmail/standalone:latest
+    environment:
+      # 3143 = IMAP, 3025 = SMTP；明文端口仅用于本机端到端测试。
+      GREENMAIL_OPTS: >-
+        -Dgreenmail.setup.test.all
+        -Dgreenmail.hostname=0.0.0.0
+        -Dgreenmail.users=alice:secret@example.com
+        -Dgreenmail.verbose
+    ports:
+      - "127.0.0.1:3025:3025"
+      - "127.0.0.1:3143:3143"

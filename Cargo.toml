@@ -1,0 +1,107 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/me-core",
+    "crates/me-proto",
+    "crates/me-store",
+    "crates/me-sync",
+    "crates/me-app",
+]
+
+[workspace.package]
+version = "0.3.0-dev"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[workspace.dependencies]
+me-core = { path = "crates/me-core" }
+me-proto = { path = "crates/me-proto" }
+me-store = { path = "crates/me-store" }
+me-sync = { path = "crates/me-sync" }
+
+# --- 通用 ---
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+chrono = { version = "0.4.45", features = ["clock"] }
+chrono-tz = "0.10.4"
+base64 = "0.23.1"
+futures-util = "0.3.34"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2", "stream", "gzip"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+resvg = { version = "0.49.0", default-features = false, features = ["text", "system-fonts"] }
+scraper = "0.29.0"
+cssparser = "0.38.0"
+url = "2.5.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.26.1", features = ["v4"] }
+anyhow = "1.0.104"
+rand = "0.8.8"
+sha2 = "0.10.9"
+
+# --- 异步 ---
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "net", "io-util"] }
+tokio-util = { version = "0.7.20", features = ["rt"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
+
+# --- 协议 ---
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+lettre = { version = "0.11.23", default-features = false, features = [
+    "builder",
+    "hostname",
+    "pool",
+    "smtp-transport",
+    "rustls-tls",
+    "tokio1",
+    "tokio1-rustls-tls",
+] }
+mail-parser = { version = "0.11.9", features = ["full_encoding"] }
+html2text = "0.17.4"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0.11"
+rustls-native-certs = "0.8.5"
+
+# --- 存储 ---
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+r2d2 = "0.8.10"
+r2d2_sqlite = "0.35.0"
+flate2 = "1.1.10"
+dirs = "7.0.0"
+
+# --- 编排 / 应用 ---
+keyring = "3.6.3"
+eframe = "0.32.3"
+egui_extras = "0.32.3"
+rfd = "0.17.2"
+fs2 = "0.4.3"
+tracing-appender = "0.2.5"
+
+# --- 音频（仅 me-app）---
+# 只开播放与四种目标格式：默认特性还会带 mp4/aac/isomp4/noise/recording，
+# 既增加体积也不在本版本功能范围内。
+rodio = { version = "0.23.0", default-features = false, features = [
+    "playback",
+    "symphonia-mp3",
+    "symphonia-flac",
+    "symphonia-wav",
+    "symphonia-pcm",
+    "symphonia-ogg",
+    "symphonia-vorbis",
+] }
+# 读标签与内嵌封面。与 rodio 自带的是同一份（版本、编码特性完全对齐），
+# 因此不额外下载、不额外编译任何 crate。
+symphonia = { version = "0.5.5", default-features = false, features = [
+    "mp3",
+    "flac",
+    "wav",
+    "pcm",
+    "ogg",
+    "vorbis",
+] }
+walkdir = "2.5.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,8 @@
+From: broken
+To:
+Subject: =?UTF-8?B?invalid base64 !!!?=
+Date: not a date
+Message-ID: <<<broken
+Content-Type: text/plain; charset=utf-8
+
+Body with broken headers.

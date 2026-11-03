@@ -1,0 +1,9 @@
+From: sender@example.com
+To: receiver@example.com
+Subject: HTML only
+Date: Wed, 03 Jan 2024 09:15:00 +0000
+Message-ID: <html-1@example.com>
+MIME-Version: 1.0
+Content-Type: text/html; charset=utf-8
+
+<html><body><h1>Hello</h1><p>HTML body text.</p></body></html>
