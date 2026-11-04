@@ -8,9 +8,11 @@
 //! - 城市名与坐标不写日志；
 //! - 失败时保留旧快照，界面显示缓存而不是空白。
 //!
-//! 额度约束：只有**默认地点**会被自动刷新；最小间隔 60 秒；连续失败后按
-//! 30s → 2min → 5min 退避，三次后停止自动重试（手动刷新仍可用）。
+//! 额度约束：最小间隔与退避**按地点分别计算**——某个城市连续失败不能拖累
+//! 其他城市，刚刷新完一个城市也不该挡住切换到另一个城市。
+//! 三次后停止自动重试（手动刷新仍可用）。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use me_core::weather::{
@@ -31,22 +33,50 @@ const BACKOFF_SECS: [i64; 3] = [30, 120, 300];
 /// 连续失败多少次后不再自动重试。
 const MAX_AUTO_RETRIES: u32 = 3;
 
+/// 单个地点的运行时状态。
+///
+/// **按地点分别计算**：多地点时，某城失败后的退避不该让其他城市也退避，
+/// 刚刷新完一个城市也不该把切换到另一个城市的请求挡在最小间隔之外。
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct LocationRuntime {
+    /// 该地点是否有刷新在途（同一地点单飞）。
+    pub(crate) refreshing: bool,
+    /// 连续失败次数（决定退避时长）。
+    pub(crate) failures: u32,
+    /// 退避截止时间（UTC 秒）。
+    pub(crate) backoff_until: i64,
+    /// 最近一次请求时间（UTC 秒），用于最小间隔。
+    pub(crate) last_request_at: i64,
+}
+
 /// 会话内的天气运行时状态。
 pub(crate) struct WeatherState {
     /// keyring 不可用时的会话内存 Key。
     pub(crate) credential: Option<WeatherCredential>,
+    /// 当前生效的 API Host（已规范化为 `https://host[:port]`）。
+    ///
+    /// Host 是**每次请求的参数**（见 `WeatherProvider`），存在这里是为了
+    /// 让「当前该用哪个 Host」有唯一来源：启动时从 `meta` 读回，
+    /// 用户改配置时更新。
+    pub(crate) api_host: String,
     /// 最近一次搜索的 `request_id`；更早的结果一律丢弃。
     pub(crate) last_search_id: u64,
-    /// 连续失败次数。
-    pub(crate) failures: u32,
-    /// 退避截止时间（UTC 秒）。
-    pub(crate) backoff_until: i64,
-    /// 最近一次成功请求的时间（用于最小间隔）。
-    pub(crate) last_request_at: i64,
-    /// 两次请求之间的最小间隔（秒）。默认 60；测试可调小。
+    /// 两次刷新请求之间的最小间隔（秒）。默认 60；测试可调小。
     pub(crate) min_interval_secs: i64,
-    /// 正在刷新的地点（单飞）。
-    pub(crate) refreshing: Option<WeatherLocationId>,
+    /// 每个地点各自的运行时状态（单飞 / 退避 / 最小间隔）。
+    pub(crate) locations: HashMap<WeatherLocationId, LocationRuntime>,
+}
+
+impl WeatherState {
+    /// 取某地点的运行时状态（不存在时按默认值读，不写入）。
+    fn runtime(&self, id: WeatherLocationId) -> LocationRuntime {
+        self.locations.get(&id).copied().unwrap_or_default()
+    }
+
+    /// 取某地点的运行时状态（不存在则插入默认值）。
+    fn runtime_mut(&mut self, id: WeatherLocationId) -> &mut LocationRuntime {
+        self.locations.entry(id).or_default()
+    }
 }
 
 /// 取天气数据源（未配置时返回 `None`）。
@@ -68,12 +98,10 @@ impl Default for WeatherState {
     fn default() -> Self {
         Self {
             credential: None,
+            api_host: me_core::DEFAULT_API_HOST.to_string(),
             last_search_id: 0,
-            failures: 0,
-            backoff_until: 0,
-            last_request_at: 0,
             min_interval_secs: MIN_REFRESH_INTERVAL_SECS,
-            refreshing: None,
+            locations: HashMap::new(),
         }
     }
 }
@@ -151,15 +179,16 @@ where
         Some(credential)
     }
 
-    /// 保存 Host。校验通过后写 `meta` 并重建数据源。
+    /// 保存 Host。校验通过后写 `meta` 并更新会话状态。
     /// 保存天气配置：**一个 Host** + 可选的 API Key。
     ///
     /// `key` 为 `None` 表示「只改 Host，不动已保存的 Key」。
     pub(crate) async fn set_weather_config(&self, host: String, key: Option<String>) {
-        let api = match me_proto::qweather::validate_host(&host) {
+        // Host 规范化：用户填裸域名即可，程序自己补 https://。
+        let api = match me_core::weather::normalize_host(&host) {
             Ok(host) => host,
             Err(err) => {
-                self.fail_weather(err.user_message(), false).await;
+                self.fail_weather(None, err.user_message(), false).await;
                 return;
             }
         };
@@ -168,12 +197,13 @@ where
         if let Some(key) = key {
             let trimmed = key.trim().to_string();
             if trimmed.is_empty() {
-                self.fail_weather("API Key 不能为空".to_string(), false)
+                self.fail_weather(None, "API Key 不能为空".to_string(), false)
                     .await;
                 return;
             }
             if trimmed.len() > MAX_API_KEY_LEN {
                 self.fail_weather(
+                    None,
                     format!("API Key 过长（最多 {MAX_API_KEY_LEN} 个字符）"),
                     false,
                 )
@@ -184,8 +214,10 @@ where
             if let Ok(mut state) = self.inner.weather_state.lock() {
                 state.credential = Some(WeatherCredential::new(trimmed));
                 // 换了 Key 之后重新计数，避免沿用旧的退避。
-                state.failures = 0;
-                state.backoff_until = 0;
+                for runtime in state.locations.values_mut() {
+                    runtime.failures = 0;
+                    runtime.backoff_until = 0;
+                }
             }
             self.emit(Event::WeatherKeyStored { persisted }).await;
         }
@@ -198,26 +230,21 @@ where
             })
             .await;
         if let Err(err) = stored {
-            self.fail_weather(err.user_message(), false).await;
+            self.fail_weather(None, err.user_message(), false).await;
             return;
         }
 
-        match me_proto::qweather::QWeatherProvider::with_host(&api) {
-            Ok(provider) => {
-                if let Ok(mut guard) = self.inner.weather_provider.write() {
-                    *guard = Some(Arc::new(provider));
-                }
-                let key_present = self.weather_credential().await.is_some();
-                self.emit(Event::WeatherConfigChanged {
-                    key_present,
-                    api_host: api,
-                })
-                .await;
-            }
-            Err(err) => {
-                self.fail_weather(err.user_message(), false).await;
-            }
+        // 更新会话里的生效 Host：之后每次请求都用它。
+        if let Ok(mut state) = self.inner.weather_state.lock() {
+            state.api_host = api.clone();
         }
+
+        let key_present = self.weather_credential().await.is_some();
+        self.emit(Event::WeatherConfigChanged {
+            key_present,
+            api_host: api,
+        })
+        .await;
     }
 
     /// 测试连接：用给定的 Host 与 Key 发一次真实请求。
@@ -227,7 +254,9 @@ where
     ///
     /// 探测端点用城市搜索（一个 GET 就够），比拉整套预报省额度。
     pub(crate) async fn test_weather_connection(&self, host: String, key: String) {
-        let api = match me_proto::qweather::validate_host(&host) {
+        // 用**用户当场填的 Host**（而不是会话里已生效的那个）——
+        // 否则测的就不是用户想测的地址了。
+        let api = match me_core::weather::normalize_host(&host) {
             Ok(host) => host,
             Err(err) => {
                 self.emit(Event::WeatherConnectionTested {
@@ -265,9 +294,9 @@ where
             .and_then(|guard| guard.clone());
         let credential = WeatherCredential::new(trimmed);
         let result = match injected {
-            Some(provider) => provider.search_locations("北京", &credential).await,
-            None => match me_proto::qweather::QWeatherProvider::with_host(&api) {
-                Ok(provider) => provider.search_locations("北京", &credential).await,
+            Some(provider) => provider.search_locations(&api, "北京", &credential).await,
+            None => match me_proto::qweather::QWeatherProvider::new() {
+                Ok(provider) => provider.search_locations(&api, "北京", &credential).await,
                 Err(err) => {
                     self.emit(Event::WeatherConnectionTested {
                         ok: false,
@@ -289,6 +318,15 @@ where
         };
         self.emit(Event::WeatherConnectionTested { ok, message })
             .await;
+    }
+
+    /// 当前生效的 API Host（已规范化）。
+    fn api_host(&self) -> String {
+        self.inner
+            .weather_state
+            .lock()
+            .map(|state| state.api_host.clone())
+            .unwrap_or_else(|_| me_core::DEFAULT_API_HOST.to_string())
     }
 
     /// 写系统密钥库。返回是否持久化成功（失败时只保留在会话内存）。
@@ -319,22 +357,26 @@ where
         let query = match validate_query(&query) {
             Ok(query) => query,
             Err(err) => {
-                self.fail_weather(err.user_message(), false).await;
+                self.fail_weather(None, err.user_message(), false).await;
                 return;
             }
         };
         let Some(provider) = provider(self) else {
-            self.fail_weather("天气服务尚未初始化".to_string(), false)
+            self.fail_weather(None, "天气服务尚未初始化".to_string(), false)
                 .await;
             return;
         };
         let Some(credential) = self.weather_credential().await else {
-            self.fail_weather("请先配置和风天气 API Key".to_string(), false)
+            self.fail_weather(None, "请先配置和风天气 API Key".to_string(), false)
                 .await;
             return;
         };
+        let api_host = self.api_host();
 
-        match provider.search_locations(&query, &credential).await {
+        match provider
+            .search_locations(&api_host, &query, &credential)
+            .await
+        {
             Ok(candidates) => {
                 // 结果回来时再确认一次 request_id 仍是最新。
                 let stale = self
@@ -353,7 +395,7 @@ where
                 .await;
             }
             Err(err) => {
-                self.fail_weather(err.user_message(), false).await;
+                self.fail_weather(None, err.user_message(), false).await;
             }
         }
     }
@@ -361,7 +403,7 @@ where
     /// 添加地点。
     pub(crate) async fn add_weather_location(&self, candidate: WeatherLocationCandidate) {
         if let Err(err) = validate_candidate(&candidate) {
-            self.fail_weather(err.user_message(), false).await;
+            self.fail_weather(None, err.user_message(), false).await;
             return;
         }
         let result = self
@@ -370,13 +412,13 @@ where
         match result {
             Ok(location) => {
                 self.emit(Event::WeatherLocationsChanged).await;
-                // 第一个地点即默认地点，直接刷新一次。
-                if location.is_default {
-                    self.refresh_weather(false).await;
-                }
+                // 新加的地点立刻拉一次：用户加它就是为了看它。
+                // （早先只在 `is_default` 时刷新，导致第二个及以后的地点
+                // 永远没有快照，界面读不出来。）
+                self.refresh_weather(location.id, false).await;
             }
             Err(err) => {
-                self.fail_weather(err.user_message(), false).await;
+                self.fail_weather(None, err.user_message(), false).await;
             }
         }
     }
@@ -387,7 +429,7 @@ where
             .db(move |store| store.remove_weather_location(id))
             .await;
         if let Err(err) = result {
-            self.fail_weather(err.user_message(), false).await;
+            self.fail_weather(Some(id), err.user_message(), false).await;
             return;
         }
         self.emit(Event::WeatherLocationsChanged).await;
@@ -399,26 +441,30 @@ where
             .db(move |store| store.set_default_weather_location(id))
             .await;
         if let Err(err) = result {
-            self.fail_weather(err.user_message(), false).await;
+            self.fail_weather(Some(id), err.user_message(), false).await;
             return;
         }
         self.emit(Event::WeatherLocationsChanged).await;
-        self.refresh_weather(false).await;
+        self.refresh_weather(id, false).await;
     }
 
-    /// 刷新默认地点的天气。
+    /// 刷新**指定地点**的天气。
     ///
-    /// `force` 只跳过「未过期直接复用」；最小间隔与「同一地点单飞」仍然生效。
-    pub(crate) async fn refresh_weather(&self, force: bool) {
-        let location = match self.db(|store| store.get_default_weather_location()).await {
+    /// `id` 指向要刷新的地点：多地点时每个地点各自持有快照，
+    /// 刷新其中一个不会影响其他地点。
+    ///
+    /// `force` 只跳过「未过期直接复用」；最小间隔与退避仍然生效
+    /// （两者都按地点分别计算）。
+    pub(crate) async fn refresh_weather(&self, id: WeatherLocationId, force: bool) {
+        let location = match self.db(move |store| store.get_weather_location(id)).await {
             Ok(Some(location)) => location,
             Ok(None) => {
-                self.fail_weather("还没有添加天气地点".to_string(), false)
+                self.fail_weather(Some(id), "该地点已被移除".to_string(), false)
                     .await;
                 return;
             }
             Err(err) => {
-                self.fail_weather(err.user_message(), false).await;
+                self.fail_weather(Some(id), err.user_message(), false).await;
                 return;
             }
         };
@@ -428,12 +474,13 @@ where
             let Ok(state) = self.inner.weather_state.lock() else {
                 return;
             };
+            let runtime = state.runtime(id);
             // 单飞：同一地点正在刷新时直接返回。
-            if state.refreshing == Some(location.id) {
+            if runtime.refreshing {
                 return;
             }
             // 退避中：自动刷新跳过，手动刷新仍然允许。
-            if !force && state.backoff_until > now {
+            if !force && runtime.backoff_until > now {
                 return;
             }
         }
@@ -458,15 +505,18 @@ where
         }
 
         // 最小间隔：手动刷新也遵守，避免把额度打光。
+        // 按地点分别计时，切换城市不会被上一个城市的请求挡住。
         let blocked = {
             let Ok(mut state) = self.inner.weather_state.lock() else {
                 return;
             };
-            if state.last_request_at > 0 && now - state.last_request_at < state.min_interval_secs {
+            let min_interval = state.min_interval_secs;
+            let runtime = state.runtime_mut(id);
+            if runtime.last_request_at > 0 && now - runtime.last_request_at < min_interval {
                 true
             } else {
-                state.refreshing = Some(location.id);
-                state.last_request_at = now;
+                runtime.refreshing = true;
+                runtime.last_request_at = now;
                 false
             }
         };
@@ -482,8 +532,12 @@ where
                     .await;
                 }
                 None => {
-                    self.fail_weather("刚刚更新过，请稍后再试".to_string(), false)
-                        .await;
+                    self.fail_weather(
+                        Some(location.id),
+                        "刚刚更新过，请稍后再试".to_string(),
+                        false,
+                    )
+                    .await;
                 }
             }
             return;
@@ -500,19 +554,20 @@ where
             let Ok(mut state) = self.inner.weather_state.lock() else {
                 return;
             };
-            state.refreshing = None;
+            let runtime = state.runtime_mut(id);
+            runtime.refreshing = false;
             match result {
                 Ok(snapshot) => {
-                    state.failures = 0;
-                    state.backoff_until = 0;
+                    runtime.failures = 0;
+                    runtime.backoff_until = 0;
                     Outcome::Updated(snapshot)
                 }
                 Err(err) => {
-                    state.failures = state.failures.saturating_add(1);
-                    let index = (state.failures as usize).saturating_sub(1);
+                    runtime.failures = runtime.failures.saturating_add(1);
+                    let index = (runtime.failures as usize).saturating_sub(1);
                     let backoff = BACKOFF_SECS[index.min(BACKOFF_SECS.len() - 1)];
-                    state.backoff_until = now + backoff;
-                    let failures = state.failures;
+                    runtime.backoff_until = now + backoff;
+                    let failures = runtime.failures;
                     let message = if failures >= MAX_AUTO_RETRIES {
                         format!(
                             "{}（连续失败 {} 次，请稍后手动重试）",
@@ -538,7 +593,8 @@ where
             }
             Outcome::Failed(message) => {
                 let has_cache = self.has_cache(location.id).await;
-                self.fail_weather(message, has_cache).await;
+                self.fail_weather(Some(location.id), message, has_cache)
+                    .await;
             }
         }
     }
@@ -556,7 +612,8 @@ where
 
         let location_id = location.id;
         let now = now_unix();
-        let forecast = provider.forecast(location, &credential).await?;
+        let api_host = self.api_host();
+        let forecast = provider.forecast(&api_host, location, &credential).await?;
         me_core::weather::validate_forecast(&forecast)?;
         let snapshot = WeatherSnapshot::new(PROVIDER_QWEATHER, now, forecast);
         let to_store = snapshot.clone();
@@ -575,7 +632,20 @@ where
     }
 
     /// 统一的失败出口。
-    async fn fail_weather(&self, message: String, has_cache: bool) {
-        self.emit(Event::WeatherFailed { message, has_cache }).await;
+    ///
+    /// `location_id` 指出是哪个地点失败的；`None` 表示与地点无关的全局失败
+    /// （如 Host 非法、没配 API Key）。
+    async fn fail_weather(
+        &self,
+        location_id: Option<WeatherLocationId>,
+        message: String,
+        has_cache: bool,
+    ) {
+        self.emit(Event::WeatherFailed {
+            location_id,
+            message,
+            has_cache,
+        })
+        .await;
     }
 }

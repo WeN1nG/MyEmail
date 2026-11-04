@@ -49,6 +49,11 @@ cargo deny check
 # release 构建（lto=thin，codegen-units=1）
 cargo build --release -p me-app
 
+# 发布（dist/v03 三个产物 + 发布前泄露自检）
+bash .workbuddy/build_retry.sh    # 带 --remap-path-prefix，隐藏构建机路径
+python .workbuddy/pack_v03.py     # 生成 myemail.exe + v03code.zip
+python .workbuddy/check_leak.py   # 阻塞任何夹带本机标识/凭据/真实数据的产物
+
 # OAuth 客户端：仅构建期注入，密钥不进仓库
 # 未注入时，可在高级设置写 meta oauth_client_google / oauth_client_microsoft 覆盖 client_id/tenant；
 # client_secret 无法在运行时覆盖。
@@ -126,6 +131,9 @@ me-app ──Command/Event──► me-sync ──► me-proto
   - [views/html/](crates/me-app/src/views/html/) 是 v2 渲染器：`scraper` 解析 HTML5 DOM，`css.rs` 处理 CSS 子集与选择器优先级，`parse.rs` 清洗并生成扁平 `RenderedHtml`（保留 `inline-block` 列容器、`Section` 盒样式与表格单元格 padding），`layout.rs` 是排版引擎（按内容宽度测量块/行/单元格矩形，`LayoutJob` 整段断行、`line-height`/字距/逐行对齐、真实 `rowspan`/`colspan` 网格、图片占位），`mod.rs` 负责后台并发解析（`spawn_blocking`，并发 2）与结果模型。解析任务按 generation 丢弃旧结果；节点 ≤50k、深度 ≤128、文本 ≤2MB，超限/异常回退到 v0.1 的 `richtext` 子集。
   - 音频与日历（v0.3）：[audio/](crates/me-app/src/audio/) 是音乐播放器——`walkdir` 扫描、rodio 解码、独立音频线程（状态 250ms 回传）、`symphonia` 读标签与内嵌封面（随 rodio 一起编译，不新增 crate）、`SpectrumTap` 在音频回调里采样并整块交接给 UI 做 FFT。频谱**不经 Command/Event**。
   - [views/calendar.rs](crates/me-app/src/views/calendar.rs) 与 [views/music.rs](crates/me-app/src/views/music.rs) 渲染日历与音乐页；两者都用「先 `allocate_space` 占整块、再用绝对 `Rect` 定位」而不是嵌套 panel（CentralPanel 内嵌的 `TopBottomPanel` 拿不到高度，`allocate_ui_with_layout` 会收缩父游标）。
+  - 天气页（[views/weather.rs](crates/me-app/src/views/weather.rs)）：**刷新以地点为单位**——`Command::RefreshWeather { id, force }` 带地点 id，`me-sync` 按地点分别计算单飞 / 60s 最小间隔 / 退避，每个地点各有一份快照。界面侧「当前地点」= 选中优先、否则默认地点；「刷新中」与失败提示也按地点分别记。侧栏地点行一行放齐：左「删除」· 中「名称」· 右「设置默认」，**按钮任何侧栏宽度下都要可见**。
+  - **侧栏横向行的宽度必须交给布局算**：`available_width()` 在 horizontal 布局里返回的是**父容器**的剩余宽度，不含本行已放元素的占位。手工按它减固定宽分配会漏掉元素间的 `item_spacing`（8px）→ 每帧溢出 → 面板 `min_rect` 变宽 → egui 持久化 → 下一帧再宽 8px → **正反馈**，面板一路涨到窗口边缘（`SidePanel` 宽度上限是 `f32::INFINITY`，拦不住）。行内剩余要用 `max_rect.right() - cursor.min.x`。这类缺陷只在**多帧**下暴露，必须补「真实容器 + 连跑多帧 + 断言尺寸不漂移」的回归测试。
+  - 天气候选的行政层级（[me-core/src/weather.rs](crates/me-core/src/weather.rs) 的 `location_title`）：和风天气的最小行政单位是**区/县/县级市**，`name` 是具体地点、`adm2` 是**上级城市**。搜「成都」会返回成都本级 + 锦江区/龙泉驿/都江堰市一串下辖区县（`adm2` 全是「成都」），所以标题必须是 `具体地点 · 上级城市 · 省`，同名层级只显示一次；请求带 `number=20` 以免截断。
 
 ## 必须保持的行为不变量
 
@@ -151,6 +159,7 @@ me-app ──Command/Event──► me-sync ──► me-proto
 | `crates/me-sync/tests/sync_mock.rs` | 真实 store + mock IMAP 的同步链路、去重、IDLE 触发同步 |
 | `crates/me-sync/tests/draft_sync_mock.rs` | 草稿推送/导入/冲突/墓碑删除 |
 | `crates/me-sync/tests/oauth_flow_mock.rs` | 回环授权回调、设备码 pending→token、重新授权 |
+| `crates/me-sync/tests/weather_flow.rs` | 天气用例：城市搜索、多地点各自取数、按地点刷新与退避、失败保留缓存 |
 | `crates/me-app/src/views/html/tests.rs` | HTML 清洗、CSS 子集、inline-block 结构、行高/对齐、表格跨度、宽度约束、URL 白名单、超限 |
 | `crates/me-sync/tests/e2e_real_imap.rs` | GreenMail 真实链路，默认 `#[ignore]` |
 | `crates/me-app/src/*` 内联 | 地址解析/校验、HTML 表格、远程图片 URL 校验 |

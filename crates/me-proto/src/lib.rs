@@ -22,5 +22,5 @@ pub use oauth::{
     BuildTimeClient, DeviceCodeResponse, DeviceTokenOutcome, OAuthClient, Pkce, ProviderConfig,
     TokenResponse, UserInfo, build_time_client, random_urlsafe,
 };
-pub use qweather::{QWeatherProvider, validate_host};
+pub use qweather::QWeatherProvider;
 pub use smtp::ProtoSmtp;

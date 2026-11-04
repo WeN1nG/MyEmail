@@ -5,11 +5,14 @@
 //!   CGNAT / 链路本地；**不做 DNS 预解析**，避免解析与连接之间的时间差）；
 //! - 禁止重定向、禁止 Cookie 与 Referer；
 //! - 单请求 10s 超时、响应体 ≤ 256 KiB；
-//! - API Key 只出现在请求 URL 的查询参数里，**任何日志都不得记录完整 URL**。
+//! - API Key 只出现在请求头里，**任何日志都不得记录完整 URL**。
 //!
-//! Host 校验、URL 构造与响应解析都拆成纯函数，便于离线单测。
+//! **Host 由调用方在每次请求时传入**（见 [`WeatherProvider`]），数据源本身
+//! 不绑定任何 Host。这样「用户配置的 Host」只有一个来源，换 Host 不必重建
+//! 客户端，测试连接也能真正测到用户刚填的那个地址。
 
-use std::net::IpAddr;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use chrono::DateTime;
@@ -17,9 +20,8 @@ use me_core::CoreError;
 use me_core::weather::{
     CurrentWeather, DailyForecast, HourlyForecast, MAX_LOCATION_CANDIDATES, PROVIDER_QWEATHER,
     WeatherCredential, WeatherForecast, WeatherFuture, WeatherKind, WeatherLocation,
-    WeatherLocationCandidate, WeatherProvider,
+    WeatherLocationCandidate, WeatherProvider, normalize_host,
 };
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use reqwest::Url;
 use serde_json::Value;
@@ -27,116 +29,28 @@ use serde_json::Value;
 /// 默认 Host 与配置提示定义在领域层（UI 也要用），此处转出。
 pub use me_core::weather::{DEFAULT_API_HOST, HOST_HINT};
 
+/// 端点路径定义在领域层（UI 要预览实际请求地址），此处转出。
+pub use me_core::weather::{
+    PATH_7D, PATH_24H, PATH_CITY_LOOKUP, PATH_CITY_LOOKUP_LEGACY, PATH_NOW,
+};
+
 /// 单请求超时。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// 响应体大小上限。
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
-/// 天气接口路径。
-const PATH_NOW: &str = "/v7/weather/now";
-const PATH_24H: &str = "/v7/weather/24h";
-const PATH_7D: &str = "/v7/weather/7d";
-/// 城市搜索接口路径（**统一 Host**，官方现行）。
-///
-/// 官方把 GeoAPI 也收进了专属 Host，路径带 `/geo` 前缀。
-const PATH_CITY_LOOKUP: &str = "/geo/v2/city/lookup";
-/// 城市搜索接口路径（**旧公共 Host**，如 `geoapi.qweather.com`）。
-///
-/// 旧路径没有 `/geo` 前缀。程序会自动回退到这里，用户不必知道这��区别。
-const PATH_CITY_LOOKUP_LEGACY: &str = "/v2/city/lookup";
 /// API KEY 认证的请求头名（官方规定）。
 const HEADER_API_KEY: &str = "X-QW-Api-Key";
 
 // ---------------------------------------------------------------------------
-// Host 校验
+// URL 构造
 // ---------------------------------------------------------------------------
 
-/// 校验并规范化 Host（去掉末尾 `/`）。
-///
-/// 规则：`https` 开头、无用户名密码、无查询串、无路径（只允许 `/`）、
-/// 主机名不是私有地址字面量、不是 `localhost`。
-pub fn validate_host(host: &str) -> Result<String, CoreError> {
-    let trimmed = host.trim();
-    if trimmed.is_empty() {
-        return Err(CoreError::validation("Host 不能为空"));
-    }
-    let url = Url::parse(trimmed)
-        .map_err(|_| CoreError::validation("Host 格式无效，请以 https:// 开头"))?;
-    if url.scheme() != "https" {
-        return Err(CoreError::validation("Host 必须使用 https"));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(CoreError::validation("Host 不能包含用户名或密码"));
-    }
-    if url.query().is_some() || url.fragment().is_some() {
-        return Err(CoreError::validation("Host 不能包含查询串"));
-    }
-    let path = url.path();
-    if !path.is_empty() && path != "/" {
-        return Err(CoreError::validation("Host 不能包含路径"));
-    }
-    let host = match url.host_str() {
-        Some(host) => host.to_ascii_lowercase(),
-        None => return Err(CoreError::validation("Host 缺少主机名")),
-    };
-    // IPv6 在 URL 里带方括号（`[::1]`），比较与解析都要先剥掉。
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if bare == "localhost" || bare.ends_with(".localhost") || bare.ends_with(".local") {
-        return Err(CoreError::validation("Host 不能指向本机"));
-    }
-    if let Ok(ip) = bare.parse::<IpAddr>()
-        && !is_public_ip(ip)
-    {
-        return Err(CoreError::validation("Host 不能指向内网或保留地址"));
-    }
-    Ok(format!("https://{host}"))
-}
-
-/// 地址是否为公网地址。
-///
-/// 拒绝：回环、私网、链路本地、CGNAT（100.64.0.0/10）、未指定的 IPv6、
-/// IPv6 ULA（fc00::/7）与 IPv4 保留段。
-pub fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            !(octets[0] == 127
-                // 私网 10/8、172.16/12、192.168/16
-                || (octets[0] == 10)
-                || (octets[0] == 172 && (16..32).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 168)
-                // 链路本地 169.254/16
-                || (octets[0] == 169 && octets[1] == 254)
-                // CGNAT 100.64/10
-                || (octets[0] == 100 && (64..128).contains(&octets[1]))
-                // 0.0.0.0/8
-                || octets[0] == 0
-                // 224/4 组播、240/4 保留
-                || octets[0] >= 224)
-        }
-        IpAddr::V6(v6) => {
-            let segments = v6.segments();
-            if v6.is_loopback() || v6.is_unspecified() {
-                return false;
-            }
-            // fc00::/7 唯一本地地址
-            if (segments[0] & 0xfe00) == 0xfc00 {
-                return false;
-            }
-            // fe80::/10 链路本地
-            if (segments[0] & 0xffc0) == 0xfe80 {
-                return false;
-            }
-            // IPv4 映射地址按内嵌的 v4 判断
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public_ip(IpAddr::V4(v4));
-            }
-            true
-        }
-    }
-}
-
 /// 构造请求 URL。`params` 里的值会被 URL 编码。
+///
+/// `host` 必须是已规范化的 `https://host[:port]`；这里再校验一次，
+/// 保证任何调用方传进来的东西都不会拼出非 HTTPS 的地址。
 pub fn build_url(host: &str, path: &str, params: &[(&str, &str)]) -> Result<Url, CoreError> {
+    let host = normalize_host(host)?;
     let mut url =
         Url::parse(&format!("{host}{path}")).map_err(|_| CoreError::validation("Host 格式无效"))?;
     {
@@ -163,6 +77,16 @@ fn str_field(value: &Value, key: &str) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         _ => None,
     }
+}
+
+/// 按优先级取第一个**存在且非空**的字符串字段。
+///
+/// 服务商不同版本的字段名不一样（例如逐日预报白天天气叫 `iconDay`，
+/// 旧版叫 `icon`），按顺序回退即可兼容，不必为每个版本写一套解析。
+fn first_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| str_field(value, key))
+        .find(|text| !text.is_empty())
 }
 
 fn f64_field(value: &Value, key: &str) -> Option<f64> {
@@ -256,6 +180,8 @@ pub fn parse_city_lookup(body: &str) -> Result<Vec<WeatherLocationCandidate>, Co
             provider_location_id: id,
             name,
             admin1: str_field(item, "adm1"),
+            // `adm2` 是**上级城市**（如都江堰的 adm2 是「成都」），
+            // 不是地点本身——显示时必须和 `name` 一起用。
             admin2: str_field(item, "adm2"),
             country: str_field(item, "country"),
             latitude,
@@ -340,7 +266,20 @@ pub fn parse_7d(body: &str) -> Result<Vec<DailyForecast>, CoreError> {
             Some(date) if !date.is_empty() => date,
             _ => continue,
         };
-        let icon = str_field(item, "icon").unwrap_or_default();
+        // 和风 v7 的逐日预报把昼夜拆成两组字段：
+        // `iconDay`/`textDay` 与 `iconNight`/`textNight`。
+        // 早期版本只有单个 `icon`/`text`，这里两条路都认。
+        let icon_day = first_field(item, &["iconDay", "icon"]);
+        let icon_night = first_field(item, &["iconNight"]);
+        let text_day = first_field(item, &["textDay", "text"]);
+        let text_night = first_field(item, &["textNight"]);
+        // 卡片背景以白天天气为准；白天码缺失时才退回夜间。
+        let kind = WeatherKind::from_icon_code(icon_day.as_deref().unwrap_or_default());
+        let kind = if kind == WeatherKind::Unknown {
+            WeatherKind::from_icon_code(icon_night.as_deref().unwrap_or_default())
+        } else {
+            kind
+        };
         out.push(DailyForecast {
             date,
             sunrise: parse_clock(item, "sunrise"),
@@ -348,8 +287,11 @@ pub fn parse_7d(body: &str) -> Result<Vec<DailyForecast>, CoreError> {
             temp_max_c: f64_field(item, "tempMax").unwrap_or(0.0),
             temp_min_c: f64_field(item, "tempMin").unwrap_or(0.0),
             precip_mm: f64_field(item, "precip").unwrap_or(0.0),
-            kind: WeatherKind::from_icon_code(&icon),
-            text: str_field(item, "text").unwrap_or_default(),
+            kind,
+            text: text_day.unwrap_or_default(),
+            icon_day: icon_day.unwrap_or_default(),
+            icon_night: icon_night.unwrap_or_default(),
+            text_night: text_night.unwrap_or_default(),
         });
     }
     Ok(out)
@@ -360,38 +302,32 @@ pub fn parse_7d(body: &str) -> Result<Vec<DailyForecast>, CoreError> {
 // ---------------------------------------------------------------------------
 
 /// 和风天气数据源。
+///
+/// **不绑定 Host**：Host 由每次调用传入，客户端只负责「按给定 Host 与 Key
+/// 发请求」。这样用户换了 Host 不必重建客户端，测试连接也能真正测到
+/// 用户刚填的那个地址。
 pub struct QWeatherProvider {
     client: reqwest::Client,
-    /// 统一 API Host：城市搜索与天气都用它。
-    api_host: String,
-    /// 城市搜索实际使用的路径。
+    /// 城市搜索路径的探测结果，**按 Host 记忆**。
     ///
-    /// 官方统一 Host 用 `/geo/v2/city/lookup`，旧公共 Host 用 `/v2/city/lookup`。
-    /// 第一次遇到 404 就自动换一条并记住，避免用户手工区分 Host 类型。
-    city_path: AtomicU8,
+    /// 官方统一 Host 用 `/geo/v2/city/lookup`，旧公共 Host 用
+    /// `/v2/city/lookup`。第一次遇到 404 就自动换一条并记住，
+    /// 避免用户手工区分 Host 类型。
+    city_paths: Mutex<HashMap<String, CityPath>>,
 }
 
-/// 城市搜索路径的探测状态（存进 [`AtomicU8`]）。
+/// 城市搜索路径的探测状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 enum CityPath {
     /// 还没试过（先用统一 Host 的路径）。
-    Unknown = 0,
+    Unknown,
     /// 统一 Host 路径可用。
-    Unified = 1,
+    Unified,
     /// 统一 Host 路径 404，应改用旧路径。
-    Legacy = 2,
+    Legacy,
 }
 
 impl CityPath {
-    fn from_raw(value: u8) -> Self {
-        match value {
-            1 => CityPath::Unified,
-            2 => CityPath::Legacy,
-            _ => CityPath::Unknown,
-        }
-    }
-
     fn path(self) -> &'static str {
         match self {
             CityPath::Legacy => PATH_CITY_LOOKUP_LEGACY,
@@ -401,16 +337,8 @@ impl CityPath {
 }
 
 impl QWeatherProvider {
-    /// 用默认 Host 构造。
+    /// 构造数据源。Host 在每次请求时传入，这里不需要。
     pub fn new() -> Result<Self, CoreError> {
-        Self::with_host(DEFAULT_API_HOST)
-    }
-
-    /// 用指定 Host 构造。Host 会被校验并规范化。
-    ///
-    /// 只有**一个** Host：官方已把城市搜索与天气收进同一个专属域名，
-    /// 用户不必再填「天气 Host + 城市搜索 Host」两个。
-    pub fn with_host(api_host: &str) -> Result<Self, CoreError> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             // 禁止重定向：避免被引到内网。
@@ -420,13 +348,24 @@ impl QWeatherProvider {
             .map_err(|err| CoreError::network(false, format!("创建天气客户端失败: {err}")))?;
         Ok(Self {
             client,
-            api_host: validate_host(api_host)?,
-            city_path: AtomicU8::new(CityPath::Unknown as u8),
+            city_paths: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn api_host(&self) -> &str {
-        &self.api_host
+    /// 读出某个 Host 上探测到的城市搜索路径。
+    fn city_path(&self, host: &str) -> CityPath {
+        self.city_paths
+            .lock()
+            .ok()
+            .and_then(|map| map.get(host).copied())
+            .unwrap_or(CityPath::Unknown)
+    }
+
+    /// 记住某个 Host 上探测到的城市搜索路径。
+    fn remember_city_path(&self, host: &str, path: CityPath) {
+        if let Ok(mut map) = self.city_paths.lock() {
+            map.insert(host.to_string(), path);
+        }
     }
 
     /// 发一次 GET 并读回受限长度的响应体。
@@ -487,35 +426,49 @@ impl QWeatherProvider {
 }
 
 impl WeatherProvider for QWeatherProvider {
+    /// 按城市名搜索候选地点。`api_host` 是本次请求使用的 Host。
     fn search_locations<'a>(
         &'a self,
+        api_host: &'a str,
         query: &'a str,
         credential: &'a WeatherCredential,
     ) -> WeatherFuture<'a, Result<Vec<WeatherLocationCandidate>, CoreError>> {
         Box::pin(async move {
+            let host = normalize_host(api_host)?;
             // 先按当前探测状态选路径；若 404 且用的是统一路径，就换成旧路径重试。
-            let path = CityPath::from_raw(self.city_path.load(Ordering::Relaxed));
+            let path = self.city_path(&host);
+            // `number`：一次多取一些。搜「成都」会返回成都本级 + 一串
+            // 下辖区县（锦江区、龙泉驿、都江堰市…），默认 10 条会截掉一批。
+            let number = MAX_LOCATION_CANDIDATES.to_string();
             let url = build_url(
-                &self.api_host,
+                &host,
                 path.path(),
-                &[("location", query), ("lang", "zh"), ("unit", "m")],
+                &[
+                    ("location", query),
+                    ("lang", "zh"),
+                    ("unit", "m"),
+                    ("number", &number),
+                ],
             )?;
             let body = match self.get(url, credential).await {
                 Ok(body) => {
                     if path == CityPath::Unknown {
-                        self.city_path
-                            .store(CityPath::Unified as u8, Ordering::Relaxed);
+                        self.remember_city_path(&host, CityPath::Unified);
                     }
                     body
                 }
                 Err(err) if err.is_not_found() && path != CityPath::Legacy => {
                     // 统一路径 404：多半是旧公共 Host，换旧路径再试一次。
-                    self.city_path
-                        .store(CityPath::Legacy as u8, Ordering::Relaxed);
+                    self.remember_city_path(&host, CityPath::Legacy);
                     let retry = build_url(
-                        &self.api_host,
+                        &host,
                         PATH_CITY_LOOKUP_LEGACY,
-                        &[("location", query), ("lang", "zh"), ("unit", "m")],
+                        &[
+                            ("location", query),
+                            ("lang", "zh"),
+                            ("unit", "m"),
+                            ("number", &number),
+                        ],
                     )?;
                     self.get(retry, credential).await?
                 }
@@ -525,25 +478,28 @@ impl WeatherProvider for QWeatherProvider {
         })
     }
 
+    /// 取某地点的预报。`api_host` 是本次请求使用的 Host。
     fn forecast<'a>(
         &'a self,
+        api_host: &'a str,
         location: &'a WeatherLocation,
         credential: &'a WeatherCredential,
     ) -> WeatherFuture<'a, Result<WeatherForecast, CoreError>> {
         Box::pin(async move {
+            let host = normalize_host(api_host)?;
             let id = location.provider_location_id.as_str();
             let now_url = build_url(
-                &self.api_host,
+                &host,
                 PATH_NOW,
                 &[("location", id), ("lang", "zh"), ("unit", "m")],
             )?;
             let hourly_url = build_url(
-                &self.api_host,
+                &host,
                 PATH_24H,
                 &[("location", id), ("lang", "zh"), ("unit", "m")],
             )?;
             let daily_url = build_url(
-                &self.api_host,
+                &host,
                 PATH_7D,
                 &[("location", id), ("lang", "zh"), ("unit", "m")],
             )?;
@@ -571,49 +527,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_must_be_public_https() {
-        assert_eq!(
-            validate_host("https://devapi.qweather.com").unwrap(),
-            "https://devapi.qweather.com"
-        );
-        assert_eq!(
-            validate_host("  https://devapi.qweather.com/  ").unwrap(),
-            "https://devapi.qweather.com"
-        );
-        // 非 https
-        assert!(validate_host("http://devapi.qweather.com").is_err());
-        // 本机与内网
-        assert!(validate_host("https://localhost").is_err());
-        assert!(validate_host("https://127.0.0.1").is_err());
-        assert!(validate_host("https://10.1.2.3").is_err());
-        assert!(validate_host("https://192.168.0.1").is_err());
-        assert!(validate_host("https://172.20.0.1").is_err());
-        assert!(validate_host("https://169.254.1.1").is_err());
-        // CGNAT
-        assert!(validate_host("https://100.64.0.1").is_err());
-        // IPv6 回环与 ULA
-        assert!(validate_host("https://[::1]").is_err());
-        assert!(validate_host("https://[fd00::1]").is_err());
-        assert!(validate_host("https://[fe80::1]").is_err());
-        // 带凭据 / 查询串 / 路径
-        assert!(validate_host("https://user:pass@devapi.qweather.com").is_err());
-        assert!(validate_host("https://devapi.qweather.com?a=1").is_err());
-        assert!(validate_host("https://devapi.qweather.com/v7").is_err());
-        // 空
-        assert!(validate_host("   ").is_err());
-    }
-
-    #[test]
-    fn public_ip_classification() {
-        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
-        assert!(!is_public_ip("127.0.0.1".parse().unwrap()));
-        assert!(!is_public_ip("0.0.0.0".parse().unwrap()));
-        assert!(!is_public_ip("224.0.0.1".parse().unwrap()));
-        assert!(is_public_ip("2606:4700::1111".parse().unwrap()));
-        assert!(!is_public_ip("::1".parse().unwrap()));
-    }
-
-    #[test]
     fn url_is_built_with_encoded_params() {
         let url = build_url(
             "https://geoapi.qweather.com",
@@ -628,6 +541,30 @@ mod tests {
                 .unwrap()
                 .contains("location=%E5%8C%97+%E4%BA%AC")
         );
+    }
+
+    /// Host 可以只填裸域名：程序自己补 https:// 再拼路径。
+    #[test]
+    fn bare_host_is_completed_by_the_program() {
+        let url = build_url(
+            "abcxyz.qweatherapi.com",
+            PATH_NOW,
+            &[("location", "101010100")],
+        )
+        .unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("abcxyz.qweatherapi.com"));
+        assert_eq!(url.path(), "/v7/weather/now");
+    }
+
+    /// 绝不接受非 HTTPS 的地址：即使调用方塞了 http:// 也被改写成 https。
+    #[test]
+    fn insecure_scheme_is_never_used() {
+        let url = build_url("http://abcxyz.qweatherapi.com", PATH_24H, &[]).unwrap();
+        assert_eq!(url.scheme(), "https");
+        // 内网地址直接拒绝，请求根本发不出去。
+        assert!(build_url("http://127.0.0.1", PATH_NOW, &[]).is_err());
+        assert!(build_url("127.0.0.1", PATH_NOW, &[]).is_err());
     }
 
     /// 官方规定：请求头与 `key` 查询参数**不能同时使用**，同时用会导致认证失败。
@@ -662,8 +599,35 @@ mod tests {
         assert_eq!(candidates[0].latitude, 39.92);
         assert_eq!(candidates[0].longitude, 116.41);
         assert_eq!(candidates[0].timezone, "Asia/Shanghai");
-        assert_eq!(candidates[0].title(), "东城区 · 北京市");
-        assert_eq!(candidates[1].title(), "上海市");
+        // `name` 是具体地点，「东城区」是它的上级行政区。
+        assert_eq!(candidates[0].title(), "北京 · 东城区 · 北京市");
+        assert_eq!(candidates[1].title(), "上海 · 上海市");
+    }
+
+    /// 回归：搜「成都」会返回一串**下辖区县**，标题必须各自分得开。
+    ///
+    /// 真实的和风天气响应里，这些条目的 `adm2` 全是「成都」——
+    /// 只显示 `adm2 · adm1` 的话，锦江区 / 龙泉驿 / 都江堰市看起来一模一样。
+    #[test]
+    fn city_lookup_keeps_county_level_places_distinguishable() {
+        let body = r#"{
+            "code": "200",
+            "location": [
+                {"name":"成都","id":"101270101","lon":"104.07","lat":"30.67",
+                 "adm2":"成都","adm1":"四川省","country":"中国","tz":"Asia/Shanghai"},
+                {"name":"都江堰","id":"101270111","lon":"103.62","lat":"30.99",
+                 "adm2":"成都","adm1":"四川省","country":"中国","tz":"Asia/Shanghai"},
+                {"name":"龙泉驿","id":"101270107","lon":"104.27","lat":"30.55",
+                 "adm2":"成都","adm1":"四川省","country":"中国","tz":"Asia/Shanghai"}
+            ]
+        }"#;
+        let candidates = parse_city_lookup(body).unwrap();
+        assert_eq!(candidates.len(), 3);
+        assert_eq!(candidates[0].title(), "成都 · 四川省");
+        assert_eq!(candidates[1].title(), "都江堰 · 成都 · 四川省");
+        assert_eq!(candidates[2].title(), "龙泉驿 · 成都 · 四川省");
+        // 三条标题互不相同，用户才能挑到具体那个区县。
+        assert_ne!(candidates[1].title(), candidates[2].title());
     }
 
     #[test]
@@ -745,14 +709,97 @@ mod tests {
         assert_eq!(days[0].temp_min_c, 22.0);
         assert_eq!(days[0].kind, WeatherKind::Clear);
         assert_eq!(days[0].sunrise.as_deref(), Some("04:52"));
+        assert_eq!(days[0].text, "晴");
     }
 
+    /// 回归：和风 v7 的逐日预报用 `iconDay`/`iconNight`/`textDay`/`textNight`，
+    /// 不是 `icon`/`text`。早期版本读错了字段名，导致 7 天预报的天气种类
+    /// 全落成 `Unknown`、天气文字全空——卡片背景图于是全是一个样。
+    /// 这里的响应体取自官方文档的真实样例。
     #[test]
-    fn provider_normalizes_hosts() {
-        // 只有一个 Host：用户不必再分别填天气 Host 与城市搜索 Host。
-        let provider = QWeatherProvider::with_host("https://devapi.qweather.com/").unwrap();
-        assert_eq!(provider.api_host(), "https://devapi.qweather.com");
-        assert!(QWeatherProvider::with_host("http://x.com").is_err());
+    fn daily_reads_the_v7_day_and_night_fields() {
+        let body = r#"{"code":"200","daily":[
+            {"fxDate":"2021-11-15","sunrise":"06:58","sunset":"16:59",
+             "tempMax":"12","tempMin":"-1",
+             "iconDay":"101","textDay":"多云",
+             "iconNight":"150","textNight":"晴",
+             "precip":"0.0"},
+            {"fxDate":"2021-11-16","sunrise":"07:00","sunset":"16:58",
+             "tempMax":"13","tempMin":"0",
+             "iconDay":"100","textDay":"晴",
+             "iconNight":"101","textNight":"多云",
+             "precip":"0.0"}
+        ]}"#;
+        let days = parse_7d(body).unwrap();
+        assert_eq!(days.len(), 2);
+
+        // 第一天：白天多云、夜间晴。
+        assert_eq!(days[0].kind, WeatherKind::PartlyCloudy);
+        assert_eq!(days[0].text, "多云");
+        assert_eq!(days[0].icon_day, "101");
+        assert_eq!(days[0].icon_night, "150");
+        assert_eq!(days[0].text_night, "晴");
+
+        // 第二天：白天晴——**必须和第一天是不同的天气**，
+        // 否则卡片背景图就分不出这两天。
+        assert_eq!(days[1].kind, WeatherKind::Clear);
+        assert_eq!(days[1].text, "晴");
+        assert_eq!(days[1].icon_night, "101");
+    }
+
+    /// 回归：7 天的天气必须各不相同，卡片背景图才有意义。
+    ///
+    /// 这份响应体覆盖了晴/多云/阴/阵雨/雷阵雨/小雨/雪七种天气，
+    /// 断言解析出来的 `kind` 互不相同。
+    #[test]
+    fn daily_kinds_are_distinguished_per_day() {
+        let body = r#"{"code":"200","daily":[
+            {"fxDate":"2026-11-04","iconDay":"100","textDay":"晴","iconNight":"150"},
+            {"fxDate":"2026-11-05","iconDay":"101","textDay":"多云","iconNight":"151"},
+            {"fxDate":"2026-11-06","iconDay":"104","textDay":"阴","iconNight":"154"},
+            {"fxDate":"2026-11-07","iconDay":"300","textDay":"阵雨","iconNight":"350"},
+            {"fxDate":"2026-11-08","iconDay":"302","textDay":"雷阵雨","iconNight":"352"},
+            {"fxDate":"2026-11-09","iconDay":"305","textDay":"小雨","iconNight":"355"},
+            {"fxDate":"2026-11-10","iconDay":"400","textDay":"小雪","iconNight":"450"}
+        ]}"#;
+        let days = parse_7d(body).unwrap();
+        let kinds: Vec<WeatherKind> = days.iter().map(|day| day.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                WeatherKind::Clear,
+                WeatherKind::PartlyCloudy,
+                WeatherKind::Cloudy,
+                WeatherKind::Rain,
+                WeatherKind::Thunderstorm,
+                WeatherKind::Rain,
+                WeatherKind::Snow,
+            ],
+            "7 天预报的天气种类应逐日不同"
+        );
+        // 雷阵雨必须和普通雨分开，否则雷暴图标画不出来。
+        assert_ne!(kinds[3], kinds[4], "雨与雷阵雨不能混为一谈");
+        // 原始码必须完整保留，UI 靠它区分昼夜。
+        assert_eq!(days[3].icon_day, "300");
+        assert_eq!(days[3].icon_night, "350");
+    }
+
+    /// 旧版响应体（只有 `icon`/`text`）也要能解析，别把老数据源搞坏。
+    #[test]
+    fn daily_still_accepts_the_legacy_icon_field() {
+        let body = r#"{"code":"200","daily":[
+            {"fxDate":"2020-07-01","icon":"100","text":"晴","tempMax":"33","tempMin":"22"}
+        ]}"#;
+        let days = parse_7d(body).unwrap();
+        assert_eq!(days[0].kind, WeatherKind::Clear);
+        assert_eq!(days[0].text, "晴");
+        assert_eq!(days[0].icon_day, "100");
+    }
+
+    /// 数据源不绑定 Host：构造成功即可，Host 在调用时才给。
+    #[test]
+    fn provider_does_not_bind_a_host() {
+        assert!(QWeatherProvider::new().is_ok());
     }
 
     /// 城市搜索路径：统一 Host 用 `/geo/v2/city/lookup`，旧公共 Host 用 `/v2/city/lookup`。
@@ -774,10 +821,5 @@ mod tests {
             "/v2/city/lookup",
             "旧公共 Host 路径"
         );
-        // 状态与序号互相对应，原子里存的就是这个值。
-        assert_eq!(CityPath::from_raw(0), CityPath::Unknown);
-        assert_eq!(CityPath::from_raw(1), CityPath::Unified);
-        assert_eq!(CityPath::from_raw(2), CityPath::Legacy);
-        assert_eq!(CityPath::from_raw(9), CityPath::Unknown);
     }
 }

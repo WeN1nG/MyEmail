@@ -21,11 +21,12 @@ pub use calendar::{
 pub use music::{MusicOrder, MusicQueue};
 pub use weather::{
     CurrentWeather, DEFAULT_API_HOST, DailyForecast, HOST_HINT, HourlyForecast,
-    MAX_WEATHER_LOCATIONS, SeriesPoint, StoredWeatherSnapshot, WeatherCredential, WeatherForecast,
-    WeatherFuture, WeatherKind, WeatherLocation, WeatherLocationCandidate, WeatherLocationId,
-    WeatherProvider, WeatherRepo, WeatherSnapshot, format_humidity, format_precip, format_temp,
-    format_wind, hourly_series, hourly_temp_range, is_expired, validate_candidate,
-    validate_forecast, validate_query,
+    MAX_WEATHER_LOCATIONS, PATH_7D, PATH_24H, PATH_CITY_LOOKUP, PATH_CITY_LOOKUP_LEGACY, PATH_NOW,
+    SeriesPoint, StoredWeatherSnapshot, WeatherCredential, WeatherForecast, WeatherFuture,
+    WeatherKind, WeatherLocation, WeatherLocationCandidate, WeatherLocationId, WeatherProvider,
+    WeatherRepo, WeatherSnapshot, format_humidity, format_precip, format_temp, format_wind,
+    hourly_series, hourly_temp_range, is_expired, is_public_ip, normalize_host,
+    preview_request_url, validate_candidate, validate_forecast, validate_query,
 };
 
 pub use command::{

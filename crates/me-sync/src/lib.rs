@@ -293,8 +293,13 @@ where
             .ok()
             .flatten();
         let api_host = stored_host
-            .filter(|value| !value.trim().is_empty())
+            .as_deref()
+            .and_then(|value| me_core::weather::normalize_host(value).ok())
             .unwrap_or_else(|| me_proto::qweather::DEFAULT_API_HOST.to_string());
+        // 记录会话里生效的 Host：之后每次请求都用它。
+        if let Ok(mut state) = self.inner.weather_state.lock() {
+            state.api_host = api_host.clone();
+        }
         // 已经注入过数据源（例如测试或自定义实现）时不要覆盖。
         let provider_ready = self
             .inner
@@ -303,7 +308,7 @@ where
             .map(|guard| guard.is_some())
             .unwrap_or(false);
         if !provider_ready
-            && let Ok(provider) = me_proto::qweather::QWeatherProvider::with_host(&api_host)
+            && let Ok(provider) = me_proto::qweather::QWeatherProvider::new()
             && let Ok(mut guard) = self.inner.weather_provider.write()
         {
             *guard = Some(Arc::new(provider));
@@ -920,9 +925,9 @@ where
                 let service = self.clone();
                 tokio::spawn(async move { service.set_default_weather_location(id).await });
             }
-            Command::RefreshWeather { force } => {
+            Command::RefreshWeather { id, force } => {
                 let service = self.clone();
-                tokio::spawn(async move { service.refresh_weather(force).await });
+                tokio::spawn(async move { service.refresh_weather(id, force).await });
             }
         }
     }

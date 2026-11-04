@@ -92,6 +92,18 @@ pub(crate) fn get_weather_snapshot_conn(
         return Ok(None);
     };
     match serde_json::from_str::<StoredWeatherSnapshot>(&payload) {
+        // 版本对不上说明是旧格式的缓存：字段语义已经变了
+        // （比如逐日预报的图标码从 `icon` 改成了 `iconDay`），
+        // 继续用它只会显示错的天气。按「没有缓存」处理，让界面重新拉取。
+        Ok(stored) if stored.v != StoredWeatherSnapshot::VERSION => {
+            tracing::warn!(
+                location_id = location_id.0,
+                cached_version = stored.v,
+                expected = StoredWeatherSnapshot::VERSION,
+                "天气快照格式版本过期，按无缓存处理"
+            );
+            Ok(None)
+        }
         Ok(stored) => Ok(Some(WeatherSnapshot {
             provider,
             fetched_at,
@@ -473,6 +485,38 @@ mod tests {
             get_weather_snapshot_conn(&writable.lock(), location.id)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// 旧版本快照必须作废。
+    ///
+    /// 版本 1 的逐日预报读错了服务商的字段名（把 `iconDay` 当 `icon`），
+    /// 7 天天气全退化成「未知」。这类缓存继续用只会显示错的天气，
+    /// 所以版本号对不上时按「没有缓存」处理，让界面重新拉取。
+    #[test]
+    fn outdated_snapshot_version_is_treated_as_no_cache() {
+        let (_dir, store) = store();
+        let writable = store.writable();
+        let location =
+            insert_weather_location_conn(&mut writable.lock(), &candidate("北京", "101010100"))
+                .unwrap();
+        // 造一个版本号过期的 payload：内容合法，但 `v` 是旧值。
+        let mut stored = StoredWeatherSnapshot::new(snapshot(1_000));
+        stored.v = StoredWeatherSnapshot::VERSION.saturating_sub(1);
+        let payload = serde_json::to_string(&stored).unwrap();
+        writable
+            .lock()
+            .execute(
+                "INSERT INTO weather_snapshots(location_id, provider, fetched_at, expires_at, payload) \
+                 VALUES (?1, 'qweather', 1000, 2000, ?2)",
+                params![location.id.0, payload],
+            )
+            .unwrap();
+        assert!(
+            get_weather_snapshot_conn(&writable.lock(), location.id)
+                .unwrap()
+                .is_none(),
+            "版本过期的快照应按无缓存处理"
         );
     }
 

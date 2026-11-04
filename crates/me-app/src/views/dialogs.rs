@@ -74,6 +74,9 @@ fn credential_fallback(state: &mut UiState, commands: &mut Vec<Command>, ctx: &e
 /// 用户不需要知道「城市搜索 Host」——官方已把 GeoAPI 收进同一个专属域名，
 /// 路径差异由程序自动探测（见 `me_proto::qweather`）。
 ///
+/// **Host 可以只填裸域名**（控制台复制到的就是这样）：程序负责补
+/// `https://`、拼端点路径，并把最终请求地址显示出来。
+///
 /// 从天气页的「配置密钥」按钮打开（主页面未配置时也用同一个入口）。
 /// Key 只提交给后端写密钥库，**不留在界面状态里**——保存后立刻清空。
 fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::Context) {
@@ -94,7 +97,7 @@ fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::
             ui.label(
                 RichText::new(
                     "1. 登录 console.qweather.com 创建项目，在「凭据」里生成 API KEY\n\
-                     2. 在控制台「设置」页复制你的专属 API Host\n\
+                     2. 在控制台「设置」页复制你的专属 API Host（只有域名，https:// 可省略）\n\
                      3. 把两者填入下面，可先「测试连接」确认可用",
                 )
                 .size(12.0)
@@ -106,7 +109,8 @@ fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::
                 ui.label("API Host");
                 ui.add(
                     egui::TextEdit::singleline(&mut state.weather.host_input.api_host)
-                        .desired_width(280.0),
+                        .desired_width(280.0)
+                        .hint_text("abcxyz.qweatherapi.com"),
                 );
             });
             ui.label(
@@ -114,6 +118,33 @@ fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::
                     .size(11.0)
                     .color(Color32::GRAY),
             );
+
+            // 实时预览：Host 规范化后程序实际会请求哪个地址。
+            // 协议与路径都由程序决定，用户只管填域名。
+            let host_input = state.weather.host_input.api_host.trim();
+            if !host_input.is_empty() {
+                match me_core::weather::normalize_host(host_input) {
+                    Ok(host) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "将请求：{host}{}（城市搜索：{host}{}）",
+                                me_core::PATH_NOW,
+                                me_core::PATH_CITY_LOOKUP
+                            ))
+                            .size(11.0)
+                            .color(Color32::GRAY),
+                        );
+                    }
+                    Err(err) => {
+                        ui.label(
+                            RichText::new(err.user_message())
+                                .size(11.0)
+                                .color(Color32::from_rgb(200, 80, 80)),
+                        );
+                    }
+                }
+            }
+
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label("API Key");
@@ -205,6 +236,11 @@ fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::
         } else {
             host
         };
+        // 先本地校验：Host 不合法就别提交，弹窗保持打开并显示原因。
+        if let Err(err) = me_core::weather::normalize_host(&host) {
+            state.weather.test_result = Some((false, err.user_message()));
+            return;
+        }
         commands.push(Command::SetWeatherConfig {
             host: host.clone(),
             // Key 留空表示「不改动已保存的 Key」。
@@ -212,9 +248,10 @@ fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::
         });
         // Key 不留在界面状态里。
         state.weather.key_input.clear();
-        state.weather.api_host = host;
+        // Host 的最终生效值由后端 `WeatherConfigChanged` 事件回填，
+        // 这里不抢先改，免得显示的值和实际生效的不一致。
+        state.weather.save_requested = true;
         state.dialog.close();
-        state.toast(ToastKind::Info, "天气配置已保存");
     }
 }
 
@@ -533,6 +570,47 @@ mod tests {
         assert!(
             !texts.iter().any(|text| text.contains("城市搜索 Host")),
             "不应要求用户填城市搜索 Host，实际 {texts:?}"
+        );
+    }
+
+    /// 用户只填裸域名时，弹窗要能看到程序实际会请求的地址。
+    #[test]
+    fn weather_config_previews_the_request_url_for_a_bare_host() {
+        let mut state = UiState {
+            dialog: Dialog::WeatherConfig,
+            ..Default::default()
+        };
+        state.weather.open_config();
+        // 模拟用户把控制台里的裸域名填进 Host 输入框。
+        state.weather.host_input.api_host = "abcxyz.qweatherapi.com".into();
+        let texts = dialog_texts(&mut state);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("https://abcxyz.qweatherapi.com/v7/weather/now")),
+            "应预览最终请求地址，实际 {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("/geo/v2/city/lookup")),
+            "应预览城市搜索地址，实际 {texts:?}"
+        );
+    }
+
+    /// 内网 Host 要在弹窗里就给出原因，而不是提交后才报错。
+    #[test]
+    fn weather_config_warns_about_a_private_host() {
+        let mut state = UiState {
+            dialog: Dialog::WeatherConfig,
+            ..Default::default()
+        };
+        state.weather.open_config();
+        state.weather.host_input.api_host = "192.168.1.10".into();
+        let texts = dialog_texts(&mut state);
+        assert!(
+            texts.iter().any(|text| text.contains("内网")),
+            "应提示不能指向内网，实际 {texts:?}"
         );
     }
 }

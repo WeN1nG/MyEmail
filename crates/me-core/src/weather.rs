@@ -39,7 +39,10 @@ pub const MAX_HOURLY: usize = 48;
 pub const MAX_DAILY: usize = 7;
 
 /// 城市搜索结果的最大条数。
-pub const MAX_LOCATION_CANDIDATES: usize = 10;
+///
+/// 和风天气的 `number` 参数上限是 20：搜「成都」会返回成都本级加上
+/// 锦江区、龙泉驿、都江堰市等一串下辖区县，只给 10 条会截掉一部分。
+pub const MAX_LOCATION_CANDIDATES: usize = 20;
 
 /// 城市搜索输入的最大长度。
 pub const MAX_QUERY_LEN: usize = 100;
@@ -57,8 +60,193 @@ pub const PROVIDER_QWEATHER: &str = "qweather";
 /// 兜底默认值，用户应在配置弹窗里填自己的专属 Host。
 pub const DEFAULT_API_HOST: &str = "https://devapi.qweather.com";
 /// 配置弹窗里给用户的提示：Host 从哪里取。
-pub const HOST_HINT: &str =
-    "在 console.qweather.com 的「设置」页查看你的专属 API Host（形如 abcxyz.qweatherapi.com）";
+pub const HOST_HINT: &str = "在 console.qweather.com 的「设置」页查看你的专属 API Host（形如 abcxyz.qweatherapi.com，https:// 可省略）";
+
+// ---------------------------------------------------------------------------
+// 端点路径
+// ---------------------------------------------------------------------------
+//
+// 路径由程序决定，用户只填 Host。这些常量放在领域层是为了让界面能预览
+// 「程序实际会请求哪个地址」，实现层（me-proto）直接引用，不另写一份。
+
+/// 实时天气端点。
+pub const PATH_NOW: &str = "/v7/weather/now";
+/// 逐小时预报端点。
+pub const PATH_24H: &str = "/v7/weather/24h";
+/// 逐日预报端点。
+pub const PATH_7D: &str = "/v7/weather/7d";
+/// 城市搜索端点（**统一 Host**，官方现行）。
+pub const PATH_CITY_LOOKUP: &str = "/geo/v2/city/lookup";
+/// 城市搜索端点（**旧公共 Host**）。程序会自动回退到这里。
+pub const PATH_CITY_LOOKUP_LEGACY: &str = "/v2/city/lookup";
+
+// ---------------------------------------------------------------------------
+// Host 规范化
+// ---------------------------------------------------------------------------
+
+/// 把用户填的 Host 规范化成 `https://host[:port]`。
+///
+/// 控制台复制到的是**裸域名**（如 `abcxyz.qweatherapi.com`），用户也可能
+/// 带上 `https://` 前缀、结尾斜杠或路径。**协议由程序决定**：一律走
+/// https，因此填 `http://` 也会被升级，用户不必自己改正。
+///
+/// 规范化内容：
+/// - 去掉 `http://` / `https://` 前缀、结尾斜杠与路径部分；
+/// - 主机名转小写；
+/// - 拒绝用户名/密码、查询串与片段；
+/// - 拒绝本机与内网地址（按**字面量**判断，不做 DNS 预解析）。
+pub fn normalize_host(raw: &str) -> Result<String, CoreError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CoreError::validation("Host 不能为空"));
+    }
+
+    // 1. 拆协议：只允许 http/https，其余（ftp:// 等）直接拒绝。
+    let rest = match trimmed.find("://") {
+        Some(index) => {
+            let scheme = &trimmed[..index];
+            if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+                return Err(CoreError::validation("Host 只支持 http 或 https"));
+            }
+            &trimmed[index + 3..]
+        }
+        None => trimmed,
+    };
+
+    // 2. 查询串与片段在 Host 里没有意义（也常被用来夹带凭据），直接拒绝。
+    if rest.contains('?') || rest.contains('#') {
+        return Err(CoreError::validation("Host 不能包含查询串或片段"));
+    }
+
+    // 3. 端点路径由程序决定，Host 只保留 authority 部分。
+    let authority = rest.split('/').next().unwrap_or("").trim();
+    if authority.is_empty() {
+        return Err(CoreError::validation("Host 不能为空"));
+    }
+
+    // 4. 用户名/密码：拒绝。
+    if authority.contains('@') {
+        return Err(CoreError::validation("Host 不能包含用户名或密码"));
+    }
+
+    // 5. 拆主机名与端口。
+    let (host, port) = split_authority(authority)?;
+
+    // 6. 本机与内网：按字面量拒绝。
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare == "localhost" || bare.ends_with(".localhost") || bare.ends_with(".local") {
+        return Err(CoreError::validation("Host 不能指向本机"));
+    }
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>()
+        && !is_public_ip(ip)
+    {
+        return Err(CoreError::validation("Host 不能指向内网或保留地址"));
+    }
+
+    // 7. 主机名合法性：只允许字母、数字、'-'、'.'（IPv6 另计）。
+    if !host
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' || ch == '[' || ch == ']')
+    {
+        return Err(CoreError::validation("Host 含有非法字符"));
+    }
+
+    let host = host.to_ascii_lowercase();
+    Ok(match port {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    })
+}
+
+/// 拆 `host[:port]`。IPv6 用方括号（`[::1]`、`[::1]:8443`）。
+fn split_authority(authority: &str) -> Result<(String, Option<u16>), CoreError> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest
+            .find(']')
+            .ok_or_else(|| CoreError::validation("Host 的 IPv6 地址格式不正确"))?;
+        let host = format!("[{}]", &rest[..end]);
+        let tail = &rest[end + 1..];
+        let port = match tail.strip_prefix(':') {
+            Some(port) => Some(parse_port(port)?),
+            None if tail.is_empty() => None,
+            None => return Err(CoreError::validation("Host 格式不正确")),
+        };
+        return Ok((host, port));
+    }
+    // 未加方括号的 IPv6 无法与端口区分，直接拒绝这种写法。
+    if authority.matches(':').count() > 1 {
+        return Err(CoreError::validation("IPv6 地址需要用方括号，例如 [::1]"));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => Ok((host.to_string(), Some(parse_port(port)?))),
+        None => Ok((authority.to_string(), None)),
+    }
+}
+
+/// 解析端口号。
+fn parse_port(text: &str) -> Result<u16, CoreError> {
+    let port: u16 = text
+        .parse()
+        .map_err(|_| CoreError::validation("Host 的端口号不正确"))?;
+    if port == 0 {
+        return Err(CoreError::validation("Host 的端口号不正确"));
+    }
+    Ok(port)
+}
+
+/// 预览程序实际会请求的地址（不含 Key）。
+///
+/// 用户只填 Host，路径与协议都由程序决定。这里把最终地址显式展示出来，
+/// 免得用户猜「我填的 Host 到底被拼成了什么」。
+pub fn preview_request_url(raw_host: &str, path: &str) -> Option<String> {
+    let host = normalize_host(raw_host).ok()?;
+    Some(format!("{host}{path}"))
+}
+
+/// 地址是否为公网地址。
+///
+/// 拒绝：回环、私网、链路本地、CGNAT（100.64.0.0/10）、未指定的 IPv6、
+/// IPv6 ULA（fc00::/7）与 IPv4 保留段。
+pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            !(octets[0] == 127
+                // 私网 10/8、172.16/12、192.168/16
+                || (octets[0] == 10)
+                || (octets[0] == 172 && (16..32).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168)
+                // 链路本地 169.254/16
+                || (octets[0] == 169 && octets[1] == 254)
+                // CGNAT 100.64/10
+                || (octets[0] == 100 && (64..128).contains(&octets[1]))
+                // 0.0.0.0/8
+                || octets[0] == 0
+                // 224/4 组播、240/4 保留
+                || octets[0] >= 224)
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            if v6.is_loopback() || v6.is_unspecified() {
+                return false;
+            }
+            // fc00::/7 唯一本地地址
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // fe80::/10 链路本地
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            // IPv4 映射地址按内嵌的 v4 判断
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
+            true
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 标识与模型
@@ -81,10 +269,11 @@ pub struct WeatherLocation {
     pub provider: String,
     /// 服务商的地点 ID；刷新时用它，不依赖经纬度。
     pub provider_location_id: String,
+    /// 具体地点名（可能是区/县/县级市，如「龙泉驿」）。
     pub name: String,
     /// 省 / 州。
     pub admin1: Option<String>,
-    /// 市 / 区。
+    /// 上级行政区（`adm2`）：该地点的**上级城市**。
     pub admin2: Option<String>,
     pub country: Option<String>,
     pub latitude: f64,
@@ -96,13 +285,27 @@ pub struct WeatherLocation {
     pub created_at: i64,
 }
 
+impl WeatherLocation {
+    /// 展示用标题：`具体地点 · 上级城市 · 省`。
+    pub fn title(&self) -> String {
+        location_title(&self.name, self.admin2.as_deref(), self.admin1.as_deref())
+    }
+}
+
 /// 城市搜索返回的候选地点（尚未保存）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WeatherLocationCandidate {
     pub provider: String,
     pub provider_location_id: String,
+    /// 具体地点名（可能是区/县/县级市，如「龙泉驿」）。
     pub name: String,
+    /// 一级行政区（省 / 州 / 直辖市）。
     pub admin1: Option<String>,
+    /// 上级行政区（`adm2`）：具体地点的**上级城市**。
+    ///
+    /// 和风天气搜索「成都」会返回成都本级与锦江区、龙泉驿、都江堰市等
+    /// 下辖区县，它们的 `adm2` 都是「成都」——所以只显示 `adm2` 会让
+    /// 十几个候选看起来一模一样。
     pub admin2: Option<String>,
     pub country: Option<String>,
     pub latitude: f64,
@@ -111,17 +314,34 @@ pub struct WeatherLocationCandidate {
 }
 
 impl WeatherLocationCandidate {
-    /// 展示用标题：`市 · 省`；缺市时退回省，再退回名称。
+    /// 展示用标题：`具体地点 · 上级城市 · 省`。
     pub fn title(&self) -> String {
-        let city = self.admin2.as_deref().filter(|text| !text.is_empty());
-        let province = self.admin1.as_deref().filter(|text| !text.is_empty());
-        match (city, province) {
-            (Some(city), Some(province)) => format!("{city} · {province}"),
-            (Some(city), None) => city.to_string(),
-            (None, Some(province)) => province.to_string(),
-            (None, None) => self.name.clone(),
+        location_title(&self.name, self.admin2.as_deref(), self.admin1.as_deref())
+    }
+}
+
+/// 地点展示标题：`具体地点 · 上级城市 · 省`。
+///
+/// 逐级回退且**去重**：直辖市的 `adm1` 与 `adm2` 同为「北京市」，
+/// 重复显示没有意义；市本级的 `name` 与 `adm2` 同为「成都」时也只显示一次。
+///
+/// 和风天气的最小行政单位是**区/县/县级市**（搜「成都」会返回成都本级
+/// 加上锦江区、龙泉驿、都江堰市等一串下辖区县），所以标题必须带上
+/// `name`——只显示 `adm2 · adm1` 会让这些候选看起来一模一样。
+pub fn location_title(name: &str, admin2: Option<&str>, admin1: Option<&str>) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in [Some(name), admin2, admin1] {
+        let text = part.map(str::trim).filter(|text| !text.is_empty());
+        if let Some(text) = text
+            && !parts.contains(&text)
+        {
+            parts.push(text);
         }
     }
+    if parts.is_empty() {
+        return name.to_string();
+    }
+    parts.join(" · ")
 }
 
 /// 天气种类。界面按它绘制图标，不依赖字体是否收录符号。
@@ -165,33 +385,56 @@ impl WeatherKind {
 
     /// 和风天气图标码 → 天气种类。
     ///
+    /// 图标码有两种形态：
+    /// - 三位纯数字（`"100"`、`"150"`）；
+    /// - 带昼夜后缀（`"100d"`、`"101n"`）。
+    ///
+    /// 两者都要认，否则夜间时段会整片落进 [`WeatherKind::Unknown`]。
+    ///
+    /// 码表对齐官方「天气现象」文档（`condition.code`）与其图标对照表：
+    /// `100` 晴、`104` 阴、`300` 阵雨、`305` 小雨、`400` 小雪、`500` 薄雾、
+    /// `502` 霾、`900` 热……夜间码是同一套现象的夜版（`150` 晴、`153` 晴间多云、
+    /// `154` 阴、`350` 阵雨、`456`/`457` 雨雪……）。
+    ///
     /// 认不出的码归 [`WeatherKind::Unknown`]，**不报错**：图标码会随服务商
     /// 增加而变，界面上显示服务商给的文字描述即可。
     pub fn from_icon_code(code: &str) -> Self {
-        let code = code.trim();
-        match code {
-            // 晴 / 多云 / 阴
-            "100" | "700" | "800" => WeatherKind::Clear,
-            "101" | "102" | "103" | "104" | "701" | "702" | "703" | "704" | "801" | "802"
-            | "803" | "804" | "805" => WeatherKind::PartlyCloudy,
-            // 雾 / 霾 / 浮尘
-            "500" | "509" | "711" | "733" => WeatherKind::Fog,
-            "501" | "502" | "712" => WeatherKind::Haze,
-            "503" | "504" | "713" | "714" => WeatherKind::Dust,
-            // 雨（含冻雨：冻雨仍按雨处理）
-            "300" | "301" | "302" | "303" | "304" | "307" | "309" | "314" | "806" | "807"
-            | "808" | "816" | "817" | "818" | "819" | "820" | "821" | "822" => WeatherKind::Rain,
-            // 雷暴（强对流）
-            "305" | "308" | "310" | "311" | "823" | "900" | "901" | "902" => {
-                WeatherKind::Thunderstorm
+        // 先剥掉昼夜后缀（`"100d"` → `"100"`），再按纯数字码表匹配。
+        let trimmed = code.trim();
+        let digits = trimmed
+            .strip_suffix(['d', 'D', 'n', 'N'])
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(trimmed);
+
+        match digits {
+            // 晴（含夜间晴 `150`、夜间晴间多云 `153`）。
+            "100" | "150" => WeatherKind::Clear,
+            // 多云 / 少云 / 晴间多云。
+            "101" | "102" | "103" | "153" => WeatherKind::PartlyCloudy,
+            // 阴（`154` 是夜间阴）。
+            "104" | "154" => WeatherKind::Cloudy,
+            // 雾 / 薄雾 / 浓雾 / 大雾。
+            "500" | "501" | "509" | "510" | "514" | "515" => WeatherKind::Fog,
+            // 霾。
+            "502" | "511" | "512" | "513" => WeatherKind::Haze,
+            // 扬沙 / 浮尘 / 沙尘暴。
+            "503" | "504" | "507" | "508" => WeatherKind::Dust,
+            // 毛毛雨 / 细雨（量级最小，单独归类）。
+            "309" => WeatherKind::Drizzle,
+            // 雨（阵雨、小中大雨、暴雨…）。
+            "300" | "301" | "305" | "306" | "307" | "308" | "310" | "311" | "312" | "314"
+            | "315" | "316" | "317" | "318" | "350" | "351" | "399" => WeatherKind::Rain,
+            // 雷暴（强对流）。
+            "302" | "303" | "900" | "901" | "902" => WeatherKind::Thunderstorm,
+            // 雷阵雨伴有冰雹。
+            "304" => WeatherKind::Hail,
+            // 雪（小雪、中雪、大雪、暴雪）。
+            "400" | "401" | "402" | "403" | "407" | "408" | "409" | "410" | "457" | "499" => {
+                WeatherKind::Snow
             }
-            // 冰雹
-            "312" => WeatherKind::Hail,
-            // 雪
-            "400" | "401" | "402" | "403" | "404" | "405" | "315" | "810" | "811" | "812"
-            | "813" | "814" | "815" | "826" | "827" | "828" | "829" | "830" => WeatherKind::Snow,
-            // 雨夹雪
-            "306" | "313" | "406" | "809" | "824" => WeatherKind::Sleet,
+            // 雨夹雪 / 冻雨 / 雨雪天气。
+            "313" | "404" | "405" | "406" | "456" => WeatherKind::Sleet,
+            // 热 / 冷：不画特殊图形，按未知处理（文字描述里会写明「热」/「冷」）。
             _ => WeatherKind::Unknown,
         }
     }
@@ -252,6 +495,19 @@ pub struct DailyForecast {
     pub precip_mm: f64,
     pub kind: WeatherKind,
     pub text: String,
+    /// 白天的原始图标码（如 `100d`）。
+    ///
+    /// 保留原始码是为了两件事：一是**夜间图标与白天不同**
+    /// （`100` 晴 / `150` 夜间晴），二是将来换成服务商的官方图标资源时
+    /// 不必再改数据层。
+    #[serde(default)]
+    pub icon_day: String,
+    /// 夜间的原始图标码（如 `150n`）。
+    #[serde(default)]
+    pub icon_night: String,
+    /// 夜间天气文字描述（`textNight`）。
+    #[serde(default)]
+    pub text_night: String,
 }
 
 /// 一次刷新的完整结果（不含缓存元信息）。
@@ -298,7 +554,12 @@ pub struct StoredWeatherSnapshot {
 
 impl StoredWeatherSnapshot {
     /// 当前快照格式版本。
-    pub const VERSION: u32 = 1;
+    ///
+    /// **版本 2**：逐日预报新增原始图标码（`icon_day`/`icon_night`）与
+    /// 夜间文字（`text_night`）。版本 1 的逐日预报读错了服务商的字段名
+    /// （把 `iconDay` 当成 `icon`），导致 7 天天气全部退化成「未知」——
+    /// 这批缓存继续用只会显示错的天气，所以版本号一升就整体作废。
+    pub const VERSION: u32 = 2;
 
     pub fn new(snapshot: WeatherSnapshot) -> Self {
         Self {
@@ -350,10 +611,16 @@ impl fmt::Debug for WeatherCredential {
 pub type WeatherFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// 天气数据源。
+///
+/// **Host 是每次调用的参数**，不是数据源的构造参数：用户配置的 Host
+/// 只有这一个来源，换 Host 不必重建客户端，测试连接也能真正测到用户
+/// 刚填的那个地址。`api_host` 传裸域名或完整 URL 均可，实现层会自行
+/// 规范化（补 `https://`）并拒绝内网地址。
 pub trait WeatherProvider: Send + Sync {
     /// 按城市名搜索候选地点。
     fn search_locations<'a>(
         &'a self,
+        api_host: &'a str,
         query: &'a str,
         credential: &'a WeatherCredential,
     ) -> WeatherFuture<'a, Result<Vec<WeatherLocationCandidate>, CoreError>>;
@@ -361,6 +628,7 @@ pub trait WeatherProvider: Send + Sync {
     /// 取某地点的当前天气 + 逐时 + 逐日预报。
     fn forecast<'a>(
         &'a self,
+        api_host: &'a str,
         location: &'a WeatherLocation,
         credential: &'a WeatherCredential,
     ) -> WeatherFuture<'a, Result<WeatherForecast, CoreError>>;
@@ -596,21 +864,84 @@ mod tests {
         }
     }
 
+    /// 造一个候选（字段按和风天气的实际返回填）。
+    fn named_candidate(name: &str, adm1: &str, adm2: &str) -> WeatherLocationCandidate {
+        WeatherLocationCandidate {
+            provider: PROVIDER_QWEATHER.to_string(),
+            provider_location_id: "101270101".to_string(),
+            name: name.to_string(),
+            admin1: Some(adm1.to_string()),
+            admin2: Some(adm2.to_string()),
+            country: Some("中国".to_string()),
+            latitude: 30.6,
+            longitude: 104.0,
+            timezone: "Asia/Shanghai".to_string(),
+        }
+    }
+
+    /// 回归：和风天气的 `adm2` 是**上级城市**，不是地点本身。
+    ///
+    /// 搜「成都」会返回成都本级 + 锦江区/龙泉驿/都江堰市等下辖区县，
+    /// 它们的 `adm2` 全是「成都」。早先标题只显示 `adm2 · adm1`，
+    /// 于是十几个候选全都显示成「成都 · 四川省」，用户没法挑。
+    /// 标题必须带上**具体地点名**。
+    #[test]
+    fn candidate_title_shows_the_specific_place_not_just_the_parent_city() {
+        let district = named_candidate("都江堰", "四川省", "成都");
+        assert_eq!(
+            district.title(),
+            "都江堰 · 成都 · 四川省",
+            "区/县级市必须显示自己的名字"
+        );
+
+        let city = named_candidate("成都", "四川省", "成都");
+        assert_eq!(
+            city.title(),
+            "成都 · 四川省",
+            "市本级与上级城市同名时只显示一次"
+        );
+    }
+
+    /// 直辖市的 `adm1` 与 `adm2` 同名，不该重复显示。
+    #[test]
+    fn candidate_title_drops_duplicated_admin_levels() {
+        let beijing = named_candidate("东城", "北京市", "北京市");
+        assert_eq!(beijing.title(), "东城 · 北京市");
+    }
+
+    /// 缺上级行政区时逐级回退，不能显示成空串。
+    #[test]
+    fn candidate_title_falls_back_when_admin_levels_are_missing() {
+        let mut candidate = named_candidate("拉萨", "西藏自治区", "拉萨");
+        candidate.admin2 = None;
+        assert_eq!(candidate.title(), "拉萨 · 西藏自治区");
+
+        let mut candidate = named_candidate("拉萨", "西藏自治区", "拉萨");
+        candidate.admin1 = None;
+        candidate.admin2 = None;
+        assert_eq!(candidate.title(), "拉萨");
+    }
+
     #[test]
     fn icon_codes_map_to_kinds() {
+        // 映射严格对齐官方「天气现象」码表：
+        // 104 是**阴**（不是多云），302 是**雷阵雨**（不是雨），
+        // 305 是**小雨**（不是雷暴），312 是**特大暴雨**（不是冰雹）。
         assert_eq!(WeatherKind::from_icon_code("100"), WeatherKind::Clear);
-        assert_eq!(
-            WeatherKind::from_icon_code("104"),
-            WeatherKind::PartlyCloudy
-        );
+        assert_eq!(WeatherKind::from_icon_code("104"), WeatherKind::Cloudy);
         assert_eq!(WeatherKind::from_icon_code("300"), WeatherKind::Rain);
-        assert_eq!(WeatherKind::from_icon_code("302"), WeatherKind::Rain);
-        assert_eq!(WeatherKind::from_icon_code("306"), WeatherKind::Sleet);
         assert_eq!(
-            WeatherKind::from_icon_code("305"),
+            WeatherKind::from_icon_code("302"),
             WeatherKind::Thunderstorm
         );
-        assert_eq!(WeatherKind::from_icon_code("312"), WeatherKind::Hail);
+        assert_eq!(WeatherKind::from_icon_code("306"), WeatherKind::Rain);
+        assert_eq!(
+            WeatherKind::from_icon_code("305"),
+            WeatherKind::Rain,
+            "305 是小雨，不是雷暴"
+        );
+        assert_eq!(WeatherKind::from_icon_code("312"), WeatherKind::Rain);
+        assert_eq!(WeatherKind::from_icon_code("304"), WeatherKind::Hail);
         assert_eq!(WeatherKind::from_icon_code("401"), WeatherKind::Snow);
         assert_eq!(WeatherKind::from_icon_code("500"), WeatherKind::Fog);
         assert_eq!(WeatherKind::from_icon_code("502"), WeatherKind::Haze);
@@ -769,7 +1100,11 @@ mod tests {
         );
         let stored = StoredWeatherSnapshot::new(snapshot.clone());
         let json = serde_json::to_string(&stored).expect("序列化");
-        assert!(json.contains("\"v\":1"));
+        // 版本号跟随常量，避免以后升版本时漏改这里。
+        assert!(
+            json.contains(&format!("\"v\":{}", StoredWeatherSnapshot::VERSION)),
+            "序列化结果应带上当前版本号：{json}"
+        );
         let back: StoredWeatherSnapshot = serde_json::from_str(&json).expect("反序列化");
         assert_eq!(back.snapshot, snapshot);
         assert_eq!(back.v, StoredWeatherSnapshot::VERSION);
@@ -783,5 +1118,182 @@ mod tests {
         assert_eq!(format_wind(0, 7.0), "7 km/h");
         assert_eq!(format_precip(0.04), "0.0 mm");
         assert_eq!(format_humidity(65), "65%");
+    }
+
+    #[test]
+    fn host_normalization_accepts_bare_domain() {
+        // 控制台复制到的就是裸域名：必须能直接用。
+        assert_eq!(
+            normalize_host("abcxyz.qweatherapi.com").unwrap(),
+            "https://abcxyz.qweatherapi.com"
+        );
+        // 带 https 前缀、结尾斜杠、路径都要归一到同一个结果。
+        for input in [
+            "https://abcxyz.qweatherapi.com",
+            "https://abcxyz.qweatherapi.com/",
+            "  https://abcxyz.qweatherapi.com/  ",
+            "https://abcxyz.qweatherapi.com/v7/weather/now",
+            "abcxyz.qweatherapi.com/v7",
+        ] {
+            assert_eq!(
+                normalize_host(input).unwrap(),
+                "https://abcxyz.qweatherapi.com",
+                "输入 {input} 应归一到同一 Host"
+            );
+        }
+        // 协议由程序决定：http 会被升级成 https。
+        assert_eq!(
+            normalize_host("http://abcxyz.qweatherapi.com").unwrap(),
+            "https://abcxyz.qweatherapi.com"
+        );
+        // 主机名统一小写。
+        assert_eq!(
+            normalize_host("ABCXYZ.QWeatherAPI.com").unwrap(),
+            "https://abcxyz.qweatherapi.com"
+        );
+        // 端口保留。
+        assert_eq!(
+            normalize_host("abcxyz.qweatherapi.com:8443").unwrap(),
+            "https://abcxyz.qweatherapi.com:8443"
+        );
+    }
+
+    #[test]
+    fn host_normalization_rejects_dangerous_input() {
+        // 空
+        assert!(normalize_host("   ").is_err());
+        // 非 http(s) 协议
+        assert!(normalize_host("ftp://abc.com").is_err());
+        // 查询串 / 片段 / 凭据
+        assert!(normalize_host("https://abc.com?key=secret").is_err());
+        assert!(normalize_host("https://abc.com#frag").is_err());
+        assert!(normalize_host("https://user:pass@abc.com").is_err());
+        // 本机与内网（按字面量）
+        assert!(normalize_host("localhost").is_err());
+        assert!(normalize_host("foo.localhost").is_err());
+        assert!(normalize_host("127.0.0.1").is_err());
+        assert!(normalize_host("10.1.2.3").is_err());
+        assert!(normalize_host("192.168.0.1").is_err());
+        assert!(normalize_host("172.20.0.1").is_err());
+        assert!(normalize_host("169.254.1.1").is_err());
+        assert!(normalize_host("100.64.0.1").is_err());
+        assert!(normalize_host("[::1]").is_err());
+        assert!(normalize_host("[fd00::1]").is_err());
+        // 非法字符与端口
+        assert!(normalize_host("abc com").is_err());
+        assert!(normalize_host("abc.com:0").is_err());
+        assert!(normalize_host("abc.com:99999").is_err());
+        assert!(normalize_host("abc.com:notaport").is_err());
+    }
+
+    /// 图标码 → 天气种类，必须严格对齐官方「天气现象」码表。
+    ///
+    /// 这张表是卡片背景图能反映天气的根本依据：
+    /// 任何一条映射错了，那一天的背景图就会画成别的天气。
+    #[test]
+    fn icon_codes_follow_the_official_weather_table() {
+        // 晴（含夜间晴 150）。
+        assert_eq!(WeatherKind::from_icon_code("100"), WeatherKind::Clear);
+        assert_eq!(WeatherKind::from_icon_code("150"), WeatherKind::Clear);
+        // 多云 / 少云 / 晴间多云（含夜间 153）。
+        assert_eq!(
+            WeatherKind::from_icon_code("101"),
+            WeatherKind::PartlyCloudy
+        );
+        assert_eq!(
+            WeatherKind::from_icon_code("102"),
+            WeatherKind::PartlyCloudy
+        );
+        assert_eq!(
+            WeatherKind::from_icon_code("103"),
+            WeatherKind::PartlyCloudy
+        );
+        assert_eq!(
+            WeatherKind::from_icon_code("153"),
+            WeatherKind::PartlyCloudy
+        );
+        // 阴（含夜间 154）。
+        assert_eq!(WeatherKind::from_icon_code("104"), WeatherKind::Cloudy);
+        assert_eq!(WeatherKind::from_icon_code("154"), WeatherKind::Cloudy);
+        // 雨：阵雨、小雨、中雨、大雨、暴雨…
+        for code in [
+            "300", "301", "305", "306", "307", "310", "311", "312", "399",
+        ] {
+            assert_eq!(
+                WeatherKind::from_icon_code(code),
+                WeatherKind::Rain,
+                "码 {code} 应判为雨"
+            );
+        }
+        // 雷阵雨必须与普通雨分开，否则雷暴图标画不出来。
+        assert_eq!(
+            WeatherKind::from_icon_code("302"),
+            WeatherKind::Thunderstorm
+        );
+        assert_eq!(
+            WeatherKind::from_icon_code("303"),
+            WeatherKind::Thunderstorm
+        );
+        // 冰雹。
+        assert_eq!(WeatherKind::from_icon_code("304"), WeatherKind::Hail);
+        // 雪。
+        for code in ["400", "401", "402", "403", "499"] {
+            assert_eq!(
+                WeatherKind::from_icon_code(code),
+                WeatherKind::Snow,
+                "码 {code} 应判为雪"
+            );
+        }
+        // 雨夹雪 / 冻雨。
+        assert_eq!(WeatherKind::from_icon_code("404"), WeatherKind::Sleet);
+        assert_eq!(WeatherKind::from_icon_code("313"), WeatherKind::Sleet);
+        // 雾 / 霾 / 浮尘。
+        assert_eq!(WeatherKind::from_icon_code("501"), WeatherKind::Fog);
+        assert_eq!(WeatherKind::from_icon_code("502"), WeatherKind::Haze);
+        assert_eq!(WeatherKind::from_icon_code("503"), WeatherKind::Dust);
+        assert_eq!(WeatherKind::from_icon_code("504"), WeatherKind::Dust);
+    }
+
+    /// 图标码可能带昼夜后缀（`"100d"` / `"101n"`），必须一样能认出来。
+    ///
+    /// 不剥后缀的话，夜间时段的天气会整片落进 `Unknown`。
+    #[test]
+    fn icon_codes_with_day_night_suffix_are_recognized() {
+        assert_eq!(WeatherKind::from_icon_code("100d"), WeatherKind::Clear);
+        assert_eq!(WeatherKind::from_icon_code("100n"), WeatherKind::Clear);
+        assert_eq!(
+            WeatherKind::from_icon_code("101d"),
+            WeatherKind::PartlyCloudy
+        );
+        assert_eq!(WeatherKind::from_icon_code("104n"), WeatherKind::Cloudy);
+        assert_eq!(
+            WeatherKind::from_icon_code("302n"),
+            WeatherKind::Thunderstorm
+        );
+        assert_eq!(WeatherKind::from_icon_code("400d"), WeatherKind::Snow);
+        // 前后空白也要容忍。
+        assert_eq!(WeatherKind::from_icon_code("  100d  "), WeatherKind::Clear);
+    }
+
+    /// 认不出的码归 `Unknown`，不报错也不误判。
+    #[test]
+    fn unknown_icon_codes_fall_back_to_unknown() {
+        for code in ["", "   ", "999", "abc", "d", "n"] {
+            assert_eq!(
+                WeatherKind::from_icon_code(code),
+                WeatherKind::Unknown,
+                "码 {code:?} 应判为未知"
+            );
+        }
+    }
+
+    #[test]
+    fn public_ip_classification() {
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(!is_public_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip("0.0.0.0".parse().unwrap()));
+        assert!(!is_public_ip("224.0.0.1".parse().unwrap()));
+        assert!(is_public_ip("2606:4700::1111".parse().unwrap()));
+        assert!(!is_public_ip("::1".parse().unwrap()));
     }
 }

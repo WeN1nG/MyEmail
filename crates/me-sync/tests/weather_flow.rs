@@ -17,11 +17,16 @@ use me_sync::events::EventSender;
 use tokio::sync::mpsc;
 
 /// 假的数据源：搜索与预报结果都可预设。
+///
+/// 记录每次调用用的 Host 与 Key——用来断言「测试连接真的测的是用户
+/// 当场填的那一组」，而不是某个缓存下来的旧值。
 struct FakeProvider {
     candidates: Mutex<Vec<WeatherLocationCandidate>>,
     /// 用 `String` 存错误：`CoreError` 不可克隆。
     forecast: Mutex<Result<WeatherForecast, String>>,
     calls: Mutex<usize>,
+    /// 每次调用时传入的 Host。
+    hosts: Mutex<Vec<String>>,
 }
 
 impl FakeProvider {
@@ -30,25 +35,39 @@ impl FakeProvider {
             candidates: Mutex::new(Vec::new()),
             forecast: Mutex::new(Ok(sample_forecast())),
             calls: Mutex::new(0),
+            hosts: Mutex::new(Vec::new()),
         })
+    }
+
+    /// 记录一次调用的 Host。
+    fn record_host(&self, api_host: &str) {
+        if let Ok(mut hosts) = self.hosts.lock() {
+            hosts.push(api_host.to_string());
+        }
     }
 }
 
 impl WeatherProvider for FakeProvider {
     fn search_locations<'a>(
         &'a self,
+        api_host: &'a str,
         _query: &'a str,
         _credential: &'a WeatherCredential,
     ) -> me_core::weather::WeatherFuture<'a, Result<Vec<WeatherLocationCandidate>, CoreError>> {
-        Box::pin(async move { Ok(self.candidates.lock().unwrap().clone()) })
+        Box::pin(async move {
+            self.record_host(api_host);
+            Ok(self.candidates.lock().unwrap().clone())
+        })
     }
 
     fn forecast<'a>(
         &'a self,
+        api_host: &'a str,
         _location: &'a me_core::weather::WeatherLocation,
         _credential: &'a WeatherCredential,
     ) -> me_core::weather::WeatherFuture<'a, Result<WeatherForecast, CoreError>> {
         Box::pin(async move {
+            self.record_host(api_host);
             *self.calls.lock().unwrap() += 1;
             match self.forecast.lock().unwrap().clone() {
                 Ok(forecast) => Ok(forecast),
@@ -94,6 +113,9 @@ fn sample_forecast() -> WeatherForecast {
             precip_mm: 0.0,
             kind: WeatherKind::Clear,
             text: "晴".into(),
+            icon_day: "100d".into(),
+            icon_night: "150n".into(),
+            text_night: "晴".into(),
         }],
     }
 }
@@ -110,6 +132,19 @@ fn candidate(name: &str, id: &str) -> WeatherLocationCandidate {
         longitude: 116.4,
         timezone: "Asia/Shanghai".into(),
     }
+}
+
+/// 取库里某个地点的 id（按服务商地点 id 认领）。
+fn find_location_id(
+    store: &Store,
+    provider_location_id: &str,
+) -> me_core::weather::WeatherLocationId {
+    me_core::port::WeatherRepo::list_weather_locations(&store.writable())
+        .unwrap()
+        .into_iter()
+        .find(|item| item.provider_location_id == provider_location_id)
+        .map(|item| item.id)
+        .expect("地点应已入库")
 }
 
 fn start_service(
@@ -234,6 +269,145 @@ async fn adding_a_location_persists_it_and_refreshes_weather() {
     assert_eq!(*provider.calls.lock().unwrap(), 1, "应只请求一次预报");
 }
 
+/// 回归：加了第二个城市之后，**第二个城市**也要有自己的天气。
+///
+/// 早先的缺陷是刷新流程写死了「默认地点」：
+/// `RefreshWeather` 不带地点 id，后端一律刷新默认地点，
+/// 于是第二个及以后的地点永远没有快照，界面读不出来。
+#[tokio::test]
+async fn every_location_gets_its_own_weather() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let provider = FakeProvider::new();
+    let (tx, mut rx) = start_service(&store, Some(provider.clone()));
+
+    // 第一个城市（北京）：默认地点。
+    tx.send(Command::AddWeatherLocation {
+        candidate: candidate("北京", "101010100"),
+    })
+    .unwrap();
+    wait_for(&mut rx, |event| {
+        matches!(event, Event::WeatherUpdated { .. })
+    })
+    .await;
+
+    // 第二个城市（上海）：非默认地点。
+    tx.send(Command::AddWeatherLocation {
+        candidate: candidate("上海", "101020100"),
+    })
+    .unwrap();
+    let updated = wait_for(&mut rx, |event| {
+        matches!(event, Event::WeatherUpdated { .. })
+    })
+    .await;
+    match updated {
+        Event::WeatherUpdated { location_id, .. } => {
+            let shanghai = find_location_id(&store, "101020100");
+            assert_eq!(
+                location_id, shanghai,
+                "刷新应落在刚添加的上海上，而不是默认地点北京"
+            );
+        }
+        other => panic!("事件类型不对：{other:?}"),
+    }
+
+    // 两个地点各自都有快照，互不覆盖。
+    let beijing = find_location_id(&store, "101010100");
+    let shanghai = find_location_id(&store, "101020100");
+    for id in [beijing, shanghai] {
+        let snapshot = me_core::port::WeatherRepo::get_weather_snapshot(&store.writable(), id)
+            .unwrap()
+            .expect("每个地点都应有自己的快照");
+        assert_eq!(snapshot.current.temp_c, 18.5);
+    }
+    assert_eq!(*provider.calls.lock().unwrap(), 2, "两个城市各请求一次");
+}
+
+/// 回归：刷新**指定地点**时，不能动到别的地点。
+///
+/// 最小间隔与退避都按地点分别计算：刚刷完北京不该挡住刷新上海，
+/// 否则切换到第二个城市后会一直看到「刚刚更新过，请稍后再试」。
+#[tokio::test]
+async fn refreshing_one_location_leaves_the_others_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let provider = FakeProvider::new();
+    // 用默认的 60 秒最小间隔，才能验出「按地点分别计时」。
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<Command>();
+    let (event_tx, mut event_rx) = mpsc::channel::<Event>(1024);
+    let events = EventSender::new(event_tx, Arc::new(|| {}));
+    let service = SyncService::new(
+        store.writable(),
+        me_proto::ProtoFactory,
+        me_proto::ProtoSmtp,
+        store.paths(),
+        events,
+        Arc::new(me_sync::NoopBrowser),
+    )
+    .with_weather_provider(provider.clone())
+    .with_weather_credential(WeatherCredential::new("test-key"));
+    tokio::spawn(async move { service.run(command_rx).await });
+
+    command_tx
+        .send(Command::AddWeatherLocation {
+            candidate: candidate("北京", "101010100"),
+        })
+        .unwrap();
+    wait_for(&mut event_rx, |event| {
+        matches!(event, Event::WeatherUpdated { .. })
+    })
+    .await;
+
+    // 紧接着刷新上海：北京刚请求过，但上海没请求过，不该被最小间隔挡住。
+    command_tx
+        .send(Command::AddWeatherLocation {
+            candidate: candidate("上海", "101020100"),
+        })
+        .unwrap();
+    let updated = wait_for(&mut event_rx, |event| {
+        matches!(event, Event::WeatherUpdated { .. })
+    })
+    .await;
+    match updated {
+        Event::WeatherUpdated { location_id, .. } => {
+            assert_eq!(location_id, find_location_id(&store, "101020100"));
+        }
+        other => panic!("事件类型不对：{other:?}"),
+    }
+}
+
+/// 回归：删除地点后，它的快照也一起消失（外键 CASCADE）。
+#[tokio::test]
+async fn removing_a_location_drops_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let provider = FakeProvider::new();
+    let (tx, mut rx) = start_service(&store, Some(provider));
+
+    tx.send(Command::AddWeatherLocation {
+        candidate: candidate("北京", "101010100"),
+    })
+    .unwrap();
+    wait_for(&mut rx, |event| {
+        matches!(event, Event::WeatherUpdated { .. })
+    })
+    .await;
+
+    let id = find_location_id(&store, "101010100");
+    tx.send(Command::RemoveWeatherLocation { id }).unwrap();
+    wait_for(&mut rx, |event| {
+        matches!(event, Event::WeatherLocationsChanged)
+    })
+    .await;
+
+    assert!(
+        me_core::port::WeatherRepo::get_weather_snapshot(&store.writable(), id)
+            .unwrap()
+            .is_none(),
+        "地点删掉后快照也应删掉"
+    );
+}
+
 #[tokio::test]
 async fn failed_refresh_keeps_the_cached_snapshot() {
     let dir = tempfile::tempdir().unwrap();
@@ -253,16 +427,23 @@ async fn failed_refresh_keeps_the_cached_snapshot() {
 
     // 再让数据源失败。
     *provider.forecast.lock().unwrap() = Err("连接超时".to_string());
-    tx.send(Command::RefreshWeather { force: true }).unwrap();
+    let id = find_location_id(&store, "101010100");
+    tx.send(Command::RefreshWeather { id, force: true })
+        .unwrap();
 
     let failed = wait_for(&mut rx, |event| {
         matches!(event, Event::WeatherFailed { .. })
     })
     .await;
     match failed {
-        Event::WeatherFailed { message, has_cache } => {
+        Event::WeatherFailed {
+            message,
+            has_cache,
+            location_id,
+        } => {
             assert!(has_cache, "本地仍有缓存，应提示而不是空白");
             assert!(!message.is_empty());
+            assert_eq!(location_id, Some(id), "失败应指出是哪个地点");
         }
         other => panic!("事件类型不对：{other:?}"),
     }
@@ -318,14 +499,19 @@ async fn refresh_without_key_reports_configuration_error() {
     }
 
     command_tx
-        .send(Command::RefreshWeather { force: true })
+        .send(Command::RefreshWeather {
+            id: find_location_id(&store, "101010100"),
+            force: true,
+        })
         .unwrap();
     let failed = wait_for(&mut event_rx, |event| {
         matches!(event, Event::WeatherFailed { .. })
     })
     .await;
     match failed {
-        Event::WeatherFailed { message, has_cache } => {
+        Event::WeatherFailed {
+            message, has_cache, ..
+        } => {
             assert!(message.contains("Key"), "应提示配置 Key，实际 {message}");
             assert!(!has_cache);
         }
@@ -416,9 +602,10 @@ async fn invalid_host_is_rejected() {
     .await;
     match failed {
         Event::WeatherFailed { message, .. } => {
+            // 协议由程序决定（http 会被升级成 https），这里被拒的理由是内网地址。
             assert!(
-                message.contains("https"),
-                "应说明必须用 https，实际 {message}"
+                message.contains("内网") || message.contains("本机"),
+                "应说明不能指向内网，实际 {message}"
             );
         }
         other => panic!("事件类型不对：{other:?}"),
@@ -442,7 +629,11 @@ async fn snapshot_is_reused_when_still_fresh() {
     .await;
 
     // 快照未过期，普通刷新应直接复用，不发请求。
-    tx.send(Command::RefreshWeather { force: false }).unwrap();
+    tx.send(Command::RefreshWeather {
+        id: find_location_id(&store, "101010100"),
+        force: false,
+    })
+    .unwrap();
     let updated = wait_for(&mut rx, |event| {
         matches!(event, Event::WeatherUpdated { .. })
     })
@@ -558,12 +749,53 @@ async fn connection_test_rejects_invalid_host() {
         Event::WeatherConnectionTested { ok, message } => {
             assert!(!ok, "应测试失败");
             assert!(
-                message.contains("https"),
-                "应说明必须用 https，实际 {message}"
+                message.contains("内网") || message.contains("本机"),
+                "应说明不能指向内网，实际 {message}"
             );
         }
         other => panic!("事件类型不对：{other:?}"),
     }
+}
+
+/// 「测试连接」必须用**用户当场填的 Host**，而不是会话里已生效的那个。
+///
+/// 这是个真实缺陷：早先的实现复用启动时注入的数据源，测的其实是旧地址，
+/// 用户填错了 Host 也照样显示「连接成功」。
+#[tokio::test]
+async fn connection_test_uses_the_host_the_user_just_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let provider = FakeProvider::new();
+    provider
+        .candidates
+        .lock()
+        .unwrap()
+        .push(candidate("北京", "101010100"));
+    let (tx, mut rx) = start_service(&store, Some(provider.clone()));
+
+    // 裸域名：程序自己补 https://。
+    tx.send(Command::TestWeatherConnection {
+        host: "abc.qweatherapi.com".into(),
+        key: "test-key".into(),
+    })
+    .unwrap();
+    let tested = wait_for(&mut rx, |event| {
+        matches!(event, Event::WeatherConnectionTested { .. })
+    })
+    .await;
+    match tested {
+        Event::WeatherConnectionTested { ok, message } => {
+            assert!(ok, "应测试成功，实际 {message}");
+        }
+        other => panic!("事件类型不对：{other:?}"),
+    }
+
+    let hosts = provider.hosts.lock().unwrap().clone();
+    assert_eq!(
+        hosts.last().map(String::as_str),
+        Some("https://abc.qweatherapi.com"),
+        "测试连接必须用用户刚填的 Host（规范化后），实际 {hosts:?}"
+    );
 }
 
 #[tokio::test]
@@ -631,5 +863,43 @@ async fn saving_config_stores_only_the_single_host() {
         stored.as_deref(),
         Some("https://abc.qweatherapi.com"),
         "Host 应被持久化"
+    );
+}
+
+/// 用户填**裸域名**就行：程序自己补 `https://` 再存。
+#[tokio::test]
+async fn saving_config_normalizes_a_bare_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let (tx, mut rx) = start_service(&store, None);
+
+    tx.send(Command::SetWeatherConfig {
+        host: "abc.qweatherapi.com".into(),
+        key: Some("test-key".into()),
+    })
+    .unwrap();
+    let changed = wait_for(&mut rx, |event| {
+        matches!(
+            event,
+            Event::WeatherConfigChanged { api_host, .. }
+                if api_host == "https://abc.qweatherapi.com"
+        )
+    })
+    .await;
+    match changed {
+        Event::WeatherConfigChanged { api_host, .. } => {
+            assert_eq!(api_host, "https://abc.qweatherapi.com");
+        }
+        other => panic!("事件类型不对：{other:?}"),
+    }
+
+    let stored = store
+        .writable()
+        .get_setting(me_core::settings_key::WEATHER_API_HOST)
+        .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some("https://abc.qweatherapi.com"),
+        "裸域名应被规范化后持久化"
     );
 }

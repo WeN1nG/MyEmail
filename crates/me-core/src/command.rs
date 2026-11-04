@@ -226,9 +226,14 @@ pub enum Command {
     SetDefaultWeatherLocation {
         id: crate::weather::WeatherLocationId,
     },
-    /// 刷新默认地点的天气。`force` 只跳过「未过期直接复用」，
-    /// 最小间隔与退避仍然生效。
+    /// 刷新**某个地点**的天气。
+    ///
+    /// `id` 指定刷新哪个地点：多地点时必须显式带上，不能只刷默认地点
+    /// （否则切到别的城市就永远读不到它的天气）。
+    /// `force` 只跳过「未过期直接复用」，最小间隔与退避仍然生效
+    /// （两者都**按地点分别计算**）。
     RefreshWeather {
+        id: crate::weather::WeatherLocationId,
         force: bool,
     },
 }
@@ -606,7 +611,11 @@ pub enum Event {
         expires_at: i64,
     },
     /// 天气刷新失败。`has_cache` 表示本地仍有缓存可显示。
+    ///
+    /// `location_id` 指出是哪个地点失败的；`None` 表示与地点无关的
+    /// 全局失败（如 Host 非法、没配 API Key）。
     WeatherFailed {
+        location_id: Option<crate::weather::WeatherLocationId>,
         message: String,
         has_cache: bool,
     },

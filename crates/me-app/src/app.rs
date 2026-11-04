@@ -226,40 +226,71 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             }
         };
         self.state.weather.locations = locations;
-        let active = self.state.weather.active_location().map(|item| item.id);
+        // 认领刚添加的地点：它入库后才有 id，按服务商地点 id 匹配。
+        if let Some(pending) = self.state.weather.pending_select.clone()
+            && let Some(location) = self
+                .state
+                .weather
+                .locations
+                .iter()
+                .find(|item| item.provider_location_id == pending)
+        {
+            self.state.weather.selected = Some(location.id);
+            self.state.weather.pending_select = None;
+        }
+        let active = self.state.weather.active_location_id();
         match active {
             Some(id) => match self.repo.get_weather_snapshot_readonly(id) {
-                Ok(snapshot) => self.state.weather.snapshot = snapshot,
+                Ok(snapshot) => {
+                    self.state.weather.snapshot = snapshot;
+                    // 记下这份快照属于哪个地点：切换地点后，
+                    // 拿旧地点的快照去判断「是否过期」会得出错误结论。
+                    self.state.weather.snapshot_location = Some(id);
+                }
                 Err(err) => self.report_error(ErrorScope::Global, err),
             },
-            None => self.state.weather.snapshot = None,
+            None => {
+                self.state.weather.snapshot = None;
+                self.state.weather.snapshot_location = None;
+            }
         }
     }
 
-    /// 页面停在天气页时，缓存缺失或过期就自动刷新一次（60 秒节流）。
+    /// 页面停在天气页时，当前地点的缓存缺失或过期就自动刷新一次（每地点 60 秒节流）。
     fn maybe_auto_refresh_weather(&mut self, commands: &mut Vec<Command>) {
         if !self.state.weather.key_present {
             return;
         }
-        let Some(location) = self.state.weather.active_location() else {
+        let Some(location_id) = self.state.weather.active_location_id() else {
             return;
         };
-        let location_id = location.id;
         let now = me_core::now_unix();
-        if now - self.state.weather.auto_refresh_at < 60 {
+        // 每个地点各自节流：刚刷新过 A 城，不该挡住切换到 B 城后的首次请求。
+        if let Some(last) = self.state.weather.auto_refresh_at.get(&location_id)
+            && now - last < 60
+        {
             return;
         }
-        let expired = match &self.state.weather.snapshot {
-            Some(snapshot) => me_core::weather::is_expired(now, snapshot.expires_at),
-            None => true,
+        // 只有属于当前地点的快照才能用来判断是否过期。
+        let expired = match (
+            &self.state.weather.snapshot,
+            self.state.weather.snapshot_location,
+        ) {
+            (Some(snapshot), Some(owner)) if owner == location_id => {
+                me_core::weather::is_expired(now, snapshot.expires_at)
+            }
+            _ => true,
         };
         if !expired {
             return;
         }
-        self.state.weather.auto_refresh_at = now;
-        self.state.weather.refreshing = true;
-        commands.push(Command::RefreshWeather { force: false });
-        let _ = location_id;
+        self.state.weather.auto_refresh_at.insert(location_id, now);
+        self.state.weather.refreshing.insert(location_id);
+        // 刷的是**当前显示的地点**：切到第二个城市后，自动刷新动的也应该是它。
+        commands.push(Command::RefreshWeather {
+            id: location_id,
+            force: false,
+        });
     }
 
     /// 重查当前视图的日程。
@@ -988,8 +1019,14 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 api_host,
             } => {
                 self.state.weather.key_present = key_present;
-                self.state.weather.api_host = api_host;
+                self.state.weather.api_host = api_host.clone();
                 self.state.weather.dirty = true;
+                // 只有用户主动保存过才提示：启动时读回配置也会发这个事件。
+                if self.state.weather.save_requested {
+                    self.state.weather.save_requested = false;
+                    self.state
+                        .toast(ToastKind::Info, format!("天气配置已保存（{api_host}）"));
+                }
             }
             Event::WeatherConnectionTested { ok, message } => {
                 self.state.weather.testing = false;
@@ -1019,19 +1056,33 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             Event::WeatherLocationsChanged => {
                 self.state.weather.dirty = true;
             }
-            Event::WeatherUpdated { .. } => {
-                self.state.weather.refreshing = false;
-                self.state.weather.error = None;
+            Event::WeatherUpdated { location_id, .. } => {
+                // 只结束**这个地点**的刷新状态：别的城市还在刷不算完成。
+                self.state.weather.refreshing.remove(&location_id);
+                // 错误提示也是按地点记的：清掉属于该地点的那条。
+                if self.state.weather.error_location == Some(location_id) {
+                    self.state.weather.error = None;
+                    self.state.weather.error_location = None;
+                }
                 self.state.weather.dirty = true;
             }
-            Event::WeatherFailed { message, has_cache } => {
-                self.state.weather.refreshing = false;
+            Event::WeatherFailed {
+                location_id,
+                message,
+                has_cache,
+            } => {
+                if let Some(id) = location_id {
+                    self.state.weather.refreshing.remove(&id);
+                }
                 self.state.weather.dirty = true;
+                // 保存失败：不再等待「已保存」提示。
+                self.state.weather.save_requested = false;
                 self.state.weather.error = Some(if has_cache {
                     format!("{message}（显示的是缓存数据）")
                 } else {
                     message.clone()
                 });
+                self.state.weather.error_location = location_id;
                 self.state.toast(ToastKind::Warn, message);
             }
             Event::CalendarReminder {
