@@ -16,7 +16,7 @@ pub mod tasks;
 pub mod watcher;
 mod weather;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -26,8 +26,8 @@ use me_core::port::{BrowserOpener, ImapSession, SmtpSender, StorePort};
 use me_core::{
     APP_NAME, Account, AccountId, AuthCredential, Command, ConnectionState, CoreError,
     DEFAULT_POLL_SECS, DraftContent, DraftId, DraftStatus, ErrorScope, Event, FlagOp, Flags,
-    FolderRole, HtmlRendererMode, MAX_POLL_SECS, MIN_POLL_SECS, MessageId, MusicOrder,
-    OAuthClientConfig, OAuthProvider, OutgoingMessage, SavedSearch, SavedSearchId,
+    FolderRole, HtmlRendererMode, MAX_POLL_SECS, MIN_POLL_SECS, MessageId, MessageSummary,
+    MusicOrder, OAuthClientConfig, OAuthProvider, OutgoingMessage, SavedSearch, SavedSearchId,
     SavedSearchQuery, SearchQuery, SendFailureKind, ThemeMode,
 };
 use me_store::cache::{self, CachePaths};
@@ -1376,13 +1376,15 @@ where
             return;
         }
 
-        let mut account = None;
-        let mut messages = Vec::new();
+        // **按账户分组**：统一收件箱（v0.4 的 C1）里的批量删除会横跨账户。
+        // 每个账户有自己的文件夹树、废件箱与服务器能力，必须各算各的——
+        // 旧实现拿「最后一封邮件的账户」当作全部邮件的账户，
+        // 会把别的账户的邮件移到一个不属于它的文件夹 id 上。
+        let mut by_account: BTreeMap<AccountId, Vec<MessageSummary>> = BTreeMap::new();
         for &id in &ids {
             match self.db(move |s| s.get_message(id)).await {
                 Ok(Some(message)) => {
-                    account = Some(message.account);
-                    messages.push(message);
+                    by_account.entry(message.account).or_default().push(message);
                 }
                 Ok(None) => {}
                 Err(err) => {
@@ -1394,8 +1396,18 @@ where
                 }
             }
         }
-        let Some(account) = account else { return };
 
+        for (account, messages) in by_account {
+            self.move_account_messages_to_trash(account, messages).await;
+        }
+    }
+
+    /// 单个账户内的删除：废件箱里的走永久删除，其余移入**该账户**的废件箱。
+    async fn move_account_messages_to_trash(
+        &self,
+        account: AccountId,
+        messages: Vec<MessageSummary>,
+    ) {
         let folders = match self.db(move |s| s.list_folders(account)).await {
             Ok(folders) => folders,
             Err(err) => {
@@ -1451,22 +1463,25 @@ where
                     return;
                 }
             }
-            let permanent_folder = messages
-                .iter()
-                .find(|m| role_of(m.folder) == FolderRole::Trash)
-                .map(|m| m.folder);
+            // 按文件夹分组发 `MessagesRemoved`——同一账户可能有多个
+            // 废件箱角色文件夹（SPECIAL-USE 启发式可能标错），
+            // 用「第一个废件箱」会把别的文件夹里的行错误地从前端抹掉。
+            let mut permanent_by_folder: BTreeMap<me_core::FolderId, Vec<MessageId>> =
+                BTreeMap::new();
+            for message in messages.iter().filter(|m| permanent.contains(&m.id)) {
+                permanent_by_folder
+                    .entry(message.folder)
+                    .or_default()
+                    .push(message.id);
+            }
             let permanent_for_db = permanent.clone();
             match self
                 .db(move |s| s.delete_permanent(&permanent_for_db))
                 .await
             {
                 Ok(_) => {
-                    if let Some(folder) = permanent_folder {
-                        self.emit(Event::MessagesRemoved {
-                            folder,
-                            ids: permanent.clone(),
-                        })
-                        .await;
+                    for (folder, ids) in permanent_by_folder {
+                        self.emit(Event::MessagesRemoved { folder, ids }).await;
                     }
                     let token = CancellationToken::new();
                     let service = self.clone();
