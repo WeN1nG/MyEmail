@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 项目概览
 
 MyEmail 是 Rust + egui/eframe 的原生桌面邮件客户端：多账户 IMAP 收信、SMTP 发信、SQLite 全量摘要 + 文件正文缓存、FTS5 离线全文检索。**v0.1、v0.2 已闭环**；当前为 **v0.3（0.3.0）**：schema **v5**，在邮件主链路上新增**日历 / 天气 / AI 对话 / 音乐播放器**四个页面（顶部页签 `邮件 / 日历 / 天气 / AI / 音乐 / 账户 / 设置`，`Ctrl+1..7` 直达）。
-自动化测试 **548 passed / 5 ignored**（`cargo test --workspace` 实测）；`cargo deny check` 已在本机通过。**尚未做**真实 Gmail/Outlook 授权、真实天气/AI 密钥、真机音频与 Docker E2E 的人工验收——见 [doc/versiondoc/v03收尾.md](doc/versiondoc/v03收尾.md) §7。
+自动化测试 **561 passed / 6 ignored**（`cargo test --workspace` 实测）；`cargo deny check` 已在本机通过。**尚未做**真实 Gmail/Outlook 授权、真实天气/AI 密钥、真机音频与 Docker E2E 的人工验收——见 [doc/versiondoc/v03收尾.md](doc/versiondoc/v03收尾.md) §7。
 
 v0.3 的**未交付项**（写代码前先看，别当成已实现）：`.ics` 导入导出与邮件 `text/calendar` 邀请导入、系统通知（只有应用内 toast）、日历「仅此次」编辑界面、四个模块的 `feature_*` 开关接线（`FEATURE_CALENDAR` / `FEATURE_AI` 只有常量、无读取方）、AI 会话滚动分页（当前固定拉 100 条）。收尾进度见 [doc/versiondoc/v3收尾项清单.md](doc/versiondoc/v3收尾项清单.md)。
 
@@ -108,7 +108,7 @@ me-app ──Command/Event──► me-sync ──► me-proto
 ## crate 关键事实
 
 - **me-core**（[port.rs](crates/me-core/src/port.rs)、[command.rs](crates/me-core/src/command.rs)、[model.rs](crates/me-core/src/model.rs)、[ai.rs](crates/me-core/src/ai.rs)、[ai_plan.rs](crates/me-core/src/ai_plan.rs)、[calendar.rs](crates/me-core/src/calendar.rs)、[weather.rs](crates/me-core/src/weather.rs)、[music.rs](crates/me-core/src/music.rs)、[error.rs](crates/me-core/src/error.rs)）
-  - `SCHEMA_VERSION = 5`（[lib.rs](crates/me-core/src/lib.rs)）。v3 表结构冻结，v4/v5 都是**纯加列**。
+  - `SCHEMA_VERSION = 6`（[lib.rs](crates/me-core/src/lib.rs)）。v3 表结构冻结，v4/v5 都是**纯加列**，v6 是**纯索引调整**（不动列/约束）。
   - [ai.rs](crates/me-core/src/ai.rs)：AI 领域类型与**纯函数**——`build_chat_request`（拼系统提示/历史/引用/实体，含字符预算与整轮裁剪）、`escape_context`（把 `---` 换成破折号，堵死伪造分隔符）、`select_entities`、`TOOL_SPECS`（**14 个工具**）/ `tool_specs(permissions)`、`AiToolName::is_replay_safe`、`CancelFlag`（`Arc<AtomicBool>`，不把 tokio 带进领域层）、`AiProvider` / `AiRepo` / `AiMemoryRepo` 端口。`AiCredential` 的 `Debug` 脱敏且**不实现 `Serialize`**。
   - 模型档案（v0.3）：`AiModel` 是**唯一**的调用参数来源（`id` / `name` / `kind` / `base_url` / `model` / `max_input_chars` / `max_output_tokens` / `tools` / `api_key`）。`tools` 是 `AiToolPermissions` 的 **9 个** bool 开关（`email_search` / `mail_read` / `weather` / `calendar_read` / `calendar_create` / `calendar_update` / `calendar_delete` / `music` / `memory`），`#[serde(default)]` 全开，**加字段不迁移**。`validate_model` 复用 `validate_config` 的端点规则并校验 key 形态（空可接受），名称判重走 `normalize_model_name`（trim + 小写），`next_model_id` 生成 `m1`/`m2`…，`resolve_model` 按「会话绑定 → 当前模型 → 列表第一个」三级回退。`AiConversation` 8 个字段，`model_id` 记录绑定，`provider`/`model` 保留为创建时快照。
   - **`api_key` 是普通字段**：与其他参数一起序列化进 `meta.ai_models`（明文），不走 keyring，没有「保存 Key」这类单独按钮。`AiModel` 因此**手写 `Debug`**，`api_key` 只输出 `<redacted>` / `<empty>`——这条不能因为「反正已经明文存了」而删掉：事件载荷、日志、测试失败输出都会经过 `Debug`。
@@ -136,7 +136,8 @@ me-app ──Command/Event──► me-sync ──► me-proto
   - `Store::open()` 依次做目录 / PRAGMA / `quick_check` / schema 初始化 / WAL checkpoint；之后 `writable()` 交给 `me-sync`，`read_only()` 交给 `me-app`。
   - 只做「存取 + 约束」，不判断业务语义；事务内不做网络 IO。**两处约束刻意放在存储层**（防竞态）：AI 实体上限 200、助手消息 256 KiB 截断；另有天气地点上限 8、默认地点唯一（部分唯一索引 + 事务内先清零再置位）。
   - FTS5 使用 `trigram` 分词：查询词 ≥3 字符才能命中正文，1–2 字符仅 `LIKE` 头部三列（`subject`/`from_addr`/`to_addrs`）。
-  - `schema_version = 5`，迁移链 **v1→v2→v3→v4→v5**，每步单独事务、末尾 `foreign_key_check`；迁移失败不写版本号并中止启动。v3 引入日历/天气/AI 共 11 张表，v4 给 `ai_conversations` 补 `model_id`，v5 给 `ai_messages` 补 `plan`（任务清单 JSON）。v4/v5 都用 `pragma_table_info` 判列**幂等**执行——新建库的 DDL 已带该列，只有真正的老库需要 ALTER。中间步骤的版本号**写死**（v2→v3 写 `3`、v3→v4 写 `4`、v4→v5 写 `5`），不能写 `SCHEMA_VERSION`，否则会给旧库盖上「已是最新」的章而跳过后续迁移。
+  - `schema_version = 6`，迁移链 **v1→v2→v3→v4→v5→v6**，每步单独事务、末尾 `foreign_key_check`；迁移失败不写版本号并中止启动。v3 引入日历/天气/AI 共 11 张表，v4 给 `ai_conversations` 补 `model_id`，v5 给 `ai_messages` 补 `plan`（任务清单 JSON）。v4/v5 都用 `pragma_table_info` 判列**幂等**执行——新建库的 DDL 已带该列，只有真正的老库需要 ALTER。中间步骤的版本号**写死**（v2→v3 写 `3`、v3→v4 写 `4`、v4→v5 写 `5`、v5→v6 写 `6`），不能写 `SCHEMA_VERSION`，否则会给旧库盖上「已是最新」的章而跳过后续迁移。
+  - **v5 → v6 是纯索引调整**（[migrations.rs](crates/me-store/src/migrations.rs) 的 `migrate_v5_to_v6`）：`idx_messages_folder_date` 补 `id DESC`、`idx_messages_body_pending` 改成 `(account_id, folder_id, date DESC, id DESC)`、新增 `idx_messages_unread(folder_id, (flags & 1))` 与 `idx_drafts_updated`、两条 AI 索引补 `id DESC`。SQLite 没有 `ALTER INDEX`，改列序只能 **DROP + CREATE**（对同名索引幂等，且列序必然与 DDL 一致）。**索引列序必须与 `ORDER BY` 前缀严格对齐**——只补 `id` 不够，首列不对仍要临时排序（详见 [数据结构.md](doc/数据结构.md) §6.1/§6.3）。
   - 全库 **20 张表**（19 张普通表 + `messages_fts` 虚表）。
   - Drafts 文件夹不再写入 `messages`；草稿只走 `drafts` 表（`bcc_addrs` 仅本地保存，不写入 RFC822）。草稿同步状态机 6 态：`local_only` / `synced` / `local_dirty` / `conflict` / `deleted_local` / `deleted_server`；墓碑 = `deleted_at` 时间戳 + `deleted_local`；冲突副本用 `conflict_of` 列指向原草稿、标题加 `[冲突副本] ` 前缀、`raw_path` 置空串。
   - 日历范围查询把「一次性事件」与「未结束的重复事件」拆成**两条 SQL**：重复系列用 `start_utc <= ? AND (recurrence_until IS NULL OR recurrence_until >= ?)` 且**降序**取最近一批，避免历史重复事件挤掉当月视图。提醒去重主键是 `calendar_reminder_fires (event_id, occurrence_at, minutes_before)`，写入用 `INSERT OR IGNORE`。
@@ -149,7 +150,7 @@ me-app ──Command/Event──► me-sync ──► me-proto
   - `oauth_flow.rs`：回环回调（只绑 `127.0.0.1:0`，state 是 32 字节随机数、**常量时间比较**、5 分钟超时、socket 读取单次 2s）与设备码轮询（`SlowDown` 时间隔 +5s）；成功后创建账户或更新同一账户的令牌；浏览器通过注入的 `BrowserOpener` 打开。
   - `run()` 消费 Command 循环；每个命令 `dispatch` 到独立 handler，DB 访问统一走 `self.db(...)`。
   - 事件经 `EventSender` 发出：进度事件可丢，关键事件背压；`ProgressThrottle` 每 ≥200 ms **或**每 50 封发一次；AI delta 另有 `DeltaThrottle`（≥50 ms 或 ≥2 KB）。
-  - 后台补全队列为 `body_path IS NULL AND uid IS NOT NULL`，按 `(folder_id, uid)` 升序（取批 200），排除 Drafts 文件夹；进度天然持久（`body_path` 非空即完成）。
+  - 后台补全队列为 `body_path IS NULL AND uid IS NOT NULL`，按 `(folder_id, date DESC, id DESC)` 排序（取批 200），排除 Drafts 文件夹；**`folder_id` 必须留在最前**——indexer 是**游程式**消费（`jobs[index].folder` 之后只吃「连续同 folder」的一段，每段一次 `SELECT` 再批量 `FETCH`），文件夹一旦交错，同一文件夹会被反复 SELECT、IMAP 往返成倍增加；文件夹**内部**按时间倒序，保证最近的邮件先被索引。`date` 为 NULL（缺 Date 头）在 DESC 下排末位。进度天然持久（`body_path` 非空即完成）。
   - `calendar.rs` 是日历写操作的**唯一实现**（`dispatch` 与 `ai_tools` 都只是薄壳）——算 `recurrence_until`、校验、来源归属、事务内落库、发事件只在这里做一次。AI 侧不复用 `Command`：Command 是无界通道 fire-and-forget，拿不到返回值，而工具调用必须同步返回事件 id。
   - `weather.rs` 是天气地点与快照的**唯一写入方**。刷新**以地点为单位**：每个地点各自单飞、60s 最小间隔（**手动刷新也遵守**）、30s→2min→5min 退避（`force` 可跳过退避但不能跳过最小间隔）、连续失败 3 次后停止自动重试；快照未过期直接复用不发请求；**失败时保留旧快照**（只发 `WeatherFailed { has_cache }`）。Key 与 Host 一起明文存 `meta`（不走 keyring）。
   - `ai.rs` 是 AI 用例层：全局并发 2 条流、**同一会话同一时刻只允许一条**、最多 **6 轮模型 / 12 次工具调用**（`MAX_TOOL_ROUNDS` / `MAX_TOOL_CALLS`）、整轮预算 **300 秒**（`STREAM_BUDGET`）。三条不变量：①流式期间只写内存与事件，**终止时一次性落库**；②终止事件不携带全文，UI 收到后从数据库重载（`AiStreamDelta` 可丢）；③工具调用与最终回复**不是同一事务**。
