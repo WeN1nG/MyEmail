@@ -2,6 +2,9 @@
 //!
 //! 不依赖 egui，不持有 UI 状态；只通过 `EventSender` 向上层发事件。
 
+pub mod ai;
+mod ai_music;
+pub mod ai_tools;
 pub mod auth;
 pub mod calendar;
 pub mod drafts;
@@ -30,6 +33,7 @@ use me_store::cache::{self, CachePaths};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::ai::AiState;
 use crate::auth::TokenManager;
 use crate::events::EventSender;
 use crate::oauth_flow::OAuthFlowRegistry;
@@ -77,6 +81,16 @@ pub struct Inner<S, F, M> {
     pub(crate) weather_provider: RwLock<Option<Arc<dyn me_core::weather::WeatherProvider>>>,
     /// 会话内的天气状态：Key 兜底、单飞、退避与最小间隔。
     pub(crate) weather_state: Mutex<WeatherState>,
+    /// AI 传输层；未注入时 AI 命令提示「尚未初始化」。
+    pub(crate) ai_provider: RwLock<Option<Arc<dyn me_core::ai::AiProvider>>>,
+    /// 会话内 AI 状态：配置、密钥兜底、隐私确认、进行中的流。
+    pub(crate) ai_state: Mutex<AiState>,
+    /// AI 音乐工具的等待表：`call_id -> 回执通道`。
+    ///
+    /// 音乐是唯一不由 `me-sync` 执行的工具（播放器住在 UI 线程侧），
+    /// 所以这里存的是「等 UI 回话」的通道，而不是执行结果。
+    pub(crate) ai_music_pending:
+        Mutex<HashMap<String, tokio::sync::oneshot::Sender<me_core::MusicOutcome>>>,
 }
 
 /// 用于比较目录归属：优先规范化（Windows 下同时统一大小写与分隔符），
@@ -162,6 +176,9 @@ where
                 backfills: Mutex::new(HashMap::new()),
                 weather_provider: RwLock::new(None),
                 weather_state: Mutex::new(WeatherState::default()),
+                ai_provider: RwLock::new(None),
+                ai_state: Mutex::new(AiState::default()),
+                ai_music_pending: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -170,6 +187,7 @@ where
     pub async fn run(self, mut command_rx: mpsc::UnboundedReceiver<Command>) {
         self.load_settings().await;
         self.load_oauth_configs().await;
+        self.load_ai_settings().await;
         self.startup();
 
         while let Some(command) = command_rx.recv().await {
@@ -285,7 +303,7 @@ where
             .and_then(MusicOrder::parse)
             .unwrap_or_default();
 
-        // 天气：读回 Host 并初始化数据源。API Key 只查「是否存在」，不读明文。
+        // 天气：读回 Host 与 Key（两者都存在本机 `meta`，退出再进来照样有效）。
         // 只有一个 Host：官方已把城市搜索与天气收进同一个专属域名。
         let stored_host = self
             .db(|s| s.get_setting(me_core::settings_key::WEATHER_API_HOST))
@@ -883,12 +901,16 @@ where
             cmd @ (Command::CreateCalendarEvent { .. }
             | Command::UpdateCalendarEvent { .. }
             | Command::DeleteCalendarEvent { .. }
+            | Command::RestoreCalendarEvent { .. }
             | Command::CreateCalendar { .. }
             | Command::SetCalendarVisible { .. }) => {
                 let service = self.clone();
                 tokio::spawn(async move { service.handle_calendar_command(cmd).await });
             }
             // 音乐设置只落 meta；播放由 UI 直接驱动音频线程（§5.5.3）。
+            Command::AiMusicResult { call_id, outcome } => {
+                self.complete_music_op(&call_id, outcome);
+            }
             Command::SetMusicSettings { dir, order } => {
                 let service = self.clone();
                 tokio::spawn(async move { service.handle_set_music_settings(dir, order).await });
@@ -928,6 +950,92 @@ where
             Command::RefreshWeather { id, force } => {
                 let service = self.clone();
                 tokio::spawn(async move { service.refresh_weather(id, force).await });
+            }
+
+            // ---- AI（v0.3）----
+            // 与天气同理：可能等网络，一律 spawn，不阻塞命令循环。
+            Command::CreateAiConversation { model } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_create_ai_conversation(model).await });
+            }
+            Command::RenameAiConversation { id, title } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_rename_ai_conversation(id, title).await });
+            }
+            Command::DeleteAiConversation { id } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_delete_ai_conversation(id).await });
+            }
+            Command::ClearAiConversations => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_clear_ai_conversations().await });
+            }
+            Command::SendAiMessage {
+                conversation,
+                content,
+                context,
+            } => {
+                let service = self.clone();
+                tokio::spawn(async move {
+                    service
+                        .handle_send_ai_message(conversation, content, context)
+                        .await
+                });
+            }
+            Command::CancelAiStream { conversation } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_cancel_ai_stream(conversation).await });
+            }
+            Command::RegenerateAiMessage { conversation } => {
+                let service = self.clone();
+                tokio::spawn(
+                    async move { service.handle_regenerate_ai_message(conversation).await },
+                );
+            }
+            Command::SaveAiModel { model } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_save_ai_model(model).await });
+            }
+            Command::DeleteAiModel { id } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_delete_ai_model(id).await });
+            }
+            Command::SetActiveAiModel { id } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_set_active_ai_model(id).await });
+            }
+            Command::SetConversationAiModel {
+                conversation,
+                model,
+            } => {
+                let service = self.clone();
+                tokio::spawn(async move {
+                    service
+                        .handle_set_conversation_ai_model(conversation, model)
+                        .await
+                });
+            }
+            Command::TestAiModel { model } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_test_ai_model(model).await });
+            }
+            Command::SetAiPrivacyAck { provider, accepted } => {
+                let service = self.clone();
+                tokio::spawn(
+                    async move { service.handle_set_ai_privacy_ack(provider, accepted).await },
+                );
+            }
+            Command::UndoAiCalendarCreate { event } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_undo_ai_calendar_create(event).await });
+            }
+            Command::DeleteAiEntity { entity } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_delete_ai_entity(entity).await });
+            }
+            Command::ClearAiEntities => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_clear_ai_entities().await });
             }
         }
     }
@@ -1465,7 +1573,9 @@ where
         let mut ids = Vec::new();
         let mut cursor = None;
         loop {
-            let page = self.db(move |s| s.list_messages(folder, cursor, 200)).await;
+            let page = self
+                .db(move |s| me_core::port::MessageRepo::list_messages(&s, folder, cursor, 200))
+                .await;
             match page {
                 Ok(messages) if messages.is_empty() => break,
                 Ok(messages) => {
@@ -2000,11 +2110,12 @@ where
     // 搜索与维护
     // -----------------------------------------------------------------------
 
+    /// 搜索框入口。与 `email_search` 工具共用 [`Self::search_mail`]：
+    /// 两套查询一定会漂移成「AI 说没有、用户一搜就有」。
     async fn handle_search(&self, query: SearchQuery) {
-        let query_id = self.inner.query_seq.fetch_add(1, Ordering::Relaxed) + 1;
-        match self.db(move |s| s.search(&query)).await {
-            Ok(mut outcome) => {
-                outcome.query_id = query_id;
+        match self.search_mail(query, me_core::MAX_PAGE_SIZE).await {
+            Ok(outcome) => {
+                let query_id = outcome.query_id;
                 self.emit(Event::SearchResults {
                     query_id,
                     messages: outcome.messages,
@@ -2348,12 +2459,13 @@ fn classify_send_error(err: &CoreError) -> SendFailureKind {
             code: None,
             detail: what.to_string(),
         },
-        CoreError::Storage { .. } | CoreError::Validation { .. } | CoreError::Cancelled => {
-            SendFailureKind::Rejected {
-                code: None,
-                detail: err.user_message(),
-            }
-        }
+        CoreError::Storage { .. }
+        | CoreError::Validation { .. }
+        | CoreError::Cancelled
+        | CoreError::Ai { .. } => SendFailureKind::Rejected {
+            code: None,
+            detail: err.user_message(),
+        },
     }
 }
 
@@ -2460,14 +2572,19 @@ pub fn start_native(
     events: EventSender,
     browser: Arc<dyn BrowserOpener>,
 ) -> NativeService {
-    SyncService::new(
+    let service = SyncService::new(
         store,
         me_proto::ProtoFactory,
         me_proto::ProtoSmtp,
         paths,
         events,
         browser,
-    )
+    );
+    // AI 传输层在这里注入：`me-app` 因此不需要依赖 `me-proto`（§2.3 第 2 条）。
+    if let Ok(provider) = me_proto::ai::HttpAiProvider::new() {
+        service.with_ai_provider(Arc::new(provider));
+    }
+    service
 }
 
 /// 无头/测试用浏览器打开端口：不执行任何外部程序。

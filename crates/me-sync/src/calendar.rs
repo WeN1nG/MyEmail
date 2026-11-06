@@ -84,6 +84,49 @@ where
         Ok(event)
     }
 
+    /// 查重：同日历、同标题、开始时间相差 ≤5 分钟视为同一条。
+    ///
+    /// 这是 **AI 入口专用**的去重（`calendar_create` 的工具语义）。
+    /// 放在用例层而不是工具层有两个原因：工具层不允许碰仓储（§2.7 门禁），
+    /// 而放在这里又能只对 `Actor::Ai` 生效——用户手动建两条同名日程是合理的，
+    /// 不能被"聪明"地吞掉一条。
+    pub(crate) async fn find_duplicate_event(
+        &self,
+        calendar: Option<CalendarId>,
+        summary: &str,
+        start_utc: i64,
+    ) -> Result<Option<CalendarEvent>, CoreError> {
+        let summary = summary.trim().to_string();
+        if summary.is_empty() {
+            return Ok(None);
+        }
+        self.db(move |s| {
+            let calendars: Vec<CalendarId> = match calendar {
+                Some(id) => vec![id],
+                None => s
+                    .list_calendars()?
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect(),
+            };
+            if calendars.is_empty() {
+                return Ok(None);
+            }
+            // 窗口前后各 5 分钟：列表查询用 [start-300, start+300]，
+            // 再在内存里按「同标题 + |Δstart| ≤ 300」精确判定。
+            let series =
+                s.list_series_in_range(&calendars, start_utc - 300, start_utc + 300, 50)?;
+            let hit = series.into_iter().find(|item| {
+                item.summary.trim() == summary && (item.start_utc - start_utc).abs() <= 300
+            });
+            match hit {
+                Some(item) => s.get_event(item.id),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
     /// 更新日程。保留原 `source`（由仓储保证），`sequence` 自动 +1。
     pub(crate) async fn update_event(
         &self,
@@ -119,6 +162,22 @@ where
             self.emit(Event::CalendarEventsChanged { calendar }).await;
         }
         Ok(())
+    }
+
+    /// 撤销一次软删除。与 [`Self::delete_event`] 对称：只动墓碑时间戳。
+    ///
+    /// 恢复后必须发 `CalendarEventsChanged`，否则界面停在「已删除」的视图里，
+    /// 用户撤销了却看不到东西回来。
+    pub(crate) async fn restore_event(
+        &self,
+        id: CalendarEventId,
+    ) -> Result<CalendarEvent, CoreError> {
+        let event = self.db(move |store| store.restore_event(id)).await?;
+        self.emit(Event::CalendarEventsChanged {
+            calendar: event.calendar_id,
+        })
+        .await;
+        Ok(event)
     }
 
     pub(crate) async fn create_calendar(
@@ -258,6 +317,7 @@ where
                 self.update_event(id, draft, Actor::User).await.map(|_| ())
             }
             Command::DeleteCalendarEvent { id } => self.delete_event(id, Actor::User).await,
+            Command::RestoreCalendarEvent { id } => self.restore_event(id).await.map(|_| ()),
             Command::CreateCalendar { name, color } => self
                 .create_calendar(name, color, Actor::User)
                 .await

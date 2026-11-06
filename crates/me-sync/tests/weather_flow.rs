@@ -151,6 +151,22 @@ fn start_service(
     store: &Store,
     provider: Option<Arc<FakeProvider>>,
 ) -> (mpsc::UnboundedSender<Command>, mpsc::Receiver<Event>) {
+    start_service_with(store, provider, true)
+}
+
+/// 同 [`start_service`]，但**不注入会话凭证**：用来模拟「重启后从库里读 Key」。
+fn start_service_without_credential(
+    store: &Store,
+    provider: Option<Arc<FakeProvider>>,
+) -> (mpsc::UnboundedSender<Command>, mpsc::Receiver<Event>) {
+    start_service_with(store, provider, false)
+}
+
+fn start_service_with(
+    store: &Store,
+    provider: Option<Arc<FakeProvider>>,
+    inject_credential: bool,
+) -> (mpsc::UnboundedSender<Command>, mpsc::Receiver<Event>) {
     let (command_tx, command_rx) = mpsc::unbounded_channel::<Command>();
     let (event_tx, event_rx) = mpsc::channel::<Event>(1024);
     let events = EventSender::new(event_tx, Arc::new(|| {}));
@@ -165,7 +181,9 @@ fn start_service(
     if let Some(provider) = provider {
         service = service.with_weather_provider(provider);
     }
-    service = service.with_weather_credential(WeatherCredential::new("test-key"));
+    if inject_credential {
+        service = service.with_weather_credential(WeatherCredential::new("test-key"));
+    }
     // 测试里把最小间隔设为 0，避免被 60 秒节流挡住。
     service = service.with_weather_min_interval(0);
     tokio::spawn(async move { service.run(command_rx).await });
@@ -864,6 +882,55 @@ async fn saving_config_stores_only_the_single_host() {
         Some("https://abc.qweatherapi.com"),
         "Host 应被持久化"
     );
+}
+
+/// Key 与 Host 一起存本机 `meta`：**退出应用再进来仍然有效**。
+///
+/// 回归背景：早先 Key 只写系统密钥库，部分环境写入失败，表现为
+/// 「重新配置后能用、一退出应用就失效」。现在两者同库保存。
+#[tokio::test]
+async fn saved_key_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let (tx, mut rx) = start_service(&store, None);
+
+    tx.send(Command::SetWeatherConfig {
+        host: "abc.qweatherapi.com".into(),
+        key: Some("restart-key".into()),
+    })
+    .unwrap();
+    wait_for(&mut rx, |event| {
+        matches!(
+            event,
+            Event::WeatherConfigChanged { api_host, .. }
+                if api_host == "https://abc.qweatherapi.com"
+        )
+    })
+    .await;
+
+    // Key 落在 `meta` 里，和 Host 同一处（不进系统密钥库）。
+    let stored_key = store
+        .writable()
+        .get_setting(me_core::settings_key::WEATHER_API_KEY)
+        .unwrap();
+    assert_eq!(stored_key.as_deref(), Some("restart-key"), "Key 应持久化");
+
+    // 模拟重新启动：新服务、不注入任何会话凭证，只靠库里的配置恢复。
+    let (_tx2, mut rx2) = start_service_without_credential(&store, None);
+    let startup = wait_for(&mut rx2, |event| {
+        matches!(event, Event::WeatherConfigChanged { .. })
+    })
+    .await;
+    match startup {
+        Event::WeatherConfigChanged {
+            key_present,
+            api_host,
+        } => {
+            assert!(key_present, "重启动后应仍认得已保存的 Key");
+            assert_eq!(api_host, "https://abc.qweatherapi.com");
+        }
+        other => panic!("事件类型不对：{other:?}"),
+    }
 }
 
 /// 用户填**裸域名**就行：程序自己补 `https://` 再存。

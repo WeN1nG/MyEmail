@@ -3,8 +3,9 @@
 //! 分层约束（`doc/v03架构设计.md` §2.7）：这里是**唯一**能写天气地点与快照的
 //! 地方；界面只发 `Command`，写操作全部收敛到本文件。
 //!
-//! 安全约束（§6.3）：
-//! - API Key 只进系统密钥库或会话内存，**不进数据库、不进事件载荷、不写日志**；
+//! 安全约束（§6.3，按用户要求放宽了一处）：
+//! - API Key 与 Host **一起**存在本机 `meta` 里（明文，不走系统密钥库），
+//!   这样退出应用再进来仍然有效；但**不进事件载荷、不在界面上回显明文、不写日志**；
 //! - 城市名与坐标不写日志；
 //! - 失败时保留旧快照，界面显示缓存而不是空白。
 //!
@@ -23,10 +24,6 @@ use me_core::weather::{
 use me_core::{CoreError, Event, now_unix};
 
 use crate::SyncService;
-
-/// 密钥库里的服务名与用户名（与邮件账户的 `MyEmail` 分开）。
-pub const WEATHER_KEYRING_SERVICE: &str = "MyEmail.Weather";
-pub const WEATHER_KEYRING_USER: &str = "qweather";
 
 /// 退避序列（秒）：连续失败后逐级拉长。
 const BACKOFF_SECS: [i64; 3] = [30, 120, 300];
@@ -51,7 +48,7 @@ pub(crate) struct LocationRuntime {
 
 /// 会话内的天气运行时状态。
 pub(crate) struct WeatherState {
-    /// keyring 不可用时的会话内存 Key。
+    /// 会话内缓存的 Key（读回后缓存，避免每次都查库）。
     pub(crate) credential: Option<WeatherCredential>,
     /// 当前生效的 API Host（已规范化为 `https://host[:port]`）。
     ///
@@ -136,9 +133,9 @@ where
         }
     }
 
-    /// 注入会话内的天气凭证（**不写系统密钥库**）。
+    /// 注入会话内的天气凭证（**不落库**）。
     ///
-    /// 用于「仅本次会话有效」的场景与测试；正常路径是 [`SyncService::set_weather_api_key`]。
+    /// 用于「仅本次会话有效」的场景与测试；正常路径是 [`SyncService::set_weather_config`]。
     pub fn with_weather_credential(&self, credential: WeatherCredential) -> Self {
         if let Ok(mut state) = self.inner.weather_state.lock() {
             state.credential = Some(credential);
@@ -146,7 +143,11 @@ where
         self.clone()
     }
 
-    /// 读取天气 API Key：先会话内存，再系统密钥库。
+    /// 读取天气 API Key：先会话缓存，再本机 `meta`（与 Host 同一处）。
+    ///
+    /// **不再走系统密钥库**：密钥库在部分 Windows 环境下写入失败，
+    /// 表现为「重新配置后能用、退出应用就失效」。Key 与 Host 一起存在
+    /// `meta.weather_api_key` 里，重启后照样读得回来。
     pub(crate) async fn weather_credential(&self) -> Option<WeatherCredential> {
         if let Some(credential) = self
             .inner
@@ -155,23 +156,19 @@ where
             .ok()
             .and_then(|s| s.credential.clone())
         {
-            // 空凭证表示「明确未配置」，不再去读密钥库。
+            // 空凭证表示「明确未配置」，不再去读库。
             return if credential.is_empty() {
                 None
             } else {
                 Some(credential)
             };
         }
-        let value = tokio::task::spawn_blocking(|| {
-            let entry = keyring::Entry::new(WEATHER_KEYRING_SERVICE, WEATHER_KEYRING_USER).ok()?;
-            match entry.get_password() {
-                Ok(value) if !value.trim().is_empty() => Some(value),
-                _ => None,
-            }
-        })
-        .await
-        .ok()
-        .flatten()?;
+        let value = self
+            .db(|store| store.get_setting(me_core::settings_key::WEATHER_API_KEY))
+            .await
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty())?;
         let credential = WeatherCredential::new(value);
         if let Ok(mut state) = self.inner.weather_state.lock() {
             state.credential = Some(credential.clone());
@@ -179,8 +176,10 @@ where
         Some(credential)
     }
 
-    /// 保存 Host。校验通过后写 `meta` 并更新会话状态。
     /// 保存天气配置：**一个 Host** + 可选的 API Key。
+    ///
+    /// 两者都写进本机 `meta`（`weather_api_host` / `weather_api_key`），
+    /// 与系统密钥库无关：退出应用再进来照样读得回来。
     ///
     /// `key` 为 `None` 表示「只改 Host，不动已保存的 Key」。
     pub(crate) async fn set_weather_config(&self, host: String, key: Option<String>) {
@@ -193,24 +192,48 @@ where
             }
         };
 
-        // 先写 Key（若给了），再落 Host。Key 写失败不影响 Host 生效。
-        if let Some(key) = key {
-            let trimmed = key.trim().to_string();
-            if trimmed.is_empty() {
-                self.fail_weather(None, "API Key 不能为空".to_string(), false)
+        // Key 先本地校验，再与 Host **一次写进同一个库**。
+        // 两者必须同进同退：只写进 Key 没写进 Host，下次启动就会拿旧地址配新 Key。
+        let key_value = match key {
+            Some(key) => {
+                let trimmed = key.trim().to_string();
+                if trimmed.is_empty() {
+                    self.fail_weather(None, "API Key 不能为空".to_string(), false)
+                        .await;
+                    return;
+                }
+                if trimmed.len() > MAX_API_KEY_LEN {
+                    self.fail_weather(
+                        None,
+                        format!("API Key 过长（最多 {MAX_API_KEY_LEN} 个字符）"),
+                        false,
+                    )
                     .await;
-                return;
+                    return;
+                }
+                Some(trimmed)
             }
-            if trimmed.len() > MAX_API_KEY_LEN {
-                self.fail_weather(
-                    None,
-                    format!("API Key 过长（最多 {MAX_API_KEY_LEN} 个字符）"),
-                    false,
-                )
-                .await;
-                return;
-            }
-            let persisted = self.write_weather_key(&trimmed).await;
+            None => None,
+        };
+
+        let api_for_db = api.clone();
+        let key_for_db = key_value.clone();
+        let stored = self
+            .db(move |store| {
+                if let Some(key) = key_for_db.as_deref() {
+                    store.set_setting(me_core::settings_key::WEATHER_API_KEY, key)?;
+                }
+                store.set_setting(me_core::settings_key::WEATHER_API_HOST, &api_for_db)?;
+                Ok(())
+            })
+            .await;
+        if let Err(err) = stored {
+            self.fail_weather(None, err.user_message(), false).await;
+            return;
+        }
+
+        // 落库成功后才更新会话：Key 与 Host 一起生效，重启后还能读回来。
+        if let Some(trimmed) = key_value {
             if let Ok(mut state) = self.inner.weather_state.lock() {
                 state.credential = Some(WeatherCredential::new(trimmed));
                 // 换了 Key 之后重新计数，避免沿用旧的退避。
@@ -219,19 +242,7 @@ where
                     runtime.backoff_until = 0;
                 }
             }
-            self.emit(Event::WeatherKeyStored { persisted }).await;
-        }
-
-        let api_key = api.clone();
-        let stored = self
-            .db(move |store| {
-                store.set_setting(me_core::settings_key::WEATHER_API_HOST, &api_key)?;
-                Ok(())
-            })
-            .await;
-        if let Err(err) = stored {
-            self.fail_weather(None, err.user_message(), false).await;
-            return;
+            self.emit(Event::WeatherKeyStored { persisted: true }).await;
         }
 
         // 更新会话里的生效 Host：之后每次请求都用它。
@@ -250,7 +261,7 @@ where
     /// 测试连接：用给定的 Host 与 Key 发一次真实请求。
     ///
     /// **不落库**：Host 与 Key 只在这一个请求里生效，
-    /// 不会覆盖已保存的配置，也不会写进密钥库。
+    /// 不会覆盖已保存的配置。
     ///
     /// 探测端点用城市搜索（一个 GET 就够），比拉整套预报省额度。
     pub(crate) async fn test_weather_connection(&self, host: String, key: String) {
@@ -329,54 +340,43 @@ where
             .unwrap_or_else(|_| me_core::DEFAULT_API_HOST.to_string())
     }
 
-    /// 写系统密钥库。返回是否持久化成功（失败时只保留在会话内存）。
-    async fn write_weather_key(&self, key: &str) -> bool {
-        let key = key.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            let entry = keyring::Entry::new(WEATHER_KEYRING_SERVICE, WEATHER_KEYRING_USER)
-                .map_err(|err| err.to_string())?;
-            entry.set_password(&key).map_err(|err| err.to_string())
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => true,
-            Ok(Err(err)) => {
-                // 只记错误类别，不记 Key 本身。
-                tracing::warn!(%err, "keyring unavailable; weather key kept in session memory only");
-                false
-            }
-            Err(join) => {
-                tracing::warn!(%join, "keyring task failed; weather key kept in session memory only");
-                false
-            }
-        }
-    }
-
     /// 按城市名搜索候选地点。
-    pub(crate) async fn search_weather_locations(&self, request_id: u64, query: String) {
-        let query = match validate_query(&query) {
-            Ok(query) => query,
-            Err(err) => {
-                self.fail_weather(None, err.user_message(), false).await;
-                return;
-            }
-        };
-        let Some(provider) = provider(self) else {
-            self.fail_weather(None, "天气服务尚未初始化".to_string(), false)
-                .await;
-            return;
-        };
-        let Some(credential) = self.weather_credential().await else {
-            self.fail_weather(None, "请先配置和风天气 API Key".to_string(), false)
-                .await;
-            return;
-        };
+    /// 只做一次城市搜索并返回候选。
+    ///
+    /// 工具入口（`weather_get`）需要拿到候选自己判断，不能只发事件；
+    /// 界面入口 [`Self::search_weather_locations`] 也走这里，保证两条路
+    /// 用的是同一套 Key 检查、Host 与错误分类。
+    pub(crate) async fn weather_candidates(
+        &self,
+        query: &str,
+    ) -> Result<Vec<WeatherLocationCandidate>, CoreError> {
+        let query = validate_query(query)?;
+        let provider = provider(self).ok_or_else(|| CoreError::validation("天气服务尚未初始化"))?;
+        let credential = self
+            .weather_credential()
+            .await
+            .ok_or_else(|| CoreError::validation("请先配置和风天气 API Key"))?;
         let api_host = self.api_host();
-
-        match provider
+        provider
             .search_locations(&api_host, &query, &credential)
             .await
-        {
+    }
+
+    /// 读取缓存快照（工具在刷新之后取用；过期判断由调用方决定）。
+    pub(crate) async fn weather_snapshot(
+        &self,
+        id: WeatherLocationId,
+    ) -> Result<Option<WeatherSnapshot>, CoreError> {
+        self.db(move |s| s.get_weather_snapshot(id)).await
+    }
+
+    /// 已保存的地点列表。
+    pub(crate) async fn weather_locations(&self) -> Result<Vec<WeatherLocation>, CoreError> {
+        self.db(|s| s.list_weather_locations()).await
+    }
+
+    pub(crate) async fn search_weather_locations(&self, request_id: u64, query: String) {
+        match self.weather_candidates(&query).await {
             Ok(candidates) => {
                 // 结果回来时再确认一次 request_id 仍是最新。
                 let stale = self
