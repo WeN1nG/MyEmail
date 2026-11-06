@@ -253,6 +253,20 @@ impl ReadOnlyRepo for ReadOnlyStore {
         crate::contacts::list_contacts_conn(&conn, prefix, limit)
     }
 
+    fn list_unified_inbox_readonly(
+        &self,
+        cursor: Option<(i64, i64)>,
+        limit: u32,
+    ) -> Result<Vec<me_core::MessageSummary>, CoreError> {
+        let conn = self.conn()?;
+        crate::messages::list_unified_inbox_conn(&conn, cursor, limit)
+    }
+
+    fn unified_unread_count_readonly(&self) -> Result<u32, CoreError> {
+        let conn = self.conn()?;
+        crate::messages::unified_unread_count_conn(&conn)
+    }
+
     fn list_calendars_readonly(&self) -> Result<Vec<me_core::Calendar>, CoreError> {
         self.calendars_readonly()
     }

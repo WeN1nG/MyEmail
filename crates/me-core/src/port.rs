@@ -712,6 +712,18 @@ pub trait ReadOnlyRepo: Send + Sync {
     /// **只读、单次 `LIMIT ≤ 200`**——与本 trait 的其它方法同一套约束。
     fn list_contacts_readonly(&self, prefix: &str, limit: u32) -> Result<Vec<Contact>, CoreError>;
 
+    /// 统一收件箱：各账户 `role='inbox'` 文件夹的并集，按时间倒序。
+    ///
+    /// **跨账户聚合必须在 store 层一次查完**——UI 端拉完各账户再本地合并
+    /// 会破坏键集分页，也违反 `LIMIT ≤ 200` 的硬规则。
+    fn list_unified_inbox_readonly(
+        &self,
+        cursor: Option<(i64, i64)>,
+        limit: u32,
+    ) -> Result<Vec<MessageSummary>, CoreError>;
+    /// 统一收件箱的未读计数。
+    fn unified_unread_count_readonly(&self) -> Result<u32, CoreError>;
+
     // 日历：主线程只读，单次 `LIMIT <= 200`。
     fn list_calendars_readonly(&self) -> Result<Vec<Calendar>, CoreError>;
     fn list_calendar_series_readonly(

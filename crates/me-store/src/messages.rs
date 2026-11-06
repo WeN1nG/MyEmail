@@ -191,6 +191,76 @@ pub(crate) fn unread_count_conn(conn: &Connection, folder: FolderId) -> Result<u
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
+/// 统一收件箱：各账户 `role='inbox'` 文件夹的并集，按时间倒序。
+///
+/// **为什么用 `folder_id IN (SELECT id FROM folders WHERE role='inbox')`
+/// 而不是按 `account_id`**：「收件箱」是**文件夹角色**，不是账户——
+/// 一个账户可以有多个被标记为 inbox 的文件夹（IMAP 的 SPECIAL-USE 启发式
+/// 可能标错，`SetFolderRole` 就是为此存在的）。
+///
+/// **必须排除 `uid IS NULL`**：本地已移动、服务器身份待确认的行
+/// （`CLAUDE.md` 的删除路径不变量）在服务器上还没有位置，
+/// 不该出现在聚合视图里。
+///
+/// 键集分页与单文件夹列表一致：`(date, id)` 游标 + `LIMIT ≤ 200`。
+/// 排序键必须跨账户稳定，故用 `date DESC, id DESC`（`id` 是全局主键，天然唯一）。
+pub(crate) fn list_unified_inbox_conn(
+    conn: &Connection,
+    cursor: Option<(i64, i64)>,
+    limit: u32,
+) -> Result<Vec<MessageSummary>, CoreError> {
+    let limit = limit.clamp(1, MAX_PAGE_SIZE);
+    let base = "m.uid IS NOT NULL AND m.folder_id IN \
+                (SELECT id FROM folders WHERE role = 'inbox')";
+    let rows = match cursor {
+        None => {
+            let sql = format!(
+                "SELECT {SUMMARY_COLUMNS_M} FROM messages m
+                  WHERE {base}
+                  ORDER BY m.date DESC, m.id DESC
+                  LIMIT ?1"
+            );
+            let mut stmt = conn.prepare(&sql).store()?;
+            stmt.query_map(params![i64::from(limit)], row_to_summary)
+                .store()?
+                .collect::<Result<Vec<_>, _>>()
+                .store()?
+        }
+        Some((date, id)) => {
+            let sql = format!(
+                "SELECT {SUMMARY_COLUMNS_M} FROM messages m
+                  WHERE {base} AND (m.date < ?1 OR (m.date = ?2 AND m.id < ?3))
+                  ORDER BY m.date DESC, m.id DESC
+                  LIMIT ?4"
+            );
+            let mut stmt = conn.prepare(&sql).store()?;
+            stmt.query_map(params![date, date, id, i64::from(limit)], row_to_summary)
+                .store()?
+                .collect::<Result<Vec<_>, _>>()
+                .store()?
+        }
+    };
+    Ok(rows)
+}
+
+/// 统一收件箱的未读计数。
+///
+/// **同一个 `flags & 1` 位**（bit 0 是 `\Seen`，`(flags & 1) = 0` 才是未读）——
+/// 与 `unread_count_conn` 用的是同一个位。
+pub(crate) fn unified_unread_count_conn(conn: &Connection) -> Result<u32, CoreError> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages m
+              WHERE m.uid IS NOT NULL
+                AND m.folder_id IN (SELECT id FROM folders WHERE role = 'inbox')
+                AND (m.flags & 1) = 0",
+            [],
+            |row| row.get(0),
+        )
+        .store()?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
 fn placeholders(count: usize) -> String {
     std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()

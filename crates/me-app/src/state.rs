@@ -189,12 +189,26 @@ pub struct UiState {
     pub accounts: Vec<Account>,
     pub folders: BTreeMap<AccountId, Vec<Folder>>,
     pub unread: BTreeMap<FolderId, u32>,
+    /// 统一收件箱的未读数（跨账户合计）。
+    pub unified_unread_count: u32,
     pub connection: BTreeMap<AccountId, ConnectionState>,
     /// 实时同步状态（WP-08 在设置/账户页展示）。
     pub realtime: BTreeMap<AccountId, RealtimeView>,
 
     pub selected_account: Option<AccountId>,
     pub selected_folder: Option<FolderId>,
+    /// 是否在看**统一收件箱**（各账户收件箱的并集）。
+    ///
+    /// **与 `selected_folder` 互斥**：统一收件箱是**视图层的虚拟项**，
+    /// 不是数据库里的文件夹行——`folders.role` 有 CHECK 约束且
+    /// `account_id NOT NULL`，插不进一行「属于所有账户的收件箱」。
+    ///
+    /// 为什么用 `bool` 而不是把 `selected_folder` 改成
+    /// `enum MailScope { Folder(FolderId), UnifiedInbox }`：后者更「干净」，
+    /// 但 `selected_folder` 被十几处引用，改它会波及整个 `me-app`——
+    /// **收益不抵风险**。互斥关系**集中在这两个方法里维护**，
+    /// 禁止别处直接写字段。
+    pub unified_inbox: bool,
     pub messages: Vec<MessageSummary>,
     /// 键集分页游标：上一页最后一行的 `(date, id)`。
     pub messages_cursor: Option<(i64, i64)>,
@@ -346,6 +360,8 @@ impl Default for UiState {
             realtime: BTreeMap::new(),
             selected_account: None,
             selected_folder: None,
+            unified_inbox: false,
+            unified_unread_count: 0,
             messages: Vec::new(),
             messages_cursor: None,
             messages_has_more: false,
@@ -518,6 +534,32 @@ impl UiState {
         }
     }
 
+    // --- 统一收件箱（批次 4）---
+
+    /// 选中统一收件箱。
+    ///
+    /// **互斥关系的唯一入口**——所有切到统一收件箱的地方都要走这里，
+    /// 否则会出现「`unified_inbox = true` 且 `selected_folder = Some(x)`」
+    /// 的矛盾态，列表取数会二义。
+    pub fn select_unified_inbox(&mut self) {
+        self.unified_inbox = true;
+        self.selected_folder = None;
+    }
+
+    /// 选中某个文件夹（退出统一收件箱）。
+    ///
+    /// **互斥关系的唯一入口**。
+    pub fn select_folder(&mut self, folder: FolderId) {
+        self.unified_inbox = false;
+        self.selected_folder = Some(folder);
+    }
+
+    /// 退出文件夹选择（初始状态 / 切账户）。
+    pub fn clear_folder_selection(&mut self) {
+        self.unified_inbox = false;
+        self.selected_folder = None;
+    }
+
     pub fn folders_of(&self, account: AccountId) -> &[Folder] {
         self.folders.get(&account).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -564,6 +606,15 @@ impl UiState {
 
     pub fn unread_of(&self, folder: FolderId) -> u32 {
         self.unread.get(&folder).copied().unwrap_or(0)
+    }
+
+    /// 统一收件箱的未读数（跨账户合计）。
+    ///
+    /// 单独一个字段而不是把各账户的加总——**各账户的未读数是按 folder 缓存的**，
+    /// 统一收件箱的聚合范围（`role='inbox'` 的所有文件夹）与之不同，
+    /// 只能单独查。刷新时填入。
+    pub fn unified_unread(&self) -> u32 {
+        self.unified_unread_count
     }
 
     /// 文件夹按角色排序：Inbox 优先，其余按名称。
@@ -1334,6 +1385,29 @@ pub fn toggle_star_op(message: &MessageSummary) -> FlagOp {
     }
 }
 
+/// 测试用：构造一个最小可用的账户。
+///
+/// 只填渲染需要的字段（`id` / `email`），端点之类给占位值——
+/// `Account` 有十几个字段，逐个手写会让每个渲染测试都变成噪音。
+#[cfg(test)]
+pub(crate) fn sample_account(id: i64, email: &str) -> Account {
+    Account {
+        id: AccountId(id),
+        email: email.to_string(),
+        display_name: None,
+        imap: me_core::Endpoint::new("imap.example.com", 993, TlsMode::Implicit),
+        smtp: me_core::Endpoint::new("smtp.example.com", 465, TlsMode::Implicit),
+        auth_user: email.to_string(),
+        auth_method: AuthMethod::AppPassword,
+        oauth_provider: None,
+        oauth_subject: None,
+        needs_reauth: false,
+        idle_enabled: true,
+        poll_interval_secs: None,
+        token_expires_at: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1455,5 +1529,41 @@ mod tests {
         assert_eq!(compose.bcc, "new@example.com");
         // 收件人没被动过。
         assert!(compose.to.is_empty());
+    }
+
+    // --- 统一收件箱（批次 4）---
+
+    #[test]
+    fn unified_inbox_and_folder_selection_are_mutually_exclusive() {
+        let mut state = UiState::default();
+        state.select_folder(FolderId(1));
+        assert!(!state.unified_inbox);
+        assert_eq!(state.selected_folder, Some(FolderId(1)));
+
+        state.select_unified_inbox();
+        assert!(state.unified_inbox);
+        assert_eq!(
+            state.selected_folder, None,
+            "选统一收件箱必须清掉文件夹选择"
+        );
+
+        state.select_folder(FolderId(2));
+        assert!(!state.unified_inbox, "选文件夹必须退出统一收件箱");
+        assert_eq!(state.selected_folder, Some(FolderId(2)));
+    }
+
+    #[test]
+    fn clearing_folder_selection_also_exits_unified_inbox() {
+        let mut state = UiState::default();
+        state.select_unified_inbox();
+        state.clear_folder_selection();
+        assert!(!state.unified_inbox);
+        assert_eq!(state.selected_folder, None);
+    }
+
+    #[test]
+    fn unified_unread_count_starts_at_zero() {
+        let state = UiState::default();
+        assert_eq!(state.unified_unread(), 0);
     }
 }

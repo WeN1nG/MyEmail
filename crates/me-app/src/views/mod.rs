@@ -218,6 +218,15 @@ pub fn folder_sidebar(state: &mut UiState, commands: &mut Vec<Command>, ctx: &eg
             account_selector(state, ui);
             ui.separator();
 
+            // 统一收件箱：**视图层的虚拟项**，不是数据库里的文件夹行。
+            // 放在「还没选账户」的检查**之前**——它跨账户，
+            // 正是「还没选定单个账户」时最该用的视图。
+            // 一个账户都没有时不显示：聚合视图没有来源，点了只会是空的。
+            if !state.accounts.is_empty() {
+                unified_inbox_row(state, ui);
+                ui.separator();
+            }
+
             let Some(account) = state.selected_account else {
                 ui.add_space(8.0);
                 ui.label(RichText::new("还没有账户").color(Color32::GRAY));
@@ -237,6 +246,39 @@ pub fn folder_sidebar(state: &mut UiState, commands: &mut Vec<Command>, ctx: &eg
                     }
                 });
         });
+}
+
+/// 侧栏的「统一收件箱」行（视图层虚拟项）。
+///
+/// **不是数据库里的文件夹行**——`folders.role` 有 CHECK 约束且
+/// `account_id NOT NULL`，插不进一行「属于所有账户的收件箱」。
+/// 聚合范围是各账户 `role = 'inbox'` 的文件夹的并集。
+fn unified_inbox_row(state: &mut UiState, ui: &mut egui::Ui) {
+    let selected = state.unified_inbox;
+    let unread = state.unified_unread();
+    ui.horizontal(|ui| {
+        let response = ui.selectable_label(selected, RichText::new("📥 统一收件箱"));
+        if response.clicked() {
+            // **走集中方法**——互斥关系只在这里维护。
+            state.select_unified_inbox();
+            state.search.active = false;
+            state.messages.clear();
+            state.selected_message = None;
+            state.open_body = None;
+            state.clear_multi_selection();
+            state.messages_dirty = true;
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if unread > 0 {
+                ui.label(
+                    RichText::new(unread.to_string())
+                        .small()
+                        .strong()
+                        .color(Color32::from_rgb(60, 140, 220)),
+                );
+            }
+        });
+    });
 }
 
 /// 切换页面时置脏，让下一次刷新拉取该页数据。
@@ -291,7 +333,7 @@ fn account_selector(state: &mut UiState, ui: &mut egui::Ui) {
 
     if let Some(new_account) = changed {
         state.selected_account = new_account;
-        state.selected_folder = None;
+        state.clear_folder_selection();
         state.messages.clear();
         state.selected_message = None;
         state.open_body = None;
@@ -328,7 +370,7 @@ fn folder_row(
         });
 
         if response.clicked() {
-            state.selected_folder = Some(folder.id);
+            state.select_folder(folder.id);
             state.search.active = false;
             state.messages.clear();
             state.selected_message = None;
@@ -500,5 +542,61 @@ mod tests {
         // 「日历」在顶部栏出现一次即可；左栏不再重复画导航。
         let count = texts.iter().filter(|text| *text == "日历").count();
         assert_eq!(count, 1, "页面入口不应重复出现，实际 {texts:?}");
+    }
+
+    // --- 统一收件箱（批次 4）---
+
+    /// 跑一帧左侧栏，收集绘制出来的文本。
+    fn sidebar_texts(state: &mut UiState) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            folder_sidebar(state, &mut Vec::new(), ctx);
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn state_with_account() -> UiState {
+        let account = crate::state::sample_account(1, "a@example.com");
+        UiState {
+            accounts: vec![account],
+            selected_account: Some(me_core::AccountId(1)),
+            ..Default::default()
+        }
+    }
+
+    /// 侧栏必须有「统一收件箱」这一行——**光改状态不算做完，控件得真画出来**。
+    #[test]
+    fn sidebar_renders_the_unified_inbox_row() {
+        let mut state = state_with_account();
+        state.unified_unread_count = 3;
+        let texts = sidebar_texts(&mut state);
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("统一收件箱"),
+            "侧栏缺少统一收件箱行：{texts:?}"
+        );
+        assert!(joined.contains('3'), "统一收件箱行应显示未读数：{texts:?}");
+    }
+
+    /// 一个账户都没有时不画统一收件箱——聚合视图没有来源。
+    #[test]
+    fn sidebar_hides_the_unified_inbox_without_accounts() {
+        let mut state = UiState::default();
+        let texts = sidebar_texts(&mut state);
+        assert!(
+            !texts.join("\n").contains("统一收件箱"),
+            "没有账户时不该显示统一收件箱：{texts:?}"
+        );
     }
 }

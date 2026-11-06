@@ -125,17 +125,31 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                         self.state.unread.insert(folder.id, count);
                     }
                 }
+                // 统一收件箱的未读数：**跨账户合计**，
+                // 范围是所有账户 `role='inbox'` 的文件夹——与单个 folder 的
+                // 未读数不是一回事，只能单独查。
+                if let Ok(count) = self.repo.unified_unread_count_readonly() {
+                    self.state.unified_unread_count = count;
+                }
                 let selected_missing = self
                     .state
                     .selected_folder
                     .map(|selected| !folders.iter().any(|f| f.id == selected))
                     .unwrap_or(true);
-                if self.state.selected_folder.is_none() || selected_missing {
-                    self.state.selected_folder = folders
+                // **统一收件箱模式下不自动选文件夹**——那会把视图切走。
+                // 统一收件箱的未读数是跨账户的，单独查。
+                if !self.state.unified_inbox
+                    && (self.state.selected_folder.is_none() || selected_missing)
+                {
+                    // **走集中方法**——它会同时把 `unified_inbox` 置 false，
+                    // 保持两者互斥。
+                    if let Some(folder) = folders
                         .iter()
                         .find(|f| f.role == me_core::FolderRole::Inbox)
                         .or_else(|| folders.first())
-                        .map(|f| f.id);
+                    {
+                        self.state.select_folder(folder.id);
+                    }
                     self.state.messages.clear();
                     self.state.selected_message = None;
                     // 列表换了 → 多选集合里的 id 不再属于当前列表，必须清空。
@@ -156,6 +170,26 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
     fn refresh_messages(&mut self) {
         if self.state.search.active {
             self.state.messages_dirty = false;
+            return;
+        }
+        // **统一收件箱**：跨账户聚合，在 store 层一次查完
+        // （UI 端拉完各账户再合并会破坏键集分页，也违反 LIMIT ≤ 200）。
+        if self.state.unified_inbox {
+            match self.repo.list_unified_inbox_readonly(None, PAGE_SIZE) {
+                Ok(messages) => {
+                    self.state.messages_has_more = messages.len() as u32 == PAGE_SIZE;
+                    self.state.messages_cursor = messages.last().map(cursor_of);
+                    self.state.messages = messages;
+                    self.state.selected_message = None;
+                    self.state.clear_multi_selection();
+                    self.state.open_body = None;
+                    self.state.messages_dirty = false;
+                }
+                Err(err) => {
+                    self.state.messages_dirty = false;
+                    self.report_error(ErrorScope::Global, err);
+                }
+            }
             return;
         }
         let Some(folder) = self.state.selected_folder else {
@@ -185,10 +219,23 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
         if self.state.search.active || !self.state.messages_has_more {
             return;
         }
+        let cursor = self.state.messages_cursor;
+        if self.state.unified_inbox {
+            match self.repo.list_unified_inbox_readonly(cursor, PAGE_SIZE) {
+                Ok(more) => {
+                    self.state.messages_has_more = more.len() as u32 == PAGE_SIZE;
+                    if let Some(last) = more.last() {
+                        self.state.messages_cursor = Some(cursor_of(last));
+                    }
+                    self.state.messages.extend(more);
+                }
+                Err(err) => self.report_error(ErrorScope::Global, err),
+            }
+            return;
+        }
         let Some(folder) = self.state.selected_folder else {
             return;
         };
-        let cursor = self.state.messages_cursor;
         match self.repo.list_messages_readonly(folder, cursor, PAGE_SIZE) {
             Ok(more) => {
                 self.state.messages_has_more = more.len() as u32 == PAGE_SIZE;
@@ -901,7 +948,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 self.state.accounts.retain(|a| a.id != id);
                 self.state.accounts.push(account);
                 self.state.selected_account = Some(id);
-                self.state.selected_folder = None;
+                self.state.clear_folder_selection();
                 self.state.folders_dirty = true;
                 self.state.drafts_dirty = true;
                 if let Dialog::AccountEditor(editor) = &mut self.state.dialog {
@@ -928,7 +975,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 self.state.folders.remove(&id);
                 if self.state.selected_account == Some(id) {
                     self.state.selected_account = self.state.accounts.first().map(|a| a.id);
-                    self.state.selected_folder = None;
+                    self.state.clear_folder_selection();
                     self.state.messages.clear();
                     self.state.selected_message = None;
                     // 列表换了 → 多选集合里的 id 不再属于当前列表，必须清空。
@@ -984,7 +1031,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 } else {
                     self.state.accounts.push(account);
                     self.state.selected_account = Some(id);
-                    self.state.selected_folder = None;
+                    self.state.clear_folder_selection();
                 }
                 self.state.folders_dirty = true;
                 self.state.drafts_dirty = true;
@@ -1385,7 +1432,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             }
             Event::FolderRemoved { folder } => {
                 if self.state.selected_folder == Some(folder) {
-                    self.state.selected_folder = None;
+                    self.state.clear_folder_selection();
                     self.state.messages.clear();
                 }
                 self.state.folders_dirty = true;

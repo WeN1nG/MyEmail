@@ -25,7 +25,9 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
         );
         return;
     }
-    let Some(_account) = state.selected_account else {
+    // **统一收件箱跨账户**，不要求先选定单个账户——否则侧栏点得进来、
+    // 列表却提示「请选择账户」。
+    if state.selected_account.is_none() && !state.unified_inbox {
         empty_state(
             ui,
             "请选择账户",
@@ -35,8 +37,10 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
             commands,
         );
         return;
-    };
-    if state.selected_folder.is_none() && !state.search.active {
+    }
+    // **统一收件箱选中时 `selected_folder` 也是 `None`**——
+    // 不加 `!state.unified_inbox` 会把它误判成「请选择文件夹」的空态。
+    if state.selected_folder.is_none() && !state.search.active && !state.unified_inbox {
         empty_state(
             ui,
             "请选择文件夹",
@@ -89,7 +93,10 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
         no_messages(state, ui);
     } else {
         let table_height = (ui.available_height() - 40.0).max(120.0);
-        TableBuilder::new(ui)
+        // **聚合模式多一列「账户」**——多账户时否则无法分辨邮件来自谁。
+        // 列宽用 `Column::initial(...)`，遵守 D40（宽度交给布局算）。
+        let unified = state.unified_inbox;
+        let mut table = TableBuilder::new(ui)
             .max_scroll_height(table_height)
             // 默认是 Sense::hover()，行不会产生点击事件；必须显式启用点击。
             .sense(egui::Sense::click())
@@ -98,10 +105,15 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::exact(28.0)) // 未读
             .column(Column::exact(26.0)) // 星标
-            .column(Column::initial(150.0).at_least(80.0).clip(true))
+            .column(Column::initial(150.0).at_least(80.0).clip(true));
+        if unified {
+            table = table.column(Column::initial(130.0).at_least(80.0).clip(true));
+        }
+        table = table
             .column(Column::remainder().at_least(200.0).clip(true))
             .column(Column::initial(130.0).at_least(100.0))
-            .column(Column::exact(30.0)) // 附件
+            .column(Column::exact(30.0)); // 附件
+        table
             .header(22.0, |mut header| {
                 header.col(|ui| {
                     ui.label("");
@@ -112,6 +124,11 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                 header.col(|ui| {
                     ui.strong("发件人");
                 });
+                if unified {
+                    header.col(|ui| {
+                        ui.strong("账户");
+                    });
+                }
                 header.col(|ui| {
                     ui.strong("主题");
                 });
@@ -119,7 +136,7 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                     ui.strong("时间");
                 });
                 header.col(|ui| {
-                    ui.strong("");
+                    ui.label("");
                 });
             })
             .body(|body| {
@@ -181,6 +198,16 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                         };
                         ui.label(text);
                     });
+                    if unified {
+                        row.col(|ui| {
+                            // 显示账户邮箱——多账户时否则无法分辨来源。
+                            let email = state
+                                .account(message.account)
+                                .map(|a| a.email.clone())
+                                .unwrap_or_else(|| "(未知账户)".to_string());
+                            ui.label(RichText::new(email).small());
+                        });
+                    }
                     row.col(|ui| {
                         let subject = message.display_subject();
                         let mut text = if unread {
@@ -362,17 +389,13 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
         });
     }
     if let Some(id) = move_trash {
-        if state
-            .selected_account
-            .and_then(|account| state.trash_folder(account))
-            .is_none()
-        {
+        if has_trash_for(state, id) {
+            commands.push(Command::MoveToTrash(vec![id]));
+        } else {
             state.toast(
                 ToastKind::Warn,
                 "该账户没有废件箱角色，无法删除。请先在服务器端创建废件箱，或在文件夹右键菜单指定角色。",
             );
-        } else {
-            commands.push(Command::MoveToTrash(vec![id]));
         }
     }
     if let Some(id) = open {
@@ -382,6 +405,20 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
         state.body_loading = true;
         commands.push(Command::OpenMessage(id));
     }
+}
+
+/// 能不能把这封邮件移入废件箱。
+///
+/// **按邮件所属账户找废件箱**，不是按 `selected_account`——统一收件箱里
+/// 这封可能来自另一个账户，用错账户会拦下一次合法删除。
+fn has_trash_for(state: &UiState, id: MessageId) -> bool {
+    state
+        .messages
+        .iter()
+        .find(|m| m.id == id)
+        .map(|m| m.account)
+        .and_then(|account| state.trash_folder(account))
+        .is_some()
 }
 
 fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) {
@@ -426,6 +463,21 @@ fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) 
                         danger: true,
                     });
                 }
+            }
+        } else if state.unified_inbox {
+            // 聚合视图没有单个文件夹可显示——标题要单独给，
+            // 否则多账户时看不出当前在看什么。
+            ui.separator();
+            ui.label(RichText::new("📥 统一收件箱").strong());
+            ui.label(
+                RichText::new(format!("{} 封", state.messages.len()))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            if ui.small_button("刷新").clicked() {
+                // 聚合视图横跨多个账户，逐账户 `SyncFolder` 会刷一整排进度；
+                // 这里只重查本地库（离线可用，也不触发网络）。
+                state.messages_dirty = true;
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -712,7 +764,14 @@ fn submit_search(state: &mut UiState, commands: &mut Vec<Command>) {
         // **用解析后的正文**，不是原始输入——原始输入里的 `from:zhang`
         // 不该被当成正文去 FTS 匹配。
         text: parsed.text.trim().to_string(),
-        accounts: state.selected_account.into_iter().collect(),
+        // **统一收件箱里搜索不按账户过滤**——这个视图本来就跨账户，
+        // 悄悄只搜「当前选中账户」会让结果莫名少一半。
+        // `accounts` 为空 = 不限账户（`base_filters` 就是这么解释的）。
+        accounts: if state.unified_inbox {
+            Vec::new()
+        } else {
+            state.selected_account.into_iter().collect()
+        },
         folders: state.selected_folder.into_iter().collect(),
         since,
         until,
@@ -1332,6 +1391,163 @@ mod tests {
         assert!(
             !texts.join("\n").contains("已选"),
             "没选中时不该显示批量工具条"
+        );
+    }
+
+    // --- 统一收件箱（批次 4）---
+
+    fn state_with_two_accounts() -> UiState {
+        UiState {
+            accounts: vec![
+                crate::state::sample_account(1, "a@example.com"),
+                crate::state::sample_account(2, "b@example.com"),
+            ],
+            selected_account: Some(me_core::AccountId(1)),
+            unified_inbox: true,
+            ..Default::default()
+        }
+    }
+
+    fn message_from(id: i64, account: i64, folder: i64, subject: &str) -> me_core::MessageSummary {
+        me_core::MessageSummary {
+            id: MessageId(id),
+            account: me_core::AccountId(account),
+            folder: me_core::FolderId(folder),
+            uid: Some(id as u32),
+            message_id: None,
+            subject: Some(subject.to_string()),
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: Some(1000 + id),
+            date_source: me_core::DateSource::Header,
+            size: None,
+            flags: me_core::Flags::NONE,
+            snippet: None,
+            has_attachment: false,
+            body_cached: false,
+        }
+    }
+
+    /// 统一收件箱选中时 `selected_folder` 是 `None`——**不能被当成「请选择文件夹」**。
+    #[test]
+    fn unified_view_is_not_the_choose_folder_empty_state() {
+        let mut state = state_with_two_accounts();
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        let joined = texts.join("\n");
+        assert!(
+            !joined.contains("请选择文件夹"),
+            "统一收件箱被误判成空态：{texts:?}"
+        );
+        assert!(
+            joined.contains("统一收件箱"),
+            "缺少统一收件箱标题：{texts:?}"
+        );
+    }
+
+    /// 聚合模式必须多一列「账户」——多账户时否则分不清邮件来源。
+    #[test]
+    fn unified_view_renders_the_account_column() {
+        let mut state = state_with_two_accounts();
+        state.messages = vec![
+            message_from(2, 2, 20, "来自账户二"),
+            message_from(1, 1, 10, "来自账户一"),
+        ];
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        let joined = texts.join("\n");
+        assert!(joined.contains("账户"), "缺少账户列：{texts:?}");
+        assert!(
+            joined.contains("a@example.com"),
+            "缺少账户一邮箱：{texts:?}"
+        );
+        assert!(
+            joined.contains("b@example.com"),
+            "缺少账户二邮箱：{texts:?}"
+        );
+    }
+
+    /// 单文件夹视图不加「账户」列（那一列纯属浪费宽度）。
+    #[test]
+    fn folder_view_has_no_account_column() {
+        let mut state = UiState {
+            accounts: vec![crate::state::sample_account(1, "a@example.com")],
+            selected_account: Some(me_core::AccountId(1)),
+            ..Default::default()
+        };
+        state.select_folder(me_core::FolderId(10));
+        state.messages = vec![message_from(1, 1, 10, "邮件")];
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        assert!(
+            !texts.join("\n").contains("账户"),
+            "单文件夹视图不该有账户列：{texts:?}"
+        );
+    }
+
+    /// 统一收件箱里搜索不按账户过滤——`accounts` 为空表示不限账户。
+    #[test]
+    fn search_in_unified_inbox_does_not_filter_by_account() {
+        let mut state = state_with_two_accounts();
+        state.selected_account = Some(me_core::AccountId(1));
+        state.search.text = "季度报告".to_string();
+        let mut commands = Vec::new();
+        submit_search(&mut state, &mut commands);
+        match &commands[0] {
+            Command::Search(q) => {
+                assert!(
+                    q.accounts.is_empty(),
+                    "统一收件箱里搜索不该只搜一个账户：{:?}",
+                    q.accounts
+                );
+                assert!(q.folders.is_empty());
+            }
+            other => panic!("期望 Command::Search，实际 {other:?}"),
+        }
+    }
+
+    /// 删除时按**邮件所属账户**找废件箱，不是按当前选中账户。
+    #[test]
+    fn trash_guard_uses_the_message_account() {
+        // 账户 1 有废件箱、账户 2 没有；当前选中的是账户 2，
+        // 但邮件来自账户 1 → 应当放行（用错账户会拦下这次合法删除）。
+        let mut state = UiState {
+            accounts: vec![
+                crate::state::sample_account(1, "a@example.com"),
+                crate::state::sample_account(2, "b@example.com"),
+            ],
+            selected_account: Some(me_core::AccountId(2)),
+            unified_inbox: true,
+            ..Default::default()
+        };
+        state.folders.insert(
+            me_core::AccountId(1),
+            vec![me_core::Folder {
+                id: me_core::FolderId(10),
+                account: me_core::AccountId(1),
+                name: "Trash".into(),
+                delimiter: Some('/'),
+                role: me_core::FolderRole::Trash,
+                uid_validity: 1,
+                last_uid: 0,
+                deleted_on_server: false,
+            }],
+        );
+        state.messages = vec![message_from(1, 1, 10, "来自账户一")];
+
+        assert!(
+            has_trash_for(&state, MessageId(1)),
+            "应按邮件所属账户找到废件箱"
         );
     }
 }
