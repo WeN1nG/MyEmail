@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use me_core::{
     Account, AccountId, Address, AuthMethod, ConnectionState, Draft, DraftId, FlagOp, Flags,
-    Folder, FolderId, HtmlRendererMode, MessageBody, MessageId, MessageSummary, ThemeMode, TlsMode,
+    Folder, FolderId, HtmlRendererMode, MessageBody, MessageId, MessageSummary, ParsedQuery,
+    ThemeMode, TlsMode, parse_search_syntax,
 };
 
 // ---------------------------------------------------------------------------
@@ -497,16 +498,92 @@ pub struct SearchState {
     pub accounts: Vec<AccountId>,
     pub folders: Vec<FolderId>,
     pub show_filters: bool,
+    // --- 速记语法与条件面板（批次 1a） ---
+    /// 条件面板里的发件人（`from`）。
+    pub from: String,
+    /// 条件面板里的收件人（`to`）。
+    pub to: String,
+    /// 条件面板里的主题（`subject`）。
+    pub subject: String,
+    /// 条件面板里的「仅未读」。
+    pub unread_only: bool,
+    /// 上一次解析的结果。**搜索框内容变了但没回车时，界面显示的还是旧条件**——
+    /// 这个不一致必须避免，所以 chips 由 `parsed` 派生（见 `sync_parsed`）。
+    pub parsed: ParsedQuery,
+    /// 已解析条件的展示列表（chips），每项可单独删除。
+    pub conditions: Vec<ConditionChip>,
+}
+
+/// 条件标签的种类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipKind {
+    From,
+    To,
+    Subject,
+    HasAttachment,
+    Before,
+    After,
+    Unread,
+}
+
+/// 单个条件标签。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionChip {
+    /// 展示文案，如「发件人含 zhang」。
+    pub label: String,
+    pub kind: ChipKind,
+    /// 条件的值。删除标签时用它回填条件面板。
+    pub value: String,
 }
 
 impl SearchState {
+    /// 「1～2 字仅匹配头部」的提示是否该显示。
+    ///
+    /// **只看正文部分的字符数**（`parsed.text`），不是原始输入——
+    /// `from:ab` 走的是 `from` 的 `LIKE`，与正文全文检索无关，
+    /// 用原始输入判定会误报。
     pub fn is_short_query(&self) -> bool {
-        let count = self.text.trim().chars().count();
-        (1..3).contains(&count)
+        (1..3).contains(&self.parsed.text_len())
     }
 
+    /// 是否是空查询。
+    ///
+    /// **任何条件存在即非空**——速记语法下 `from:zhang` 的 `text` 为空，
+    /// 只看 `text` 会把它判成空查询，点搜索直接清空搜索框、什么都不搜。
     pub fn is_empty_query(&self) -> bool {
-        self.text.trim().is_empty()
+        self.parsed.is_empty()
+            && self.from.trim().is_empty()
+            && self.to.trim().is_empty()
+            && self.subject.trim().is_empty()
+            && !self.unread_only
+            && self.has_attachment.is_none()
+            && self.since_text.trim().is_empty()
+            && self.until_text.trim().is_empty()
+    }
+
+    /// 用当前输入重新解析速记语法，并重建 chips。
+    ///
+    /// 由调用方在**搜索框内容变化后**调用，保证界面显示的条件与输入一致。
+    pub fn sync_parsed(&mut self, today: i64) {
+        self.parsed = parse_search_syntax(&self.text, today);
+        self.conditions = build_chips(&self.parsed, self);
+    }
+
+    /// 删除某个条件标签：同时清掉对应的面板输入。
+    pub fn remove_chip(&mut self, index: usize) {
+        if index >= self.conditions.len() {
+            return;
+        }
+        let chip = self.conditions.remove(index);
+        match chip.kind {
+            ChipKind::From => self.from.clear(),
+            ChipKind::To => self.to.clear(),
+            ChipKind::Subject => self.subject.clear(),
+            ChipKind::HasAttachment => self.has_attachment = None,
+            ChipKind::Before => self.until_text.clear(),
+            ChipKind::After => self.since_text.clear(),
+            ChipKind::Unread => self.unread_only = false,
+        }
     }
 
     pub fn clear(&mut self) {
@@ -520,11 +597,104 @@ impl SearchState {
         self.has_attachment = None;
         self.since_text.clear();
         self.until_text.clear();
+        self.from.clear();
+        self.to.clear();
+        self.subject.clear();
+        self.unread_only = false;
+        self.parsed = ParsedQuery::default();
+        self.conditions.clear();
     }
 
     pub fn coverage_label(&self) -> String {
         format!("正文索引覆盖 {}/{} 封", self.body_indexed, self.body_total)
     }
+
+    /// 附件条件的展示文案（`None` 时返回空串）。
+    pub fn has_attachment_label(&self) -> String {
+        match self.has_attachment {
+            Some(true) => "仅含附件".to_string(),
+            Some(false) => "不含附件".to_string(),
+            None => String::new(),
+        }
+    }
+}
+
+/// 由解析结果 + 面板状态生成条件标签。
+///
+/// 面板里的条件（`from` / `to` / `subject` / 时间 / 附件 / 仅未读）与
+/// 速记语法解析出的条件**合并展示**——用户在面板里填的也是条件，
+/// 两者都该看得见。
+fn build_chips(parsed: &ParsedQuery, state: &SearchState) -> Vec<ConditionChip> {
+    let mut chips = Vec::new();
+    let push = |chips: &mut Vec<ConditionChip>, kind: ChipKind, value: &str, label: String| {
+        if value.trim().is_empty() {
+            return;
+        }
+        chips.push(ConditionChip {
+            label,
+            kind,
+            value: value.trim().to_string(),
+        });
+    };
+
+    // 面板里的条件优先（面板是显式操作，速记语法是输入框里的文本）。
+    push(
+        &mut chips,
+        ChipKind::From,
+        &state.from,
+        format!("发件人含 {}", state.from.trim()),
+    );
+    push(
+        &mut chips,
+        ChipKind::To,
+        &state.to,
+        format!("收件人含 {}", state.to.trim()),
+    );
+    push(
+        &mut chips,
+        ChipKind::Subject,
+        &state.subject,
+        format!("主题含 {}", state.subject.trim()),
+    );
+    push(
+        &mut chips,
+        ChipKind::HasAttachment,
+        &state.has_attachment_label(),
+        state.has_attachment_label(),
+    );
+    push(
+        &mut chips,
+        ChipKind::After,
+        &state.since_text,
+        format!("晚于 {}", state.since_text.trim()),
+    );
+    push(
+        &mut chips,
+        ChipKind::Before,
+        &state.until_text,
+        format!("早于 {}", state.until_text.trim()),
+    );
+    if state.unread_only {
+        push(&mut chips, ChipKind::Unread, "unread", "仅未读".to_string());
+    }
+
+    // 速记语法解析出的、面板里没有的条件（避免同一个条件显示两次）。
+    if state.from.trim().is_empty()
+        && let Some(v) = &parsed.from
+    {
+        push(&mut chips, ChipKind::From, v, format!("发件人含 {v}"));
+    }
+    if state.to.trim().is_empty()
+        && let Some(v) = &parsed.to
+    {
+        push(&mut chips, ChipKind::To, v, format!("收件人含 {v}"));
+    }
+    if state.subject.trim().is_empty()
+        && let Some(v) = &parsed.subject
+    {
+        push(&mut chips, ChipKind::Subject, v, format!("主题含 {v}"));
+    }
+    chips
 }
 
 // ---------------------------------------------------------------------------

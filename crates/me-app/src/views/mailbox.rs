@@ -3,7 +3,7 @@
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use me_core::{Command, MessageId, SearchQuery};
+use me_core::{Command, MessageId, SearchQuery, now_unix};
 
 use crate::app::human_bytes;
 use crate::state::{ComposeState, Dialog, Page, ToastKind, UiState};
@@ -325,10 +325,15 @@ fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) 
     ui.horizontal(|ui| {
         let response = ui.add(
             egui::TextEdit::singleline(&mut state.search.text)
-                .hint_text("搜索主题、发件人、收件人或正文（≥3 字可搜正文）")
+                .hint_text("搜索正文，或用 from: / to: / subject: / has: / is: 速记语法")
                 .desired_width(ui.available_width() - 150.0),
         );
         let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        // **输入变化就重新解析**——chips 必须反映输入框当前内容，
+        // 否则用户改了 `from:` 但没回车，界面显示的还是旧条件。
+        if response.changed() {
+            state.search.sync_parsed(now_unix());
+        }
         if ui.button("搜索").clicked() || enter {
             submit_search(state, commands);
         }
@@ -340,6 +345,38 @@ fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) 
             state.messages_dirty = true;
         }
     });
+
+    // 条件标签：让用户看得见「我搜的到底是什么」，并能单独删掉某个条件。
+    if !state.search.conditions.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("条件：").small().color(Color32::GRAY));
+            let mut to_remove: Option<usize> = None;
+            for (i, chip) in state.search.conditions.iter().enumerate() {
+                let label = chip.label.clone();
+                if ui.small_button(format!("{label} ×")).clicked() {
+                    to_remove = Some(i);
+                }
+            }
+            if let Some(i) = to_remove {
+                state.search.remove_chip(i);
+                state.search.sync_parsed(now_unix());
+            }
+        });
+    }
+
+    // 速记语法里拼错的片段：提示但不阻断搜索（探索性场景）。
+    if !state.search.parsed.unknown.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "无法识别：{}",
+                    state.search.parsed.unknown.join("、")
+                ))
+                .small()
+                .color(Color32::YELLOW),
+            );
+        });
+    }
 
     if state.search.show_filters {
         ui.horizontal(|ui| {
@@ -371,6 +408,27 @@ fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) 
                 });
         });
         ui.horizontal(|ui| {
+            ui.label("发件人：");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.search.from)
+                    .hint_text("包含")
+                    .desired_width(110.0),
+            );
+            ui.label("收件人：");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.search.to)
+                    .hint_text("包含")
+                    .desired_width(110.0),
+            );
+            ui.label("主题：");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.search.subject)
+                    .hint_text("包含")
+                    .desired_width(110.0),
+            );
+            ui.checkbox(&mut state.search.unread_only, "仅未读");
+        });
+        ui.horizontal(|ui| {
             ui.label(
                 RichText::new("过滤范围为当前账户；文件夹过滤使用左侧选中的文件夹。")
                     .small()
@@ -381,30 +439,48 @@ fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) 
 }
 
 fn submit_search(state: &mut UiState, commands: &mut Vec<Command>) {
+    // **先解析速记语法**——搜索框里的 `from:zhang` 这类片段要拆成结构化条件，
+    // 剩余的自由文本才进 FTS。
+    state.search.sync_parsed(now_unix());
+    let parsed = state.search.parsed.clone();
+
     if state.search.is_empty_query() {
         state.search.active = false;
         state.messages_dirty = true;
         return;
     }
-    let since = parse_date(&state.search.since_text, false);
-    let until = parse_date(&state.search.until_text, true);
+    // 面板里的时间优先于速记语法里的 `before:` / `after:`——
+    // 面板是显式操作，速记语法是输入框里的文本。
+    let since = parse_date(&state.search.since_text, false).or(parsed.since);
+    let until = parse_date(&state.search.until_text, true).or(parsed.until);
     if let (Some(since), Some(until)) = (since, until)
         && until <= since
     {
         state.toast(ToastKind::Warn, "结束日期必须晚于起始日期");
         return;
     }
+    // 面板条件优先（同上）。
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
     let query = SearchQuery {
-        text: state.search.text.trim().to_string(),
+        // **用解析后的正文**，不是原始输入——原始输入里的 `from:zhang`
+        // 不该被当成正文去 FTS 匹配。
+        text: parsed.text.trim().to_string(),
         accounts: state.selected_account.into_iter().collect(),
         folders: state.selected_folder.into_iter().collect(),
         since,
         until,
-        has_attachment: state.search.has_attachment,
-        from: None,
-        to: None,
-        subject: None,
-        unread_only: false,
+        has_attachment: state.search.has_attachment.or(parsed.has_attachment),
+        from: non_empty(&state.search.from).or(parsed.from),
+        to: non_empty(&state.search.to).or(parsed.to),
+        subject: non_empty(&state.search.subject).or(parsed.subject),
+        unread_only: state.search.unread_only || parsed.unread_only,
         limit: 200,
         cursor: None,
     };
@@ -471,4 +547,222 @@ fn empty_state(
         }
     });
     let _ = commands;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ChipKind;
+
+    // --- 速记语法进入查询 ---
+
+    #[test]
+    fn syntax_only_query_is_not_treated_as_empty() {
+        // 核心回归：`from:zhang` 的 text 为空，旧实现会判成空查询 →
+        // 点搜索直接清空搜索、什么都不搜。
+        let mut state = UiState::default();
+        state.search.text = "from:zhang".to_string();
+        let mut commands = Vec::new();
+        submit_search(&mut state, &mut commands);
+
+        assert_eq!(commands.len(), 1, "速记语法必须能触发搜索");
+        match &commands[0] {
+            Command::Search(q) => {
+                assert_eq!(q.from.as_deref(), Some("zhang"));
+                assert!(q.text.is_empty(), "速记语法片段不该进正文全文检索");
+            }
+            other => panic!("期望 Command::Search，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn syntax_text_is_split_from_conditions() {
+        let mut state = UiState::default();
+        state.search.text = "from:zhang 季度报告".to_string();
+        let mut commands = Vec::new();
+        submit_search(&mut state, &mut commands);
+
+        match &commands[0] {
+            Command::Search(q) => {
+                assert_eq!(q.from.as_deref(), Some("zhang"));
+                assert_eq!(q.text, "季度报告");
+            }
+            other => panic!("期望 Command::Search，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn panel_conditions_are_filled_into_query() {
+        let mut state = UiState::default();
+        state.search.from = "alice".to_string();
+        state.search.to = "bob".to_string();
+        state.search.subject = "预算".to_string();
+        state.search.unread_only = true;
+        let mut commands = Vec::new();
+        submit_search(&mut state, &mut commands);
+
+        match &commands[0] {
+            Command::Search(q) => {
+                assert_eq!(q.from.as_deref(), Some("alice"));
+                assert_eq!(q.to.as_deref(), Some("bob"));
+                assert_eq!(q.subject.as_deref(), Some("预算"));
+                assert!(q.unread_only);
+            }
+            other => panic!("期望 Command::Search，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn panel_condition_overrides_syntax_of_same_kind() {
+        // 面板是显式操作，速记语法是输入框里的文本——面板优先。
+        let mut state = UiState::default();
+        state.search.text = "from:syntax".to_string();
+        state.search.from = "panel".to_string();
+        let mut commands = Vec::new();
+        submit_search(&mut state, &mut commands);
+
+        match &commands[0] {
+            Command::Search(q) => assert_eq!(q.from.as_deref(), Some("panel")),
+            other => panic!("期望 Command::Search，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_query_clears_search_instead_of_searching() {
+        // `messages_dirty` 默认是 true（首帧要加载），这里显式置 false 才能断言它被置回。
+        let mut state = UiState {
+            messages_dirty: false,
+            ..Default::default()
+        };
+        let mut commands = Vec::new();
+        submit_search(&mut state, &mut commands);
+
+        assert!(commands.is_empty(), "空查询不该发 Command");
+        assert!(!state.search.active);
+        assert!(state.messages_dirty, "清空搜索后应标记列表待刷新");
+    }
+
+    #[test]
+    fn unknown_syntax_still_searches_without_blocking() {
+        // 拼错的字段名不该阻断搜索（探索性场景）。
+        let mut state = UiState::default();
+        state.search.text = "fromm:zhang 报告".to_string();
+        let mut commands = Vec::new();
+        submit_search(&mut state, &mut commands);
+
+        assert_eq!(commands.len(), 1, "未知片段不该阻断搜索");
+        match &commands[0] {
+            Command::Search(q) => assert_eq!(q.text, "报告"),
+            other => panic!("期望 Command::Search，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_query_hint_uses_body_part_only() {
+        // `from:ab` 走 from 的 LIKE，与正文全文检索无关 → 不该提示「1~2 字」。
+        let mut state = UiState::default();
+        state.search.text = "from:ab".to_string();
+        state.search.sync_parsed(now_unix());
+        assert!(!state.search.is_short_query());
+
+        state.search.text = "ab".to_string();
+        state.search.sync_parsed(now_unix());
+        assert!(state.search.is_short_query());
+    }
+
+    // --- 条件标签（chips）---
+
+    #[test]
+    fn chips_reflect_current_input_not_the_parsed_snapshot() {
+        // 用户改了输入框但没回车，chips 必须跟着变——
+        // 否则界面显示的还是旧条件，与用户以为的不一致。
+        let mut state = UiState::default();
+        state.search.text = "from:alice".to_string();
+        state.search.sync_parsed(now_unix());
+        assert_eq!(state.search.conditions.len(), 1);
+        assert_eq!(state.search.conditions[0].kind, ChipKind::From);
+
+        state.search.text = "from:bob to:carol".to_string();
+        state.search.sync_parsed(now_unix());
+        assert_eq!(state.search.conditions.len(), 2);
+    }
+
+    #[test]
+    fn chips_include_panel_conditions() {
+        let mut state = UiState::default();
+        state.search.from = "alice".to_string();
+        state.search.unread_only = true;
+        state.search.sync_parsed(now_unix());
+
+        let kinds: Vec<ChipKind> = state.search.conditions.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&ChipKind::From));
+        assert!(kinds.contains(&ChipKind::Unread));
+    }
+
+    #[test]
+    fn removing_a_chip_clears_the_matching_panel_field() {
+        let mut state = UiState::default();
+        state.search.from = "alice".to_string();
+        state.search.subject = "预算".to_string();
+        state.search.unread_only = true;
+        state.search.sync_parsed(now_unix());
+
+        let from_idx = state
+            .search
+            .conditions
+            .iter()
+            .position(|c| c.kind == ChipKind::From)
+            .expect("应有发件人标签");
+        state.search.remove_chip(from_idx);
+        assert!(state.search.from.is_empty(), "删标签要同时清掉面板输入");
+        assert_eq!(state.search.subject, "预算", "其它条件不受影响");
+        assert!(state.search.unread_only, "其它条件不受影响");
+    }
+
+    #[test]
+    fn removing_unread_chip_turns_the_flag_off() {
+        let mut state = UiState::default();
+        state.search.unread_only = true;
+        state.search.sync_parsed(now_unix());
+        let idx = state
+            .search
+            .conditions
+            .iter()
+            .position(|c| c.kind == ChipKind::Unread)
+            .expect("应有未读标签");
+        state.search.remove_chip(idx);
+        assert!(!state.search.unread_only);
+    }
+
+    #[test]
+    fn removing_out_of_range_chip_is_a_no_op() {
+        let mut state = UiState::default();
+        state.search.from = "alice".to_string();
+        state.search.sync_parsed(now_unix());
+        state.search.remove_chip(99);
+        assert_eq!(state.search.from, "alice", "越界删除不该改状态");
+    }
+
+    #[test]
+    fn clear_resets_all_conditions() {
+        let mut state = UiState::default();
+        state.search.text = "from:alice".to_string();
+        state.search.from = "bob".to_string();
+        state.search.unread_only = true;
+        state.search.sync_parsed(now_unix());
+        state.search.clear();
+
+        assert!(state.search.text.is_empty());
+        assert!(state.search.from.is_empty());
+        assert!(!state.search.unread_only);
+        assert!(state.search.conditions.is_empty());
+        assert!(state.search.parsed.is_empty());
+        assert!(state.search.is_empty_query());
+    }
+
+    #[test]
+    fn is_empty_query_is_true_when_nothing_is_set() {
+        let state = UiState::default();
+        assert!(state.search.is_empty_query());
+    }
 }
