@@ -4,7 +4,7 @@
 
 **用 Rust 从零实现的多账户原生邮件客户端**
 
-*自研 HTML 排版引擎 · 自研 SSE 流式解码 · 分层架构 · 548 个测试全绿*
+*自研 HTML 排版引擎 · 自研 SSE 流式解码 · 分层架构 · 600 个测试全绿*
 
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-000?logo=rust)](https://www.rust-lang.org/)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -30,7 +30,7 @@
 | 指标 | 数值 |
 |:--|:--|
 | 代码规模 | 57,500 行(不含测试) / 66,600 行(含测试) |
-| 测试 | **561 passed / 0 failed / 6 ignored** |
+| 测试 | **600 passed / 0 failed / 6 ignored** |
 | 测试文件 | 15 个集成测试 + 46 个内联测试模块 |
 | 直接依赖 | 50 个 crates(`async-imap` / `lettre` / `rusqlite` / `rodio` / `scraper`…) |
 | 外部服务 | 0(全部本地化,可完全离线使用) |
@@ -130,13 +130,15 @@ Governor: 全局许可 → 账户锁(两段获取,避免环等待)
 
 两套预算分开计费是必需的:IDLE 监听连接是长连接,如果不与操作连接分开,一封长邮件的同步就能把发送请求饿死。
 
-### 6. 数据可迁移:从 v1 活到 v5
+### 6. 数据可迁移:从 v1 活到 v6
 
-数据库 schema 走了 5 个版本,每次变更都是**纯加列**,靠一个反直觉的判据保证幂等:
+数据库 schema 走了 6 个版本。v4/v5 是**纯加列**,靠一个反直觉的判据保证幂等:
 
 > **判断「某列在不在」,而不是判断「版本号到没到」。**
 
 新建库的 DDL 天然带最新列,而从 v2 升级来的库刚跑完 v3 迁移时列的情况又不同——两条路径到达同一版本时状态不一致,用版本号判断必然出错。所以 `migrate_v3_to_v4` / `migrate_v4_to_v5` 都用 `pragma_table_info` 查列,缺了才 `ALTER TABLE`。
+
+v6 换了个判据:它是**纯索引调整**(不改列),幂等靠「先 DROP 再 CREATE」——SQLite 没有 `ALTER INDEX`,改索引列序只能重建。
 
 配套一条铁律:**中间步骤的版本号必须写死**,写 `SCHEMA_VERSION` 会给旧库盖上「已是最新」的章,把后续迁移整段跳过——这个坑代码里留了注释(`migrations.rs:560`)。
 
@@ -176,6 +178,7 @@ Governor: 全局许可 → 账户锁(两段获取,避免环等待)
 - 多账户 IMAP 收信 / SMTP 发信
 - 全量摘要入库 + 正文文件缓存,断网仍可读
 - FTS5 trigram 全文检索(≥3 字命中正文)
+- 速记语法:`from:` `to:` `subject:` `has:` `is:unread` `before:` `after:`
 - IDLE 实时推送,自动降级轮询
 - 草稿双向同步,冲突保留两份不静默覆盖
 - 富文本 / 纯文本 / Markdown 三视图
@@ -220,10 +223,10 @@ Governor: 全局许可 → 账户锁(两段获取,避免环等待)
 
 ## 工程实践
 
-**测试**:548 个测试全部通过。分层架构的直接收益是测试不需要真实服务器——`me-core` 的领域规则是纯函数,毫秒级跑完;`me-proto` 用本机 mock IMAP 测协议时序;`me-sync` 注入 mock provider 测端到端编排。
+**测试**:600 个测试全部通过。分层架构的直接收益是测试不需要真实服务器——`me-core` 的领域规则是纯函数,毫秒级跑完;`me-proto` 用本机 mock IMAP 测协议时序;`me-sync` 注入 mock provider 测端到端编排。
 
 ```bash
-cargo test --workspace        # 561 passed / 6 ignored
+cargo test --workspace        # 600 passed / 6 ignored
 ```
 
 **质量门禁**:`cargo fmt` / `cargo clippy -D warnings` / `cargo deny check`(许可证白名单 + 禁 OpenSSL / native-tls)全部通过,CI 只在 `windows-latest` 上跑这四道。
