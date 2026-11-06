@@ -27,6 +27,7 @@
 # 1. Rust / Cargo 构建产物
 # ------------------------------------------------------------
 /target/
+/target-audit-strip/
 **/target/
 **/incremental/
 **/deps/
