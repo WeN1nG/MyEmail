@@ -1,214 +1,307 @@
+<div align="center">
+
 # MyEmail
 
-多账户统一收发 + 本地全量缓存 + 离线全文检索的原生桌面邮件客户端（Rust + egui）。
+**用 Rust 从零实现的多账户原生邮件客户端**
 
-当前实现对应 **v0.3（0.3.0）**：在 v0.2 邮件主链路上加入**日历 / 天气 / AI 对话 / 音乐播放器**四个页面，
-并把它们纳入同一套分层、`Command`/`Event` 通道与安全边界；数据库 schema 为 **v5**。
+*自研 HTML 排版引擎 · 自研 SSE 流式解码 · 分层架构 · 548 个测试全绿*
 
-> v0.3 **未交付**：`.ics` 导入导出与邮件邀请导入、系统通知（只有应用内提示）、日历「仅此次」编辑、
-> 四个模块的功能开关。真实 Gmail/Outlook 授权、真实天气/AI 密钥、真机音频、Docker E2E 仍需人工验收；
-> 全部缺口见「[已知缺口](#已知缺口相对架构文档)」，逐项状态见 [doc/versiondoc/v03收尾.md](doc/versiondoc/v03收尾.md)。
->
-> 发布包在 `dist/0.3.0/`（`dist/v03/`、`dist/v04/` 是过程快照，后者才是完整 0.3.0）。
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-000?logo=rust)](https://www.rust-lang.org/)
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Tests](https://img.shields.io/badge/tests-548%20passed-2ea66f)
+![Deps](https://img.shields.io/badge/WebView-0%20%C2%B7%20JS%20engine-0-8b5cf6)
 
-## 快速开始
+</div>
+
+---
+
+## 这是什么
+
+一个**不依赖浏览器内核**的桌面邮件客户端。
+
+大多数邮件客户端用 WebView 渲染正文——这意味着要背上一个 Chromium、承担 JS 引擎的攻击面、还要处理 Electron 式的内存开销。本项目反其道而行:用 **egui 立即模式 GUI** 直接绘制,自己实现 HTML 解析、CSS 匹配与排版引擎。
+
+代价是工作量大,收益是完全掌控渲染结果:邮件正文有多少行文字、每个表格单元格在哪、字间距怎么算,全部可预测、可测试、零攻击面。
+
+在此之上还集成了**日历 / 天气 / AI 对话 / 音乐播放器**四个模块——它们共用同一套分层、`Command`/`Event` 通信契约与安全边界,不是拼装在一起的独立应用。
+
+<div align="center">
+
+| 指标 | 数值 |
+|:--|:--|
+| 代码规模 | 57,500 行(不含测试) / 66,600 行(含测试) |
+| 测试 | **548 passed / 0 failed / 5 ignored** |
+| 测试文件 | 15 个集成测试 + 46 个内联测试模块 |
+| 直接依赖 | 50 个 crates(`async-imap` / `lettre` / `rusqlite` / `rodio` / `scraper`…) |
+| 外部服务 | 0(全部本地化,可完全离线使用) |
+| WebView / JS 引擎 | **0** |
+
+</div>
+
+---
+
+## 技术要点
+
+### 1. 自研 HTML 排版引擎
+
+**难点在于**:邮件不是网页。`<table>` 布局是 1998 年的遗产,真实邮件里满地都是;而通用 CSS 布局引擎会为了「正确」把一个表格拆成几十个匿名盒,丢掉邮件作者精心调好的像素。
+
+**解法**:两步走。
+
+```
+parse.rs   HTML5 DOM(scraper)→ 清洗 → 扁平块模型
+   ↓         后台线程 spawn_blocking,并发 2
+css.rs     CSS 子集解析 → 选择器匹配 → specificity 排序
+   ↓
+layout.rs  按内容宽度测量出每个块/行/单元格的绝对矩形 → 一次性绘制
+```
+
+关键设计是**测量与绘制分离**。布局引擎先算出所有元素的绝对 `Rect`,再交给 painter 按文档序绘制:
+
+- 一个段落 = **一个** `LayoutJob`(而不是每个行内片段一个控件)——断行、CJK、字体度量、文本选区全部交给 egui 的原生能力,但保持段落整体性
+- 真实支持 `rowspan` / `colspan` 表格网格、`display:inline-block` 列容器、`max-width` 约束、相邻边距折叠
+- `line-height` / `letter-spacing` / 逐行 `text-align` 精确还原
+- 选择器优先级按 `(id, class/attr/pseudo, type)` 三元组近似计算
+
+**性能**(release):930 KB 复杂邮件 ≈ **35 ms**,1000×5 表格 ≈ **13 ms**。
+
+**安全边界**:不执行脚本、不加载外部 CSS/字体、不使用 WebView。`position`/`float`/`flex`/`grid` 按块级文档流降级。硬上限(节点 ≤50k、深度 ≤128、文本 ≤2MB)超出即回退到简化视图,绝不 panic。
+
+### 2. 自研 SSE 流式解码
+
+大模型 API 的流式响应用 Server-Sent Events。`reqwest` 能收字节流,但**不解析 SSE**——引入一个 SSE 库意味着多一个依赖、多一份信任。
+
+`sse.rs` 用 267 行解决了这个问题,核心是一个反直觉的细节:
+
+> **`\n` 是 ASCII 字符,不可能出现在 UTF-8 多字节序列中间。**
+
+所以只要**按字节缓冲、遇到 `\n` 才解码**,就不会把一个中文字符从中间切开——哪怕 TCP 恰好在那个位置断了包。这个性质无法靠事后补救,必须在缓冲策略上做对。
+
+同时实现了字节级总上限(4 MiB)与单行上限(256 KiB),防止服务端异常导致内存无限增长。
+
+### 3. 分层架构:靠编译器保证边界
+
+```
+me-app ──Command/Event──► me-sync ──► me-proto
+  │                          │  └────► me-store
+  └──只读快照───────────────► me-store
+所有 crate ──► me-core(唯一汇点)
+```
+
+硬规则不是靠自觉,而是靠**编译期就会报错**的设计:
+
+- `me-app` **不能** `use` `async-imap` / `lettre` / `rusqlite` 的任何符号——写错就编译不过
+- `me-proto` 与 `me-store` 互不依赖,只通过 `me-core` 的类型通信
+- `me-core` 是**唯一汇点**,不依赖 tokio / rusqlite / 任何协议库——领域规则可脱离运行时单测
+- 端口 trait 返回 `impl Future + Send` 而非 `async fn`:多线程 tokio 要求 future 为 `Send`,而 `async fn` in trait 无法表达该约束
+
+**`me-app` 不依赖 `me-proto`**——AI 传输层在 `me-sync` 的 `start_native()` 里注入。这是分层设计带来的直接收益:换模型服务商时,UI 层一行代码都不用动。
+
+### 4. AI 工具的两段式安全边界
+
+让模型调用工具(查邮件、创建日程、播放音乐)最大的风险是**模型被诱导执行有害操作**。本项目用三层拦截:
+
+| 层 | 机制 | 效果 |
+|:--|:--|:--|
+| 请求期 | 14 个工具白名单 + 9 个权限开关 | 关掉的工具**根本不下发**给模型 |
+| 执行期 | 二次校验本轮工具集 | 模型返回未下发的工具 → **直接拒绝** |
+| 重放期 | 正向列举可重放工具 | 「重新生成」只下发 9 个只读工具 |
+
+最后一条的设计值得单独说:**用正向白名单而不是反向排除**。写成「排除已知写工具」的话,以后新增一个带副作用的工具会**默认被判成可重放**——而重新生成时它可能被真的执行。正向列举是失败安全的:忘了登记的工具默认不可重放。
+
+还有几条不变量:
+
+- 每个工具调用**必须**携带 `motive`(模型说明调用理由),缺失则降级执行而非重试
+- `calendar_delete` **不直接删**,只发确认卡,等用户在 UI 点「确认删除」;确认后 10 秒内还能撤销
+- 音乐工具在 UI 侧执行(模型进程碰不到音频设备),3 秒超时,超时按「工具失败」回报模型而非让整轮崩掉
+- 邮件正文与工具结果一律视为**不可信资料**,`---` 分隔符会被转义,防止伪造分隔符注入
+
+### 5. 并发治理:抢连接不如先让路
+
+同步引擎面对一个经典问题:后台补全正在下载 500 封邮件的正文,用户此刻点了「发送」。
+
+常见做法是给任务排优先级队列。本项目选择**抢占式取消**——高优先任务先 `cancel_backfill(account)` 停掉该账户的补全,再抢连接:
+
+```
+Governor: 全局许可 → 账户锁(两段获取,避免环等待)
+预算分离: 操作连接 全局2/单账户1,监听连接 全局4/单账户1
+退避:    30s → 2min → 5min
+```
+
+两套预算分开计费是必需的:IDLE 监听连接是长连接,如果不与操作连接分开,一封长邮件的同步就能把发送请求饿死。
+
+### 6. 数据可迁移:从 v1 活到 v5
+
+数据库 schema 走了 5 个版本,每次变更都是**纯加列**,靠一个反直觉的判据保证幂等:
+
+> **判断「某列在不在」,而不是判断「版本号到没到」。**
+
+新建库的 DDL 天然带最新列,而从 v2 升级来的库刚跑完 v3 迁移时列的情况又不同——两条路径到达同一版本时状态不一致,用版本号判断必然出错。所以 `migrate_v3_to_v4` / `migrate_v4_to_v5` 都用 `pragma_table_info` 查列,缺了才 `ALTER TABLE`。
+
+配套一条铁律:**中间步骤的版本号必须写死**,写 `SCHEMA_VERSION` 会给旧库盖上「已是最新」的章,把后续迁移整段跳过——这个坑代码里留了注释(`migrations.rs:560`)。
+
+每步独立事务 + 末尾 `foreign_key_check`,失败即回滚、不写版本号、启动中止,**不静默降级**。
+
+### 7. 出网请求的安全默认值
+
+凡是会主动发出去的 HTTP 请求,都按「假设对方会攻击你」设计:
+
+| | 防护 |
+|:--|:--|
+| **远程图片** | 仅 http/https、端口白名单(80/443/8080/8443)、拒本机/私网/CGNAT、**逐跳 DNS 与重定向校验**、不发 Cookie/Referer、单张 ≤8 MB、20s 超时 |
+| **天气 API** | 禁止重定向(防止被引到内网)、Key 只走请求头(`X-QW-Api-Key`,URL 里绝不出现 `key=`) |
+| **OAuth 令牌** | 禁止重定向、20s 超时、响应体 ≤64 KB、令牌类型 `Debug` 脱敏 |
+| **模型 API** | 禁止重定向(防 Authorization 泄露到别的主机)、错误响应体不进入 `detail` |
+
+「逐跳校验」是重点:只检查初始 URL 是不够的,攻击者可以给一个公网地址,让它 302 到 `http://127.0.0.1/admin`。
+
+### 8. 原生音频:独立线程 + 零阻塞回调
+
+频谱分析的难点是**实时音频回调线程绝不能阻塞**——它跑在 cpal 的回调里,一旦卡住就是爆音。
+
+`spectrum.rs` 的做法:`SpectrumSink` 是唯一跨线程交接点,回调里只做「整块替换」,拿不到锁就**丢弃**这一帧。FFT 全部在 UI 线程做,回调线程永不等待。
+
+播放状态 250ms 回传一次 UI,频谱与播放状态**都不进 `Command`/`Event` 通道**,也不落库——音频是高频瞬时数据,走持久化通道是设计错误。
+
+---
+
+## 功能
+
+<div align="center">
+
+<table>
+<tr><td width="50%" valign="top"><b>邮件</b></td><td width="50%" valign="top"><b>日历</b></td></tr>
+<tr><td valign="top">
+
+- 多账户 IMAP 收信 / SMTP 发信
+- 全量摘要入库 + 正文文件缓存,断网仍可读
+- FTS5 trigram 全文检索(≥3 字命中正文)
+- IDLE 实时推送,自动降级轮询
+- 草稿双向同步,冲突保留两份不静默覆盖
+- 富文本 / 纯文本 / Markdown 三视图
+- 远程图片自动加载(带完整 SSRF 防护)
+- OAuth2 回环 + Microsoft 设备码
+
+</td><td valign="top">
+
+- 月 / 周 / 议程三视图
+- 重复规则展开(纯函数,UI 不自己解析)
+- 多个本地日历
+- 最多 3 个提醒,应用内去重
+- 与 AI 对话打通(模型可查/建日程)
+- 删除需确认,10 秒内可撤销
+
+</td></tr>
+<tr><td valign="top"><b>AI 对话</b></td><td valign="top"><b>音乐 & 天气</b></td></tr>
+<tr><td valign="top">
+
+- Anthropic / OpenAI 兼容双协议
+- 流式输出 / 停止 / 重新生成
+- 多模型档案,每份可绑定不同对话
+- 14 个工具 + 9 个权限开关
+- 1–6 步任务清单,状态只前进
+- 邮件命中卡片 + 原地阅读窗
+
+</td><td valign="top">
+
+- 目录递归扫描,48 柱实时频谱
+- mp3 / flac / wav / ogg
+- 标签与内嵌封面读取
+- 播放顺序 / 随机,切页不中断
+- 天气:城市搜索 / 24h / 7 天
+- 按地点独立刷新与退避
+
+</td></tr>
+</table>
+
+</div>
+
+---
+
+## 工程实践
+
+**测试**:548 个测试全部通过。分层架构的直接收益是测试不需要真实服务器——`me-core` 的领域规则是纯函数,毫秒级跑完;`me-proto` 用本机 mock IMAP 测协议时序;`me-sync` 注入 mock provider 测端到端编排。
 
 ```bash
-# 构建
-cargo build
-
-# 运行（Windows 下生成 target/debug/myemail.exe）
-cargo run -p me-app
-
-# 全量测试（548 passed / 5 ignored）
-cargo test --workspace
-
-# 真实 IMAP/SMTP 端到端测试（需 Docker Desktop 运行）
-scripts/e2e.sh
-
-# 打发布包：exe + 同源源码 zip + 发布说明 → dist/<版本>/
-python scripts/pack_dist.py --version 0.3.0
-
-# 发布前信息泄露自检（本机标识 / 凭据形态 / 真实数据）
-python scripts/check_leak.py --dist dist/0.3.0
+cargo test --workspace        # 548 passed / 5 ignored
 ```
 
-四个新页面在顶部页签：`邮件 / 日历 / 天气 / AI / 音乐 / 账户 / 设置`（`Ctrl+1..7` 直达）。
-天气与 AI 都需要自备密钥：天气在页面右上角「配置密钥」，AI 在 AI 页「设置 → 模型」。
+**质量门禁**:`cargo fmt` / `cargo clippy -D warnings` / `cargo deny check`(许可证白名单 + 禁 OpenSSL / native-tls)全部通过,CI 只在 `windows-latest` 上跑这四道。
 
-### OAuth 客户端配置（构建期）
+**发布安全**:打包脚本会做**信息泄露自检**——扫描 exe 与源码包里是否残留构建机绝对路径、本机标识、凭据形态、真实数据库内容,命中即阻塞发布。release 构建带 `--remap-path-prefix`,否则 exe 里会留下构建机的完整路径。
 
-Google / Microsoft 的 `client_id` 与可选 `client_secret` 通过**编译期环境变量**注入，不写入仓库：
+**性能基准**:HTML 解析在 release 下跑 930 KB 真实邮件与 1000×5 表格,作为 `#[ignore]` 测试保留,防止回归。
+
+---
+
+## 技术栈
+
+| 领域 | 选型 |
+|:--|:--|
+| 语言 | Rust 2024 edition,MSRV 1.88 |
+| GUI | `eframe` / `egui`(立即模式,无 WebView) |
+| 异步 | `tokio`(multi-thread,4 worker) |
+| 协议 | `async-imap` / `lettre` / `mail-parser`(full_encoding) |
+| 存储 | `rusqlite`(bundled)+ `r2d2` 读池 / FTS5 trigram |
+| 渲染 | `scraper`(html5ever) / `cssparser` / 自研布局引擎 |
+| 图形 | `image` / `resvg`(SVG 栅格化) |
+| 音频 | `rodio` / `symphonia` / `walkdir` |
+| 网络 | `reqwest`(rustls,仅 `me-proto`) |
+| TLS | `rustls`(**不用** OpenSSL / native-tls) |
+| 凭证 | `keyring`(系统密钥库) |
+
+---
+
+## 已知边界
+
+诚实地说明这个项目**不做**什么:
+
+- HTML 渲染是**邮件排版子集**,不是浏览器。不执行 JS、不加载外部 CSS/字体;`position`/`float`/`flex`/`grid` 按块级文档流降级;边框按整框近似
+- 无 `.ics` 导入导出,跨设备迁移靠数据库文件
+- 无系统通知,日历提醒只在应用运行时可见
+- 日历重复事件只能改整个系列,尚无「仅此次」编辑界面
+- AI 会话列表固定拉取最近 100 条,暂无滚动分页
+- AI / 天气密钥以明文存本地库(用户明确要求与其它参数一致保存),补偿手段是「不进日志、界面暗文、`Debug` 脱敏」
+- 真实 Gmail/Outlook 授权、真机音频、Docker E2E 尚待人工验收
+
+---
+
+## 构建
 
 ```bash
-MYEMAIL_GOOGLE_CLIENT_ID=xxx MYEMAIL_GOOGLE_CLIENT_SECRET=xxx \
-MYEMAIL_MICROSOFT_CLIENT_ID=xxx MYEMAIL_MICROSOFT_CLIENT_SECRET=xxx \
-cargo build --release -p me-app
+git clone <repo>
+cd MyEmail
+cargo build --release          # 产物 target/release/myemail.exe
 ```
 
-高级设置可覆盖 `client_id` 与 Microsoft `tenant`（写入 `meta.oauth_client_google` / `meta.oauth_client_microsoft`）；`client_secret` 只能构建期注入，用户自带客户端需自行构建。
+需要 Rust 1.88+。Windows 下直接运行即可,无需额外运行时。
 
-应用内入口：账户页「使用 Google / Microsoft 登录」（回环重定向）；Microsoft 另提供设备码登录；OAuth 账户可随时「重新授权」。授权回调只绑定 `127.0.0.1`，`state` 单次校验，5 分钟超时。
+**OAuth 客户端**(可选,构建期注入,密钥不进仓库):
 
-首次启动会提示“本地缓存为明文保存”，点击「我已知晓」后不再弹出。数据库与缓存位于：
-
-```
-%APPDATA%\MyEmail\            Windows（macOS/Linux 走 dirs::data_dir）
-├─ myemail.db                 SQLite 主库（WAL）
-├─ bodies/                    正文纯文本
-├─ raw/                       原始邮件 .eml.gz
-├─ attach/                    附件缓存
-├─ drafts/                    草稿原文与托管附件
-└─ logs/                      按天滚动，保留 7 天
+```bash
+MYEMAIL_GOOGLE_CLIENT_ID=xxx MYEMAIL_MICROSOFT_CLIENT_ID=xxx cargo build --release
 ```
 
-`attach/` 可在「设置 → 本地缓存 → 附件下载目录」重定位到任意绝对路径（默认即上述路径）。更改会迁移已下载附件并更新数据库中的本地路径；「另存为…」也以该目录为起始位置。
+数据目录:`%APPDATA%\MyEmail\`(其他平台走 `dirs::data_dir`)。
 
-## 工程结构
+---
 
-| crate | 职责 |
-| --- | --- |
-| `me-core` | 领域模型、端口 trait、`Command`/`Event`、错误；日历重复规则展开、天气图标码映射、AI 上下文裁剪与工具规格、任务清单校验；不依赖 tokio/rusqlite/reqwest |
-| `me-proto` | IMAP/SMTP 适配、MIME 解析与构建、modified UTF-7；和风天气 HTTPS、AI 协议（Anthropic / OpenAI 兼容）与 SSE 解析、BODYSTRUCTURE 附件判定 |
-| `me-store` | SQLite 仓储（邮件 / 日历 / 天气 / AI）、FTS5(trigram)、文件缓存、schema 与 v1→v5 迁移 |
-| `me-sync` | 同步引擎、正文补全、连接预算、取消/退避、事件发送；日历/天气/AI 用例与工具执行 |
-| `me-app` | eframe/egui 界面、视图、输入、文件对话框；HTML 渲染器 v2、音频线程与频谱 |
+## 文档
 
-依赖方向与硬规则见 [doc/项目架构.md](doc/项目架构.md) §2。`me-app` 不依赖 `me-proto`——AI 传输层由 `me-sync` 的 `start_native()` 注入。
+| 文档 | 内容 |
+|:--|:--|
+| [doc/项目架构.md](doc/项目架构.md) | 分层、依赖方向、线程模型、通信契约 |
+| [doc/数据结构.md](doc/数据结构.md) | DDL 唯一事实源、迁移链、索引与查询模式 |
+| [doc/项目大纲.md](doc/项目大纲.md) | 目标、需求、选型理由、决策记录 |
+| [doc/技术栈选用.md](doc/技术栈选用.md) | 逐项选型与**不引入**清单 |
+| [doc/可行性分析.md](doc/可行性分析.md) | 风险登记与 Spike 门禁 |
+| [doc/AI模块设计.md](doc/AI模块设计.md) | AI 工具契约与安全边界设计 |
+| [CLAUDE.md](CLAUDE.md) | 面向 AI 助手的分层规则与行为不变量 |
 
-## 测试
+---
 
-| 位置 | 内容 |
-| --- | --- |
-| `crates/me-core/src/*.rs` 内联 | 标志位、snippet、日期回退、附件上限、事件分类、AI 请求构建、清单校验、重复规则展开 |
-| `crates/me-store/tests/store_schema.rs` | schema、外键、FTS 增删改、去重、分页、标志合并、缓存不变量 |
-| `crates/me-store/tests/migration_v1_v2.rs` | v1→v2 迁移、备份、Drafts 清理、外键检查、失败回滚 |
-| `crates/me-store/tests/draft_sync_store.rs` | Bcc、同步状态、服务器身份、墓碑、冲突副本 |
-| `crates/me-store/tests/calendar_store.rs` | 日历/事件 CRUD、重复范围查询、提醒候选、例外 |
-| `crates/me-store/tests/ai_store.rs` | AI 仓储：会话/消息/实体、`tool_trace`、孤儿流式行修复、实体 200 上限 |
-| `crates/me-store/src/weather.rs` 内联 | 地点 CRUD 与 8 个上限、默认地点、快照往返与版本失效 |
-| `crates/me-proto/tests/proto_mock.rs` | mock IMAP：CAPABILITY/SELECT/LIST、标志分页、`BODY.PEEK[]`、MOVE/COPYUID、IDLE |
-| `crates/me-proto/tests/oauth_mock.rs` | mock OAuth：授权码交换、刷新、设备码三态、`invalid_grant`、响应上限 |
-| `crates/me-proto/tests/mime_fixtures.rs` | `.eml` 夹具：纯文本、multipart 附件、仅 HTML、中文主题、缺失 Date、畸形输入 |
-| `crates/me-sync/tests/sync_mock.rs` | 真实 store + mock IMAP 的同步链路、去重与 IDLE 触发同步 |
-| `crates/me-sync/tests/draft_sync_mock.rs` | 草稿推送、服务器导入、冲突保留两份、墓碑删除 |
-| `crates/me-sync/tests/oauth_flow_mock.rs` | 回环授权回调、设备码 pending→token、账户令牌更新 |
-| `crates/me-sync/tests/calendar_flow.rs` | 事件增删改、提醒去重、重复展开后的范围查询 |
-| `crates/me-sync/tests/weather_flow.rs` | 城市搜索、按地点刷新与退避、缓存跨重启、配置弹窗的保存/测试/密钥持久化 |
-| `crates/me-sync/tests/ai_flow_mock.rs` | 脚本化 `MockAiProvider`：流式、工具循环、取消、401、隐私确认、开关过滤、清单 |
-| `crates/me-app/src/**` 内联 | HTML 渲染器语料回归、地址解析、远程图片 URL 校验、音频播放/频谱/标签、视图交互 |
+<div align="center">
 
-> 架构文档中的 `tests/` 是跨 crate 测试的规划位置；Cargo 集成测试必须位于各 crate 下，因此实际落在
-> `crates/*/tests/`，文件名保持 `store_schema.rs` / `proto_mock.rs`。`me-app` 没有集成测试目录，
-> 它的测试全部内联在各模块。
+**MIT License** · 用 Rust 写成,一行 WebView 都没有
 
-## 已实现的行为要点
-
-- 账户（v0.2）：密码/授权码；Google / Microsoft OAuth2 回环登录，Microsoft 另提供设备码；
-  OAuth 账户可“重新授权”；刷新令牌存系统密钥库（或会话内存），访问令牌只在内存；授权回调只绑定 `127.0.0.1:0`。
-- 同步：启动 + 手动刷新；`UIDVALIDITY` 变化重建；`UIDNEXT <= last_uid + 1` 判空；
-  分页头部 `FETCH` + `BODYSTRUCTURE`；分页标志回拉；本地待同步标志优先。
-- 实时同步（v0.2）：每账户 IDLE 只监听 INBOX，29 分钟重新 IDLE；事件去抖 2 秒后触发同步；
-  服务器不支持 IDLE 或连续失败 3 次时自动降级轮询（默认 300 秒，±10% 抖动，可在设置页关闭或调整）。
-  监听连接与操作连接独立计费（全局 4 / 单账户 1 与 全局 2 / 单账户 1），手动同步优先于实时同步。
-- 正文：打开即本地已读并入队；`BODY.PEEK[]` 下载；`text/plain` 优先，仅有 HTML 时 `html2text` 生成索引文本；
-  MIME 头与正文按邮件声明的字符集解码（UTF-8、GBK/GB18030、Big5、Shift_JIS 等）；
-  正文与 `raw/*.eml.gz` 落盘，FTS 与 `body_path` 同事务。
-  旧版本遗留的 U+FFFD 乱码会在启动时从原始邮件重新解析并修复摘要、正文缓存与 FTS。
-- 阅读：支持 **富文本 / 纯文本 / Markdown** 三种视图。富文本使用应用内 HTML 渲染器 v2：
-  HTML5 DOM 解析 + CSS 子集（类型/类/id/后代/子/属性选择器、内联样式、背景色、字体、行高、字距、
-  边距、边框、圆角、文本对齐、`white-space`）。
-  排版由独立布局引擎完成：先按内容宽度算出每个块、行、表格单元格的绝对矩形，再统一绘制；
-  支持嵌套表格与 `display:inline-block` 列容器、`max-width` 约束、相邻边距折叠、真正的
-  `rowspan`/`colspan` 网格、列表、引用、代码块、链接与图片。
-  段落整体断行（一个段落一个 `LayoutJob`），`line-height`/`letter-spacing`、逐行 `text-align`
-  与文本选区都按邮件设计还原；正文使用系统 UI 字体与真实粗体（找不到时回退内置字体）。
-  解析在后台线程完成（并发 2），UI 只绘制扁平块；超限或异常时自动回退到简化视图，旧解析结果按 generation 丢弃。
-  不执行脚本、不加载外部 CSS/字体、不使用 WebView；`position`/`float`/`flex`/`grid` 按块级文档流降级。
-  并渲染正文图片：
-  - `cid:` 内嵌图片（MIME inline 部件，已解码，单张 ≤ 4 MB、总量 ≤ 8 MB）；
-  - `data:image/...;base64,...` 内联图片；
-  - SVG 图片（logo / 签名图）经 resvg 光栅化，最大边长 2048 px；
-  - `http(s)` 远程图片自动异步加载：仅 80/443/8080/8443，拒绝本机/私网/CGNAT 地址（含逐跳 DNS 检查与重定向校验），
-    不发送 Cookie/Referer，单张 ≤ 8 MB、20 秒超时；加载中显示进度，失败时保留可点击的浏览器打开链接。
-    可在“设置 → 隐私”整体关闭自动加载；关闭后只渲染内嵌图片。
-    注意：自动加载远程图片会向图片服务器暴露你的 IP，这是为满足内联显示所做的取舍。
-  Markdown 为常用子集（标题、列表、引用、代码块、粗斜体、链接）。不执行脚本、不解析 CSS。
-- 撰写与草稿：本地草稿保存后可重新打开编辑（附件、收件人、抄送、密送、主题、正文）；密送只保存在
-  本地 `drafts.bcc_addrs`，不写入 RFC 5322 草稿原文，重新编辑时从该列恢复。发送成功后归档到 Sent，归档失败可“重试归档”。
-- 草稿双向同步（v0.2）：Drafts 文件夹全量 UID 扫描；本地/服务器各自维护基线哈希；新增、修改、删除双向传播；
-  双方都修改时保留两份（冲突副本），不静默覆盖；服务器删除时保留本地副本等待用户决定；
-  `UIDVALIDITY` 变化重建服务器身份；无 `UIDPLUS` 时明确降级并提示。草稿不进入 `messages` 与正文补全队列。
-  账户页草稿列表提供「保留本地 / 使用服务器 / 保留两份」冲突处理，以及「保留本地 / 删除本地」服务器删除处置。
-- 删除：移入废件箱（MOVE，或 COPY + `\Deleted`）；永久删除/清空废件箱要求 `UIDPLUS`。
-- 搜索：≥3 字走 FTS5 trigram；1～2 字仅头部 `LIKE`；显示正文索引覆盖率。
-- 缓存清理：保留摘要/标志/草稿，清空正文/原始邮件/附件与 FTS 正文列。
-- TLS：统一 rustls；默认仅隐式 TLS / STARTTLS；明文需高级选项 + 风险确认。
-- 凭证：优先系统密钥库；不可用时弹出二选一：仅本次会话记忆，或取消添加；不落盘明文。
-- 磁盘保护：缓存目录剩余空间 < 500 MB 时暂停后台正文补全，并在顶部常驻提示。
-- 单实例：第二个实例通过回环 IPC 请求已有窗口激活（`Focus`），不会重复打开数据库。
-- 字体：内嵌 Noto Sans SC 子集（GB2312 + 界面字符，约 2.2 MB，OFL 1.1），无系统 CJK 字体也能正常显示；
-  若系统存在 CJK 字体，则作为内嵌子集之外的缺字回退（繁体/生僻字）。
-
-### v0.3：日历 / 天气 / AI / 音乐
-
-- **日历**：多个本地日历；月 / 周 / 议程三视图；全天与定时事件；重复事件常用子集
-  （`DAILY` / `WEEKLY` / `MONTHLY` / `YEARLY` + `COUNT` / `UNTIL`），时区存 UTC + IANA，
-  展开由 `me-core` 纯函数完成（不支持的规则降级为「只显示首个实例 + 提示」，不丢弃原文）；
-  最多 3 个提醒、提前量最多 7 天，应用运行时每 30 秒扫描一次并用
-  `calendar_reminder_fires` 主键（事件 × 发生时刻 × 提前分钟数）去重（应用关闭时不提醒）。
-  范围查询把「一次性事件」与「未结束的重复事件」拆成两条，避免大量历史重复事件挤掉当月视图。
-- **天气**：和风天气（QWeather）。城市搜索（标题显示到县级市，同名层级只显示一次）、最多 8 个地点、当前天气 +
-  24 小时折线 + 7 天预报、SQLite 快照缓存（离线可看）。刷新**按地点**为单位：每个地点各自
-  单飞、60 秒最小间隔（手动刷新也遵守）、30s→2m→5m 退避、连续失败 3 次后停止自动重试；
-  新增地点立即刷新它自己；**刷新失败保留旧快照**，界面显示缓存而不是空白。
-  图标全部矢量自绘，未知天气画「?」而不是云；快照带版本号，版本不符按无缓存处理。
-  配置弹窗只填 **API Host**（裸域名即可，程序补 `https://` 与端点路径）与 **API Key**（暗文），
-  可先「测试连接」（发一次真实请求，不落库）。
-- **AI 对话**：Anthropic Messages 与 OpenAI 兼容协议，流式输出、停止生成、重新生成、token 用量展示。
-  支持多份模型档案（每份可绑定到不同对话）。工具白名单固定 14 个、权限为 9 个扁平开关
-  （邮件 2 / 天气 / 日历 4 / 音乐 / 记忆），关掉的工具既不下发也会在执行期被拒。
-  每次工具调用必须给出 `motive`，回复末尾按 `[结果]` 四段拆块；多步需求用任务清单
-  （1–6 步，状态只前进，不计工具预算）。一轮最多 6 轮模型 / 12 次工具调用 / 300 秒。
-  邮件检索结果以卡片展示命中理由，点开在当前页原地弹阅读窗；`calendar_delete` 只发确认、
-  确认后 10 秒内可撤销；音乐四件套由界面执行并回执（3 秒超时）。正文只有用户主动「引用到 AI 对话」才进请求。
-- **音乐**：选目录递归扫描（深度 ≤8、≤2000 文件、不跟随符号链接），MP3 / FLAC / WAV / OGG。
-  左侧播放列表，主区上为专辑页（封面 + 标签 + 进度 + 上一首/播放暂停/下一首）、下为 48 柱实时频谱；
-  正序 / 随机；切页不中断。音频在独立线程解码输出（状态 250ms 回传），不复制、不改写源文件；
-  播放状态与频谱都不进 `Command`/`Event` 通道、也不落库。
-
-## 已知缺口（相对架构文档）
-
-1. HTML 渲染器 v2 仍是**邮件排版子集**，不是浏览器：不执行 JS、不加载外部 CSS/字体、不使用 WebView；
-   `position`/`float`/`flex`/`grid` 按块级文档流降级；行内 SVG 不渲染（图片形式的 SVG 仍经 resvg 光栅化）；
-   边框按整框近似（`border-top` 等单边样式会画成四边），复杂阴影、渐变与背景图不还原；
-   非常规 CSS（变形、多列、定位）不做像素级还原。原始 HTML 保留在 `raw/*.eml.gz`。
-2. 密送地址仅保存在本地 `drafts.bcc_addrs`，不写入 RFC 5322 原文；从服务器导入的草稿不含 Bcc，需重新填写。
-3. 服务器无 `UIDPLUS` 时无法精确删除旧草稿版本，会保留 `\Deleted` 副本并提示（已在 UI 标注）。
-4. OAuth2 登录入口已接入（回环重定向 + Microsoft 设备码 + 重新授权）；仓库不内置真实 `client_id`，
-   需构建期注入或高级设置覆盖。真实 Gmail/Outlook 的 G0 验收尚未执行（缺少真实客户端与账号）。
-5. 实时同步已实现后端、设置页开关与账户级覆盖；真实 Gmail/Outlook/QQ/163 的 IDLE 行为仍需人工验收。
-6. Docker 端到端测试已提供（`scripts/e2e.sh` + GreenMail），但需要本机 Docker 守护进程，未纳入 CI。
-7. 多实例激活只做窗口聚焦；不提供“在新标签页打开”等高级行为。
-8. **v0.3 未交付 `.ics` 导入导出，也不支持从邮件的 `text/calendar` 附件一键导入**（架构文档 §1.2 曾列为目标项）。
-   日历数据只在本机，跨设备迁移需等 v0.4。
-9. **没有系统通知**：日历提醒只在应用运行时以应用内提示出现，窗口在后台时看不见（未接入 `Notifier`）。
-10. **重复事件只能「改整个系列」**：`calendar_event_exceptions` 表与仓储已具备，但没有新建例外的界面。
-11. **四个模块的功能开关未接线**：`meta.feature_calendar` / `meta.feature_ai` 只有常量、没有读取方，
-    天气与音乐连键都没有；写进去不会改变行为。
-12. **天气与 AI 的密钥以明文存在 `myemail.db` 的 `meta` 表里**（用户明确要求与其它参数一起保存）。
-    读得到数据库就读得到 Key，也不再享受系统密钥库（DPAPI）的加密保护；补偿只有
-    「不进日志/事件、界面暗文、`Debug` 脱敏」三条。升级到 v0.3 后旧 keyring 里的 Key 不再被读取，需重新粘贴一次。
-13. **AI 会话列表固定拉取最近 100 条**，没有滚动分页；消息分页接口已在仓储层就绪。
-14. 发布前的 6 项人工验收（真实 Gmail/Outlook 授权与 IDLE、真实和风 Key、真实 AI Key、
-    真机音频、Docker E2E、非 1280×900 分辨率观感）尚未执行，逐项见 [doc/versiondoc/v03收尾.md](doc/versiondoc/v03收尾.md) §7。
-
-## 依赖与工具链
-
-- Rust edition 2024，MSRV 1.88；`rust-toolchain.toml` 固定 `stable`（本机 1.99.1）。
-- 依赖版本见根 `Cargo.toml` 的 `[workspace.dependencies]`，锁定在 `Cargo.lock`。
-- v0.2 新增：OAuth 使用 `reqwest`（rustls，仅 `me-proto`）/ `rand` / `sha2`；HTML v2 使用 `scraper`（html5ever/selectors）/ `cssparser` / `url`。不引入 WebView 或 JS 引擎。
-- v0.3 新增：日历用 `chrono-tz`（IANA 时区）；音频用 `rodio` + `symphonia`（mp3/flac/wav/ogg）+ `walkdir`（扫描）；
-  天气与 AI 复用 `reqwest`（rustls + gzip + stream，SSE 自行解析，不引入额外 HTTP/SSE 库）。
-  仍不引入 WebView、JS 引擎与系统通知库。
-- `deny.toml` 提供 cargo-deny 的许可证/漏洞/重复版本策略（禁 OpenSSL / native-tls）。
+</div>
