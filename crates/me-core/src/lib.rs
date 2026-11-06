@@ -74,8 +74,11 @@ pub use port::{
 };
 
 /// 当前 schema 版本。v3 的表结构冻结（`doc/v03架构设计.md` §8.3），
-/// v4 / v5 都是**纯加列**（`ai_conversations.model_id`、`ai_messages.plan`）。
-pub const SCHEMA_VERSION: u32 = 5;
+/// v4 / v5 都是**纯加列**（`ai_conversations.model_id`、`ai_messages.plan`），
+/// v6 是**纯索引调整**（不改列类型/CHECK/NOT NULL，也不改任何表结构）：
+/// 补齐 `ORDER BY` 与索引的列序，让邮件列表、未读计数、正文补全队列、
+/// 草稿列表、AI 会话/实体列表都不再退化成临时 B 树排序或全表扫描。
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// 应用显示名。
 pub const APP_NAME: &str = "MyEmail";

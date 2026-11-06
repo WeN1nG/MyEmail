@@ -73,9 +73,15 @@ CREATE TABLE messages (
     body_path      TEXT,                -- NULL = 正文未缓存；非 NULL = 已写入 FTS
     UNIQUE(folder_id, uid)
 );
-CREATE INDEX idx_messages_folder_date ON messages(folder_id, date DESC);
+-- 索引列序必须与查询的 ORDER BY 前缀严格对齐，否则 SQLite 退化成
+-- 「USE TEMP B-TREE FOR ORDER BY」甚至整表扫描（见 doc/数据结构.md §6）。
+-- v6 起：folder_date 带 id DESC；body_pending 带 date DESC + id DESC；
+-- 另加未读计数的表达式索引（`flags & 1` 是 \Seen 位）。
+CREATE INDEX idx_messages_folder_date ON messages(folder_id, date DESC, id DESC);
 CREATE INDEX idx_messages_account ON messages(account_id);
-CREATE INDEX idx_messages_body_pending ON messages(account_id, folder_id, uid) WHERE body_path IS NULL;
+CREATE INDEX idx_messages_body_pending ON messages(account_id, folder_id, date DESC, id DESC) WHERE body_path IS NULL;
+CREATE INDEX idx_messages_unread ON messages(folder_id, (flags & 1));
+CREATE INDEX idx_messages_indexed ON messages(account_id) WHERE body_path IS NOT NULL;
 CREATE INDEX idx_messages_message_id ON messages(folder_id, message_id);
 
 CREATE TABLE attachments (
@@ -117,6 +123,9 @@ CREATE UNIQUE INDEX idx_drafts_server_identity
     ON drafts(account_id, COALESCE(server_uid_validity, 0), server_uid)
     WHERE server_uid IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX idx_drafts_message_id ON drafts(account_id, message_id);
+-- 草稿列表按 `updated_at DESC, id DESC` 排序（crates/me-store/src/drafts.rs），
+-- 这条索引让排序走覆盖扫描，不必再排临时 B 树。
+CREATE INDEX idx_drafts_updated ON drafts(account_id, updated_at DESC, id DESC);
 
 CREATE VIRTUAL TABLE messages_fts USING fts5(
     subject, body, from_addr, to_addrs,
@@ -273,8 +282,7 @@ CREATE TABLE ai_conversations (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
-CREATE INDEX ix_ai_conversations_updated
-    ON ai_conversations(updated_at DESC);
+CREATE INDEX ix_ai_conversations_updated ON ai_conversations(updated_at DESC, id DESC);
 
 CREATE TABLE ai_messages (
     id              INTEGER PRIMARY KEY,
@@ -317,8 +325,7 @@ CREATE UNIQUE INDEX ux_ai_entities_name
     ON ai_entities(kind, normalized_name);
 CREATE UNIQUE INDEX ux_ai_entities_email
     ON ai_entities(lower(email)) WHERE email IS NOT NULL;
-CREATE INDEX ix_ai_entities_last_seen
-    ON ai_entities(last_seen_at DESC);
+CREATE INDEX ix_ai_entities_last_seen ON ai_entities(last_seen_at DESC, id DESC);
 
 CREATE TABLE ai_entity_aliases (
     entity_id       INTEGER NOT NULL REFERENCES ai_entities(id) ON DELETE CASCADE,
@@ -445,10 +452,11 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v2_to_v3(&mut conn)?;
             migrate_v3_to_v4(&mut conn)?;
             migrate_v4_to_v5(&mut conn)?;
+            migrate_v5_to_v6(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 backup = %backup.display(),
-                "database migrated v1 -> v5"
+                "database migrated v1 -> v6"
             );
             Ok(conn)
         }
@@ -457,9 +465,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v2_to_v3(&mut conn)?;
             migrate_v3_to_v4(&mut conn)?;
             migrate_v4_to_v5(&mut conn)?;
+            migrate_v5_to_v6(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v2 -> v5"
+                "database migrated v2 -> v6"
             );
             Ok(conn)
         }
@@ -467,18 +476,29 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             let started = std::time::Instant::now();
             migrate_v3_to_v4(&mut conn)?;
             migrate_v4_to_v5(&mut conn)?;
+            migrate_v5_to_v6(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v3 -> v5"
+                "database migrated v3 -> v6"
             );
             Ok(conn)
         }
         Some(4) => {
             let started = std::time::Instant::now();
             migrate_v4_to_v5(&mut conn)?;
+            migrate_v5_to_v6(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v4 -> v5"
+                "database migrated v4 -> v6"
+            );
+            Ok(conn)
+        }
+        Some(5) => {
+            let started = std::time::Instant::now();
+            migrate_v5_to_v6(&mut conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "database migrated v5 -> v6"
             );
             Ok(conn)
         }
@@ -663,6 +683,89 @@ fn migrate_v4_to_v5(conn: &mut Connection) -> Result<(), CoreError> {
     check_foreign_keys(&tx)?;
     tx.commit()
         .map_err(|e| storage(format!("提交 v4→v5 迁移失败: {e}")))?;
+    Ok(())
+}
+
+/// v5 → v6：**纯索引调整**，不改任何列类型 / CHECK / NOT NULL，也不动表结构。
+///
+/// 要解决的是同一类问题的四个实例：`ORDER BY <时间列> DESC, id DESC` 的查询，
+/// 而索引只覆盖到 `<时间列>`（或用了别的列组合），于是 SQLite 退化成
+/// `USE TEMP B-TREE FOR ORDER BY` 的临时排序，甚至**整表扫描**。
+///
+/// 关键约束：**索引的列序必须与 `ORDER BY` 的前缀严格对齐**，不只是「补一个 id」。
+/// 反例（实测）：`(account_id, date DESC, folder_id, id DESC)` 仍然是全账户扫描 + 排序，
+/// 而 `(account_id, folder_id, date DESC, id DESC)` 才能完全消除排序 —— 因为
+/// `ORDER BY` 的首列是 `folder_id`。
+///
+/// 逐条对应（证据见 `doc/数据结构.md` §6）：
+/// - `idx_messages_folder_date`：`(folder_id, date DESC)` → 补 `id DESC`。
+///   邮件列表（§6.1）按 `date DESC, id DESC` 排，之前每次分页都要排临时 B 树。
+/// - `idx_messages_body_pending`：`(account_id, folder_id, uid)` → 改
+///   `(account_id, folder_id, date DESC, id DESC)`。正文补全队列（§6.3）在 v04
+///   改成「文件夹内按时间倒序」后，末尾是 `uid` 的旧索引**整个被弃用**，
+///   SQLite 转而扫账户全部邮件 —— 代价随账户总邮件数增长，与待补全数量无关。
+/// - 新增 `idx_messages_unread`：未读计数（§6.2）用 `(flags & 1) = 0`，
+///   这个表达式没有索引可用，之前每次刷新文件夹都要逐行求值。
+/// - 新增 `idx_drafts_updated` + 两条 AI 索引补 `id DESC`：草稿列表与
+///   AI 会话/实体列表同属这一类。
+///
+/// 幂等：新建库走 `create_schema`，它的 DDL 已经带上了这些索引，
+/// 重复 `CREATE INDEX` 会报「index already exists」。所以这里一律
+/// **先 DROP 再 CREATE** —— SQLite 没有 `ALTER INDEX`，改列序只能重建；
+/// 而 DROP + CREATE 对已存在的同名索引是幂等的，且列序必然与 DDL 一致。
+fn migrate_v5_to_v6(conn: &mut Connection) -> Result<(), CoreError> {
+    const TARGET: u32 = 6;
+    let tx = conn
+        .transaction()
+        .map_err(|e| storage(format!("开始 v5→v6 迁移事务失败: {e}")))?;
+
+    // 重建：改列序的四个索引 + 新增的两个（DROP 后 CREATE，幂等且列序必然与 DDL 一致）。
+    // `IF EXISTS` 是为了新建库（DDL 已建好同名索引）也能安全重跑一遍 ——
+    // 迁移测试里就有「把新库回退成 v2 再升级」这种路径。
+    for drop_sql in [
+        "DROP INDEX IF EXISTS idx_messages_folder_date;",
+        "DROP INDEX IF EXISTS idx_messages_body_pending;",
+        "DROP INDEX IF EXISTS idx_messages_unread;",
+        "DROP INDEX IF EXISTS idx_messages_indexed;",
+        "DROP INDEX IF EXISTS idx_drafts_updated;",
+        "DROP INDEX IF EXISTS ix_ai_conversations_updated;",
+        "DROP INDEX IF EXISTS ix_ai_entities_last_seen;",
+    ] {
+        tx.execute_batch(drop_sql)
+            .map_err(|e| storage(format!("执行 v5→v6 索引清理失败: {e}")))?;
+    }
+
+    for create_sql in [
+        // 邮件列表（§6.1）：覆盖 `ORDER BY date DESC, id DESC`。
+        "CREATE INDEX idx_messages_folder_date ON messages(folder_id, date DESC, id DESC);",
+        // 正文补全队列（§6.3）：列序必须以 `folder_id` 打头才能同时满足
+        // 「文件夹分组」与「组内时间倒序」，并让排序走索引而非临时 B 树。
+        "CREATE INDEX idx_messages_body_pending \
+         ON messages(account_id, folder_id, date DESC, id DESC) WHERE body_path IS NULL;",
+        // 未读计数（§6.2）：`flags & 1` 是 \Seen 位，表达式索引。
+        "CREATE INDEX idx_messages_unread ON messages(folder_id, (flags & 1));",
+        // 正文索引覆盖率（§6.5）：`body_path IS NOT NULL` 的部分索引。
+        // 搜索结果页要显示「正文索引覆盖 N/M 封」，没有这条索引就得整表扫描。
+        "CREATE INDEX idx_messages_indexed ON messages(account_id) WHERE body_path IS NOT NULL;",
+        // 草稿列表：覆盖 `ORDER BY updated_at DESC, id DESC`。
+        "CREATE INDEX idx_drafts_updated ON drafts(account_id, updated_at DESC, id DESC);",
+        // AI 会话 / 实体列表：覆盖 `ORDER BY <时间列> DESC, id DESC`。
+        "CREATE INDEX ix_ai_conversations_updated ON ai_conversations(updated_at DESC, id DESC);",
+        "CREATE INDEX ix_ai_entities_last_seen ON ai_entities(last_seen_at DESC, id DESC);",
+    ] {
+        tx.execute_batch(create_sql)
+            .map_err(|e| storage(format!("执行 v5→v6 索引重建失败: {e}")))?;
+    }
+
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        params![TARGET.to_string()],
+    )
+    .map_err(|e| storage(format!("写入 schema_version 失败: {e}")))?;
+
+    check_foreign_keys(&tx)?;
+    tx.commit()
+        .map_err(|e| storage(format!("提交 v5→v6 迁移失败: {e}")))?;
     Ok(())
 }
 
