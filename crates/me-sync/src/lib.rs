@@ -21,13 +21,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use me_core::model::{check_attachment_limits, generate_message_id};
+use me_core::model::{check_attachment_limits, generate_message_id, now_unix};
 use me_core::port::{BrowserOpener, ImapSession, SmtpSender, StorePort};
 use me_core::{
     APP_NAME, Account, AccountId, AuthCredential, Command, ConnectionState, CoreError,
     DEFAULT_POLL_SECS, DraftContent, DraftId, DraftStatus, ErrorScope, Event, FlagOp, Flags,
     FolderRole, HtmlRendererMode, MAX_POLL_SECS, MIN_POLL_SECS, MessageId, MusicOrder,
-    OAuthClientConfig, OAuthProvider, OutgoingMessage, SearchQuery, SendFailureKind, ThemeMode,
+    OAuthClientConfig, OAuthProvider, OutgoingMessage, SavedSearch, SavedSearchId,
+    SavedSearchQuery, SearchQuery, SendFailureKind, ThemeMode,
 };
 use me_store::cache::{self, CachePaths};
 use tokio::sync::mpsc;
@@ -750,6 +751,18 @@ where
             Command::Search(query) => {
                 let service = self.clone();
                 tokio::spawn(async move { service.handle_search(query).await });
+            }
+            Command::SaveSearch { name, query } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_save_search(name, query).await });
+            }
+            Command::DeleteSearch { id } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_delete_search(id).await });
+            }
+            Command::RunSavedSearch { id } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_run_saved_search(id).await });
             }
             Command::SetTheme(mode) => {
                 let service = self.clone();
@@ -2129,6 +2142,103 @@ where
                 self.emit(Event::Error {
                     scope: ErrorScope::Global,
                     message: format!("搜索失败：{}", err.user_message()),
+                })
+                .await;
+            }
+        }
+    }
+
+    /// 保存一条命名搜索。
+    async fn handle_save_search(&self, name: String, query: SavedSearchQuery) {
+        let trimmed = name.trim().to_string();
+        if trimmed.is_empty() {
+            self.emit(Event::Error {
+                scope: ErrorScope::Global,
+                message: "保存的搜索需要一个名称".to_string(),
+            })
+            .await;
+            return;
+        }
+        let result = self
+            .db(move |s| {
+                s.insert_saved_search(&SavedSearch {
+                    id: SavedSearchId(0),
+                    name: trimmed,
+                    query,
+                    created_at: now_unix(),
+                    last_used_at: now_unix(),
+                })
+            })
+            .await;
+        match result {
+            Ok(_) => self.emit_saved_searches().await,
+            Err(err) => {
+                // 名称重复在**仓储层**已翻译成可读的 `Validation` 错误
+                // （`CoreError::Storage` 的 `user_message()` 是通用文案，
+                // 拿不到「名字重复」这个信息）。
+                self.emit(Event::Error {
+                    scope: ErrorScope::Global,
+                    message: err.user_message(),
+                })
+                .await;
+            }
+        }
+    }
+
+    /// 删除一条保存的搜索。
+    async fn handle_delete_search(&self, id: SavedSearchId) {
+        let result = self.db(move |s| s.delete_saved_search(id)).await;
+        if let Err(err) = result {
+            self.emit(Event::Error {
+                scope: ErrorScope::Global,
+                message: format!("删除失败：{}", err.user_message()),
+            })
+            .await;
+            return;
+        }
+        self.emit_saved_searches().await;
+    }
+
+    /// 执行一条保存的搜索。
+    ///
+    /// **反序列化在 UI 侧做**（`SavedSearchQuery` → `SearchQuery` 是领域层的活），
+    /// 这里只负责：读出 → touch（更新 `last_used_at`）→ 转成查询 → 搜索。
+    async fn handle_run_saved_search(&self, id: SavedSearchId) {
+        let found = self.db(move |s| s.get_saved_search(id)).await;
+        let search = match found {
+            Ok(Some(search)) => search,
+            Ok(None) => {
+                self.emit(Event::Error {
+                    scope: ErrorScope::Global,
+                    message: "这条保存的搜索已经不存在了".to_string(),
+                })
+                .await;
+                return;
+            }
+            Err(err) => {
+                self.emit(Event::Error {
+                    scope: ErrorScope::Global,
+                    message: format!("读取失败：{}", err.user_message()),
+                })
+                .await;
+                return;
+            }
+        };
+        // touch 后要重新下发列表——排序变了（最近使用的排前面）。
+        let _ = self.db(move |s| s.touch_saved_search(id)).await;
+        self.emit_saved_searches().await;
+        self.handle_search(search.query.to_query()).await;
+    }
+
+    /// 下发保存的搜索列表（全量快照）。
+    async fn emit_saved_searches(&self) {
+        let result = self.db(|s| s.list_saved_searches()).await;
+        match result {
+            Ok(searches) => self.emit(Event::SavedSearchesChanged { searches }).await,
+            Err(err) => {
+                self.emit(Event::Error {
+                    scope: ErrorScope::Global,
+                    message: format!("读取保存的搜索失败：{}", err.user_message()),
                 })
                 .await;
             }

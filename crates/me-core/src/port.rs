@@ -22,9 +22,10 @@ use crate::calendar::{
 use crate::command::AccountDraft;
 use crate::error::CoreError;
 use crate::model::{
-    Account, AccountId, Address, Attachment, AuthCredential, Draft, DraftContent, DraftId,
-    DraftStatus, DraftSyncState, Flags, Folder, FolderId, FolderRole, MessageId, MessageSummary,
-    NewMessage, OutgoingMessage, SearchQuery,
+    Account, AccountId, Address, Attachment, AuthCredential, Contact, ContactId, Draft,
+    DraftContent, DraftId, DraftStatus, DraftSyncState, Flags, Folder, FolderId, FolderRole,
+    MessageId, MessageSummary, NewMessage, OutgoingMessage, SavedSearch, SavedSearchId,
+    SearchQuery,
 };
 use crate::weather::{WeatherLocation, WeatherLocationId, WeatherSnapshot};
 
@@ -651,6 +652,38 @@ pub trait SearchRepo {
     fn rebuild_index(&self) -> Result<u32, CoreError>;
 }
 
+/// 保存的搜索的仓储（`saved_searches` 表）。
+///
+/// **只存条件、不做自动动作**（D42）——自动规则推迟到用户真的用了一阵子之后再说。
+pub trait SavedSearchRepo {
+    /// 按 `last_used_at` 倒序列出全部保存的搜索。
+    fn list_saved_searches(&self) -> Result<Vec<SavedSearch>, CoreError>;
+    /// 读出一条保存的搜索（执行时用）。
+    fn get_saved_search(&self, id: SavedSearchId) -> Result<Option<SavedSearch>, CoreError>;
+    /// 新增一条。名称重复时返回 `CoreError::Storage`。
+    fn insert_saved_search(&self, search: &SavedSearch) -> Result<SavedSearchId, CoreError>;
+    /// 删除一条。不存在时**不报错**（幂等）。
+    fn delete_saved_search(&self, id: SavedSearchId) -> Result<(), CoreError>;
+    /// 更新 `last_used_at`（点击执行时调用）。
+    fn touch_saved_search(&self, id: SavedSearchId) -> Result<(), CoreError>;
+}
+
+/// 联系人的仓储（`contacts` 表）。
+///
+/// 联系人是**本地派生数据**：由正文补全落库 / 发信归档时累积。
+/// 永不出网、不参与 AI 请求；`ClearCache` **不清理**它（与 D30 一致）。
+pub trait ContactRepo {
+    /// 批量 UPSERT。`addr` 小写归一化后去重——邮箱大小写不敏感，
+    /// 但显示时保留原样。已存在的只更新 `last_seen` 与 `seen_count`。
+    fn upsert_contacts(&self, contacts: &[Contact]) -> Result<(), CoreError>;
+    /// 按前缀列出联系人（补全下拉用）。
+    ///
+    /// 排序：`last_seen` 最近 > `seen_count` 高 > 姓名包含匹配 > 邮箱前缀匹配。
+    fn list_contacts(&self, prefix: &str, limit: u32) -> Result<Vec<Contact>, CoreError>;
+    /// 删除单个联系人（用户手动删除）。
+    fn remove_contact(&self, id: ContactId) -> Result<(), CoreError>;
+}
+
 pub trait MetaRepo {
     fn schema_version(&self) -> Result<u32, CoreError>;
     fn set_setting(&self, key: &str, value: &str) -> Result<(), CoreError>;
@@ -827,6 +860,8 @@ pub trait StorePort:
     + DraftRepo
     + PendingRepo
     + SearchRepo
+    + SavedSearchRepo
+    + ContactRepo
     + CalendarRepo
     + WeatherRepo
     + crate::ai::AiRepo
@@ -847,6 +882,8 @@ impl<T> StorePort for T where
         + DraftRepo
         + PendingRepo
         + SearchRepo
+        + SavedSearchRepo
+        + ContactRepo
         + CalendarRepo
         + WeatherRepo
         + crate::ai::AiRepo

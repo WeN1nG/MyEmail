@@ -15,12 +15,14 @@ mod ai;
 mod attachments;
 pub mod cache;
 mod calendars;
+mod contacts;
 mod db;
 mod drafts;
 mod folders;
 mod messages;
 mod migrations;
 mod pending;
+mod saved_searches;
 mod search;
 mod weather;
 

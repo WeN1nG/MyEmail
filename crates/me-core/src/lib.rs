@@ -58,13 +58,14 @@ pub use command::{
 };
 pub use error::{AiErrorKind, BoxError, CoreError, LimitKind};
 pub use model::{
-    Account, AccountId, Address, Attachment, AuthCredential, AuthMethod, DateSource, Draft,
-    DraftContent, DraftId, DraftStatus, DraftSyncState, Endpoint, FlagOp, Flags, Folder, FolderId,
-    FolderRole, InlineImage, LogSafeMessageSummary, MAX_ATTACHMENT_BYTES,
-    MAX_ATTACHMENT_TOTAL_BYTES, MAX_PAGE_SIZE, MAX_PARSE_BYTES, MessageBody, MessageId,
-    MessageSummary, NewMessage, OAuthClientConfig, OAuthProvider, OutgoingMessage, SearchQuery,
-    TlsMode, check_attachment_limits, effective_date, format_local_datetime, generate_message_id,
-    make_snippet, mask_email, normalize_message_id, now_unix, sort_newest_first,
+    Account, AccountId, Address, Attachment, AuthCredential, AuthMethod, Contact, ContactId,
+    DateSource, Draft, DraftContent, DraftId, DraftStatus, DraftSyncState, Endpoint, FlagOp, Flags,
+    Folder, FolderId, FolderRole, InlineImage, LogSafeMessageSummary, MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_TOTAL_BYTES, MAX_PAGE_SIZE, MAX_PARSE_BYTES, MAX_SAVED_SEARCH_NAME, MessageBody,
+    MessageId, MessageSummary, NewMessage, OAuthClientConfig, OAuthProvider, OutgoingMessage,
+    SavedSearch, SavedSearchId, SavedSearchQuery, SearchQuery, TlsMode, check_attachment_limits,
+    effective_date, format_local_datetime, generate_message_id, make_snippet, mask_email,
+    normalize_message_id, now_unix, sort_newest_first,
 };
 pub use port::{
     AccountRepo, AttachmentRepo, BodyCoverage, BodyJob, BrowserOpener, CalendarRepo,

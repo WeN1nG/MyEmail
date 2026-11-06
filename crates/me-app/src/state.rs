@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use me_core::{
     Account, AccountId, Address, AuthMethod, ConnectionState, Draft, DraftId, FlagOp, Flags,
     Folder, FolderId, HtmlRendererMode, MessageBody, MessageId, MessageSummary, ParsedQuery,
-    ThemeMode, TlsMode, parse_search_syntax,
+    SavedSearch, ThemeMode, TlsMode, parse_search_syntax,
 };
 
 // ---------------------------------------------------------------------------
@@ -512,6 +512,12 @@ pub struct SearchState {
     pub parsed: ParsedQuery,
     /// 已解析条件的展示列表（chips），每项可单独删除。
     pub conditions: Vec<ConditionChip>,
+    /// 保存的搜索列表（`Event::SavedSearchesChanged` 的快照）。
+    pub saved_searches: Vec<SavedSearch>,
+    /// 「保存此搜索」弹窗的输入框内容（空 = 未打开）。
+    pub save_search_name: String,
+    /// 「保存此搜索」弹窗是否打开。
+    pub show_save_search: bool,
 }
 
 /// 条件标签的种类。
@@ -603,6 +609,8 @@ impl SearchState {
         self.unread_only = false;
         self.parsed = ParsedQuery::default();
         self.conditions.clear();
+        self.save_search_name.clear();
+        self.show_save_search = false;
     }
 
     pub fn coverage_label(&self) -> String {

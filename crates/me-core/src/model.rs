@@ -1044,6 +1044,139 @@ impl SearchQuery {
 }
 
 // ---------------------------------------------------------------------------
+// 保存的搜索
+// ---------------------------------------------------------------------------
+
+/// 保存的搜索的 id，对应 `saved_searches.id`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SavedSearchId(pub i64);
+
+/// `SearchQuery` 的**持久化子集**——只存条件，不存分页态。
+///
+/// **不能直接 `serde_json::to_string(&SearchQuery)`**：`SearchQuery` 带
+/// `cursor`（键集分页游标）与 `limit`（分页大小），那是**一次查询的状态**，
+/// 不是**条件**。存进去会让「保存的搜索」在下次执行时带着上次的翻页位置，
+/// 点开只能看到第二页。
+///
+/// `accounts` / `folders` 是范围条件，**要存**——「只在收件箱搜」是有意义的条件。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SavedSearchQuery {
+    /// 自由文本（全文检索）。
+    #[serde(default)]
+    pub text: String,
+    /// 账户范围。空 = 全部。
+    #[serde(default)]
+    pub accounts: Vec<AccountId>,
+    /// 文件夹范围。空 = 全部。
+    #[serde(default)]
+    pub folders: Vec<FolderId>,
+    #[serde(default)]
+    pub since: Option<i64>,
+    #[serde(default)]
+    pub until: Option<i64>,
+    #[serde(default)]
+    pub has_attachment: Option<bool>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub unread_only: bool,
+}
+
+impl SavedSearchQuery {
+    /// 从一次实际查询**提取条件**（丢弃分页态）。
+    pub fn from_query(query: &SearchQuery) -> Self {
+        Self {
+            text: query.text.clone(),
+            accounts: query.accounts.clone(),
+            folders: query.folders.clone(),
+            since: query.since,
+            until: query.until,
+            has_attachment: query.has_attachment,
+            from: query.from.clone(),
+            to: query.to.clone(),
+            subject: query.subject.clone(),
+            unread_only: query.unread_only,
+        }
+    }
+
+    /// 还原成可执行的查询（分页从头开始）。
+    pub fn to_query(&self) -> SearchQuery {
+        SearchQuery {
+            text: self.text.clone(),
+            accounts: self.accounts.clone(),
+            folders: self.folders.clone(),
+            since: self.since,
+            until: self.until,
+            has_attachment: self.has_attachment,
+            from: self.from.clone(),
+            to: self.to.clone(),
+            subject: self.subject.clone(),
+            unread_only: self.unread_only,
+            limit: crate::MAX_PAGE_SIZE,
+            cursor: None,
+        }
+    }
+}
+
+/// 一条保存的搜索。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSearch {
+    pub id: SavedSearchId,
+    /// 用户给的名称。**唯一**（`ux_saved_searches_name`）。
+    pub name: String,
+    /// 条件本身。
+    pub query: SavedSearchQuery,
+    /// 创建时间，unix 秒。
+    pub created_at: i64,
+    /// 最近一次执行时间，unix 秒。
+    pub last_used_at: i64,
+}
+
+/// 保存的搜索的名称长度上限。
+pub const MAX_SAVED_SEARCH_NAME: usize = 60;
+
+// ---------------------------------------------------------------------------
+// 联系人
+// ---------------------------------------------------------------------------
+
+/// 联系人的 id，对应 `contacts.id`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ContactId(pub i64);
+
+/// 一个联系人。
+///
+/// **本地派生数据**：由正文补全落库 / 发信归档时累积，
+/// 永不出网、不参与 AI 请求（见 [v04开发指南](doc/versiondoc/v4开发指南.md) §5.3）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Contact {
+    pub id: ContactId,
+    /// 原始地址（保留大小写，用于显示）。
+    pub addr: String,
+    /// 归一化后的小写地址（唯一性判据）。
+    pub normalized: String,
+    /// 显示名（从邮件头里取的 `Name <addr>` 的 Name 部分）。
+    pub display_name: Option<String>,
+    /// 最近一次出现的时间，unix 秒。
+    pub last_seen: i64,
+    /// 累计出现次数。
+    pub seen_count: u32,
+}
+
+impl Contact {
+    /// 归一化邮箱地址：去空白 + 转小写。
+    ///
+    /// 邮箱的**本地部分**理论上大小写敏感，但实践中没有这么用的；
+    /// 统一小写才能让 `Alice@` 与 `alice@` 落到同一行。
+    pub fn normalize(addr: &str) -> String {
+        addr.trim().to_lowercase()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 纯规则
 // ---------------------------------------------------------------------------
 

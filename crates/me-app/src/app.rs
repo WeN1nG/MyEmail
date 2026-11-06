@@ -1176,6 +1176,10 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                     format!("附件已下载：{}", local_path.display()),
                 );
             }
+            Event::SavedSearchesChanged { searches } => {
+                // **全量快照**，不是增量——条数很少，直接替换。
+                self.state.search.saved_searches = searches;
+            }
             Event::SearchResults {
                 query_id,
                 messages,
@@ -1837,6 +1841,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
         }
         views::accounts::show_editor(&mut self.state, &mut commands, ctx);
         views::compose::show_window(&mut self.state, &mut commands, ctx);
+        views::mailbox::show_save_search_dialog(&mut self.state, &mut commands, ctx);
         if self.state.page == Page::Calendar {
             views::calendar::show_editor(&mut self.state, &mut commands, ctx);
         }

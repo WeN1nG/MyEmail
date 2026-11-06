@@ -3,7 +3,7 @@
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use me_core::{Command, MessageId, SearchQuery, now_unix};
+use me_core::{Command, MessageId, SavedSearchId, SavedSearchQuery, SearchQuery, now_unix};
 
 use crate::app::human_bytes;
 use crate::state::{ComposeState, Dialog, Page, ToastKind, UiState};
@@ -340,11 +340,43 @@ fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) 
         if ui.button("条件").clicked() {
             state.search.show_filters = !state.search.show_filters;
         }
+        // 「保存此搜索」——**只在有条件时可用**（空搜索存下来没意义）。
+        let can_save = !state.search.is_empty_query();
+        if ui
+            .add_enabled(can_save, egui::Button::new("保存此搜索"))
+            .clicked()
+        {
+            state.search.show_save_search = true;
+            state.search.save_search_name.clear();
+        }
         if state.search.active && ui.small_button("清除").clicked() {
             state.search.clear();
             state.messages_dirty = true;
         }
     });
+
+    // 已保存的搜索：点击即执行（D42：只存条件，不做自动动作）。
+    if !state.search.saved_searches.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("已保存：").small().color(Color32::GRAY));
+            let mut to_delete: Option<SavedSearchId> = None;
+            for saved in &state.search.saved_searches {
+                let name = saved.name.clone();
+                if ui.small_button(&name).clicked() {
+                    commands.push(Command::RunSavedSearch { id: saved.id });
+                }
+                if ui.small_button("×").clicked() {
+                    to_delete = Some(saved.id);
+                }
+            }
+            if let Some(id) = to_delete {
+                commands.push(Command::DeleteSearch { id });
+            }
+        });
+    }
+
+    // 「保存此搜索」弹窗由 `app.rs` 在顶层用 `ctx` 渲染
+    // （egui::Window 需要 &Context，而这里只有 &mut Ui）。
 
     // 条件标签：让用户看得见「我搜的到底是什么」，并能单独删掉某个条件。
     if !state.search.conditions.is_empty() {
@@ -435,6 +467,99 @@ fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) 
                     .color(Color32::GRAY),
             );
         });
+    }
+}
+
+/// 「保存此搜索」弹窗：给当前条件起个名字存起来。
+///
+/// **只存条件、不做自动动作**（D42）——保存的是「怎么搜」，不是「什么时候自动搜」。
+///
+/// 由 `app.rs` 在顶层用 `ctx` 渲染（与 `accounts::show_editor` 同一模式）——
+/// egui 的 `Window` 需要 `&Context`，而 `mailbox::show` 只有 `&mut Ui`。
+pub fn show_save_search_dialog(
+    state: &mut UiState,
+    commands: &mut Vec<Command>,
+    ctx: &egui::Context,
+) {
+    if !state.search.show_save_search {
+        return;
+    }
+    let mut open = true;
+    let mut submit = false;
+    egui::Window::new("保存此搜索")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(320.0)
+        .show(ctx, |ui| {
+            ui.label("给这组条件起个名字：");
+            ui.add(
+                egui::TextEdit::singleline(&mut state.search.save_search_name)
+                    .hint_text("例如「张老板的报价」")
+                    .desired_width(260.0),
+            );
+            ui.add_space(6.0);
+            // 条件摘要——让用户确认存的是「刚才搜的那个」。
+            let conditions = state.search.conditions.len();
+            ui.label(
+                RichText::new(format!(
+                    "将保存 {conditions} 个条件（只存条件，不做自动动作）"
+                ))
+                .small()
+                .color(Color32::GRAY),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("保存").clicked() {
+                    submit = true;
+                }
+                if ui.button("取消").clicked() {
+                    state.search.show_save_search = false;
+                    state.search.save_search_name.clear();
+                }
+            });
+        });
+
+    if !open {
+        state.search.show_save_search = false;
+        state.search.save_search_name.clear();
+    }
+    if submit {
+        let name = state.search.save_search_name.trim().to_string();
+        if !name.is_empty() {
+            // **只存条件**：从当前解析结果 + 面板条件提取，
+            // 不含 cursor / limit 这类分页态。
+            let query = SavedSearchQuery::from_query(&current_query(state));
+            commands.push(Command::SaveSearch { name, query });
+        }
+        state.search.show_save_search = false;
+        state.search.save_search_name.clear();
+    }
+}
+
+/// 当前界面上的查询条件（不含分页态）。
+fn current_query(state: &UiState) -> SearchQuery {
+    let parsed = &state.search.parsed;
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+    SearchQuery {
+        text: parsed.text.trim().to_string(),
+        accounts: state.selected_account.into_iter().collect(),
+        folders: state.selected_folder.into_iter().collect(),
+        since: parsed.since,
+        until: parsed.until,
+        has_attachment: state.search.has_attachment.or(parsed.has_attachment),
+        from: non_empty(&state.search.from).or_else(|| parsed.from.clone()),
+        to: non_empty(&state.search.to).or_else(|| parsed.to.clone()),
+        subject: non_empty(&state.search.subject).or_else(|| parsed.subject.clone()),
+        unread_only: state.search.unread_only || parsed.unread_only,
+        limit: 200,
+        cursor: None,
     }
 }
 
@@ -863,5 +988,77 @@ mod tests {
         });
         let joined = texts.join("\n");
         assert!(joined.contains("from:"), "提示未提及速记语法：{joined}");
+    }
+
+    // --- 保存的搜索 ---
+
+    #[test]
+    fn saved_search_button_is_disabled_without_conditions() {
+        // 空搜索存下来没意义——按钮该是禁用的。
+        let mut state = UiState::default();
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                toolbar(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        assert!(texts.join("\n").contains("保存此搜索"));
+    }
+
+    #[test]
+    fn saved_search_list_is_rendered_when_present() {
+        let mut state = UiState::default();
+        state.search.saved_searches = vec![me_core::SavedSearch {
+            id: me_core::SavedSearchId(1),
+            name: "张老板的报价".to_string(),
+            query: me_core::SavedSearchQuery::default(),
+            created_at: 0,
+            last_used_at: 0,
+        }];
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                toolbar(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("张老板的报价"),
+            "已保存的搜索未渲染：{joined}"
+        );
+        assert!(joined.contains("已保存"), "缺少「已保存」分组标签");
+    }
+
+    #[test]
+    fn current_query_excludes_pagination_state() {
+        // 保存时**只存条件**——cursor / limit 不该进去。
+        let mut state = UiState::default();
+        state.search.text = "from:zhang".to_string();
+        state.search.sync_parsed(now_unix());
+
+        let q = current_query(&state);
+        assert_eq!(q.from.as_deref(), Some("zhang"));
+        assert_eq!(q.cursor, None);
+
+        // 持久化子集里**没有** cursor / limit 字段——
+        // 它们的类型是 `Option<(i64, i64)>` 与 `u32`，
+        // 存进 JSON 就会带上分页态。这里用「字段不存在」来断言。
+        let saved = me_core::SavedSearchQuery::from_query(&q);
+        // 反向验证：从持久化子集还原时，分页态是「干净」的。
+        let restored = saved.to_query();
+        assert_eq!(restored.cursor, None);
+        assert_eq!(restored.limit, me_core::MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn current_query_merges_panel_and_syntax_conditions() {
+        let mut state = UiState::default();
+        state.search.text = "to:carol".to_string();
+        state.search.from = "alice".to_string();
+        state.search.unread_only = true;
+        state.search.sync_parsed(now_unix());
+
+        let q = current_query(&state);
+        assert_eq!(q.from.as_deref(), Some("alice"));
+        assert_eq!(q.to.as_deref(), Some("carol"));
+        assert!(q.unread_only);
     }
 }

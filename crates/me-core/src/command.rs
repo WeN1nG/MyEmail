@@ -13,7 +13,7 @@ use crate::error::CoreError;
 use crate::model::{
     Account, AccountId, Address, AuthMethod, DraftId, DraftSyncState, Endpoint, FlagOp, Flags,
     Folder, FolderId, MessageBody, MessageId, MessageSummary, OAuthClientConfig, OAuthProvider,
-    OutgoingMessage, SearchQuery, TlsMode,
+    OutgoingMessage, SavedSearch, SavedSearchId, SavedSearchQuery, SearchQuery, TlsMode,
 };
 use crate::music::MusicOrder;
 
@@ -72,6 +72,25 @@ pub enum Command {
     RetryArchive(DraftId),
 
     Search(SearchQuery),
+
+    // --- 保存的搜索（v0.4）---
+    /// 保存当前条件为一条命名搜索。
+    SaveSearch {
+        name: String,
+        query: SavedSearchQuery,
+    },
+    /// 删除一条保存的搜索。
+    DeleteSearch {
+        id: SavedSearchId,
+    },
+    /// 执行一条保存的搜索：把 `query_json` 反序列化回 `SearchQuery` 再搜索。
+    ///
+    /// **为什么需要这个命令**：反序列化必须在 UI 侧做——`SearchQuery` 是
+    /// `me-core` 类型，UI 持有它；而 `me-sync` 只认 `Command::Search`。
+    RunSavedSearch {
+        id: SavedSearchId,
+    },
+
     SetTheme(ThemeMode),
     SetBodyBackfill {
         enabled: bool,
@@ -545,6 +564,14 @@ pub enum Event {
         total: u32,
         body_indexed: u32,
         body_total: u32,
+    },
+    /// 保存的搜索列表变了（新增 / 删除 / 执行后 touch）。
+    ///
+    /// **关键事件**（不可丢）——丢了 UI 与存储就不一致了。
+    /// 载荷是**快照**（完整列表），不是增量——条数很少（几十条），
+    /// 每次全量下发比让 UI 自己维护增删差更不容易出错。
+    SavedSearchesChanged {
+        searches: Vec<SavedSearch>,
     },
     SyncProgress {
         folder: FolderId,
