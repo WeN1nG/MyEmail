@@ -138,6 +138,8 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                         .map(|f| f.id);
                     self.state.messages.clear();
                     self.state.selected_message = None;
+                    // 列表换了 → 多选集合里的 id 不再属于当前列表，必须清空。
+                    self.state.clear_multi_selection();
                     self.state.open_body = None;
                 }
                 self.state.folders.insert(account, folders);
@@ -167,6 +169,8 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 self.state.messages_cursor = messages.last().map(cursor_of);
                 self.state.messages = messages;
                 self.state.selected_message = None;
+                // 列表换了 → 多选集合里的 id 不再属于当前列表，必须清空。
+                self.state.clear_multi_selection();
                 self.state.open_body = None;
                 self.state.messages_dirty = false;
             }
@@ -898,6 +902,8 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                     self.state.selected_folder = None;
                     self.state.messages.clear();
                     self.state.selected_message = None;
+                    // 列表换了 → 多选集合里的 id 不再属于当前列表，必须清空。
+                    self.state.clear_multi_selection();
                     self.state.open_body = None;
                 }
                 self.state.folders_dirty = true;
@@ -1119,6 +1125,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                         .unwrap_or(false)
                     {
                         self.state.selected_message = None;
+                        self.state.clear_multi_selection();
                         self.state.open_body = None;
                     }
                 }
@@ -1198,6 +1205,8 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 self.state.messages_cursor = None;
                 self.state.messages_has_more = false;
                 self.state.selected_message = None;
+                // 搜索结果换了 → 多选集合里的 id 不再属于当前列表，必须清空。
+                self.state.clear_multi_selection();
                 self.state.open_body = None;
                 self.state.messages_dirty = false;
                 if total == 0 {

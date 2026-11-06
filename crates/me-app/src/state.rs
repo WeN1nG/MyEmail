@@ -1,6 +1,6 @@
 //! UI 侧状态。退出即丢；未保存草稿需先经 `SaveDraft` 落库。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -201,6 +201,18 @@ pub struct UiState {
     pub messages_has_more: bool,
 
     pub selected_message: Option<MessageId>,
+    /// 多选集合（批量操作）。**与 `selected_message` 并存**——
+    /// 单选点击保留 `selected_message`（阅读窗靠它），`Ctrl`/`Shift` 点击进集合。
+    ///
+    /// 集合里的 id **必须都属于当前列表**——切文件夹 / 切账户 / 退出搜索时清空，
+    /// 否则会出现「选了 INBOX 的 3 封 + Archive 的 2 封」这种语义混乱。
+    pub selected_messages: HashSet<MessageId>,
+    /// `Shift` 连选的锚点。`Shift` 点击时选「锚点到目标」之间的连续区间。
+    pub list_selection_anchor: Option<MessageId>,
+    /// 批量删除的确认卡是否打开（`None` = 不打开）。
+    ///
+    /// 沿用 AI 页 `pending_delete` 的先例——删除是破坏性操作，要先确认。
+    pub pending_batch_delete: Option<Vec<MessageId>>,
     /// 阅读窗是否打开。**不能**用 `selected_message.is_some()` 代替：
     /// 切页时 `selected_message` 不清（方便回到列表继续看），那会让阅读窗
     /// 跟着用户跑到每一个页面上；AI 页的卡片又需要它在 AI 页原地弹出。
@@ -338,6 +350,9 @@ impl Default for UiState {
             messages_cursor: None,
             messages_has_more: false,
             selected_message: None,
+            selected_messages: HashSet::new(),
+            list_selection_anchor: None,
+            pending_batch_delete: None,
             reader_open: false,
             open_body: None,
             body_loading: false,
@@ -391,6 +406,94 @@ impl Default for UiState {
 }
 
 impl UiState {
+    // --- 多选（批次 2）---
+
+    /// 裸点击：清空多选集合，设单选。
+    pub fn select_only(&mut self, id: MessageId) {
+        self.selected_messages.clear();
+        self.selected_message = Some(id);
+        self.list_selection_anchor = Some(id);
+    }
+
+    /// `Ctrl` 点击：切换单封的选中态。
+    pub fn toggle_selected(&mut self, id: MessageId) {
+        if !self.selected_messages.remove(&id) {
+            self.selected_messages.insert(id);
+        }
+        // 锚点跟着最后一次操作走——`Shift` 连选以它为起点。
+        self.list_selection_anchor = Some(id);
+        // 单选值跟着走：集合非空时，单选值应该是集合里的一封。
+        self.selected_message = Some(id);
+    }
+
+    /// `Shift` 点击：选「锚点到目标」之间的连续区间。
+    ///
+    /// **区间按当前列表的行序**算——与用户看到的顺序一致。
+    /// 锚点不在当前列表里（切了文件夹没清）时退化成「只选这一封」。
+    pub fn select_range(&mut self, id: MessageId, ordered: &[MessageId]) {
+        let Some(anchor) = self.list_selection_anchor else {
+            self.selected_messages.insert(id);
+            self.selected_message = Some(id);
+            return;
+        };
+        let (Some(start), Some(end)) = (
+            ordered.iter().position(|m| *m == anchor),
+            ordered.iter().position(|m| *m == id),
+        ) else {
+            // 锚点不在列表里——退化成单选。
+            self.selected_messages.clear();
+            self.selected_messages.insert(id);
+            self.selected_message = Some(id);
+            return;
+        };
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        self.selected_messages.clear();
+        for m in &ordered[lo..=hi] {
+            self.selected_messages.insert(*m);
+        }
+        self.selected_message = Some(id);
+    }
+
+    /// 清空多选集合与锚点。
+    ///
+    /// 切文件夹 / 切账户 / 退出搜索时**必须**调用——
+    /// 否则集合里会留下不属于当前列表的 id。
+    pub fn clear_multi_selection(&mut self) {
+        self.selected_messages.clear();
+        self.list_selection_anchor = None;
+        self.pending_batch_delete = None;
+    }
+
+    /// 批量操作的目标 id 列表。
+    ///
+    /// 集合为空时退化为单选值——这样「选中 1 封」与「没选但有单选」
+    /// 两种状态都能用同一套批量按钮。
+    pub fn batch_targets(&self) -> Vec<MessageId> {
+        if self.selected_messages.is_empty() {
+            return self.selected_message.into_iter().collect();
+        }
+        // **按列表顺序**返回——用户期望操作顺序与看到的一致。
+        let mut ids: Vec<MessageId> = self
+            .messages
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| self.selected_messages.contains(id))
+            .collect();
+        // 列表里没有的（理论上不该有）也要带上——不能静默漏掉。
+        let missing: Vec<MessageId> = self
+            .selected_messages
+            .iter()
+            .filter(|id| !ids.contains(id))
+            .copied()
+            .collect();
+        ids.extend(missing);
+        ids
+    }
+
     pub fn toast(&mut self, kind: ToastKind, text: impl Into<String>) {
         self.toasts.push(Toast {
             text: text.into(),

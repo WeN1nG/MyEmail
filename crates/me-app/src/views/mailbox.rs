@@ -3,7 +3,9 @@
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 
-use me_core::{Command, MessageId, SavedSearchId, SavedSearchQuery, SearchQuery, now_unix};
+use me_core::{
+    Command, FlagOp, Flags, MessageId, SavedSearchId, SavedSearchQuery, SearchQuery, now_unix,
+};
 
 use crate::app::human_bytes;
 use crate::state::{ComposeState, Dialog, Page, ToastKind, UiState};
@@ -79,6 +81,9 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
     let mut toggle_star: Option<MessageId> = None;
     let mut toggle_read: Option<MessageId> = None;
     let mut move_trash: Option<MessageId> = None;
+    // **在 TableBuilder 闭包外取修饰键**——闭包里 `ui` 已被可变借用，
+    // 再调 `ui.input()` 会撞借用检查。
+    let modifiers = ui.input(|i| i.modifiers);
 
     if state.messages.is_empty() {
         no_messages(state, ui);
@@ -128,7 +133,11 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                     let starred = message.flags.is_flagged();
                     let mut star_clicked = false;
 
-                    row.set_selected(state.selected_message == Some(id));
+                    // 高亮：**在多选集合内**或**等于单选值**。
+                    // 只看单选值的话，多选时看不出选了哪些。
+                    row.set_selected(
+                        state.selected_messages.contains(&id) || state.selected_message == Some(id),
+                    );
 
                     row.col(|ui| {
                         if unread {
@@ -206,7 +215,18 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                     });
 
                     if row.response().clicked() && !star_clicked {
-                        open = Some(id);
+                        // **多选交互**：`Ctrl` 切换集合、`Shift` 选区间、
+                        // 裸点击清集合并设单选（同时打开阅读窗）。
+                        if modifiers.ctrl {
+                            state.toggle_selected(id);
+                        } else if modifiers.shift {
+                            let ordered: Vec<MessageId> =
+                                state.messages.iter().map(|m| m.id).collect();
+                            state.select_range(id, &ordered);
+                        } else {
+                            state.select_only(id);
+                            open = Some(id);
+                        }
                     }
                     row.response().context_menu(|ui| {
                         if ui.button("标记为已读/未读").clicked() {
@@ -228,6 +248,101 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
 
     if !state.search.active && state.messages_has_more && ui.button("加载更多").clicked() {
         state.load_more_requested = true;
+    }
+
+    // 批量工具条：选中 N 封 → 已读/未读、加星/取消加星、删除、清除选择。
+    //
+    // 动作集只有三项（已读/未读、加星、删除）——**不含「移动到文件夹」**：
+    // 项目根本没有这个能力（`pending_ops.kind` 只有 move_to_trash /
+    // delete_permanent / empty_folder），要做就得动 IMAP 协议层，
+    // 与 D47「v0.4 不碰服务器写路径」冲突。已拍板砍掉（2026-11-06）。
+    if !state.selected_messages.is_empty() {
+        let count = state.selected_messages.len();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("已选 {count} 封")).strong());
+
+            // 批量标志：**目标态**语义——全部已读则「标为未读」，否则「标为已读」。
+            let all_seen = state.batch_targets().iter().all(|id| {
+                state
+                    .messages
+                    .iter()
+                    .find(|m| m.id == *id)
+                    .map(|m| m.flags.is_seen())
+                    .unwrap_or(false)
+            });
+            if ui
+                .button(if all_seen {
+                    "标为未读"
+                } else {
+                    "标为已读"
+                })
+                .clicked()
+            {
+                let ids = state.batch_targets();
+                commands.push(Command::SetFlags {
+                    ids,
+                    flags: if all_seen {
+                        FlagOp::Clear(Flags::SEEN)
+                    } else {
+                        FlagOp::Set(Flags::SEEN)
+                    },
+                });
+                state.clear_multi_selection();
+            }
+
+            let all_flagged = state.batch_targets().iter().all(|id| {
+                state
+                    .messages
+                    .iter()
+                    .find(|m| m.id == *id)
+                    .map(|m| m.flags.is_flagged())
+                    .unwrap_or(false)
+            });
+            if ui
+                .button(if all_flagged {
+                    "取消加星"
+                } else {
+                    "加星"
+                })
+                .clicked()
+            {
+                let ids = state.batch_targets();
+                commands.push(Command::SetFlags {
+                    ids,
+                    flags: if all_flagged {
+                        FlagOp::Clear(Flags::FLAGGED)
+                    } else {
+                        FlagOp::Set(Flags::FLAGGED)
+                    },
+                });
+                state.clear_multi_selection();
+            }
+
+            if ui.button("删除").clicked() {
+                // 破坏性操作走**确认卡**（沿用 AI 页 `pending_delete` 的先例）。
+                state.pending_batch_delete = Some(state.batch_targets());
+            }
+            if ui.button("清除选择").clicked() {
+                state.clear_multi_selection();
+            }
+        });
+    }
+
+    // 批量删除确认卡。
+    if let Some(ids) = state.pending_batch_delete.clone() {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("确定要把这 {} 封邮件移入废件箱吗？", ids.len())).strong(),
+            );
+            if ui.button("确定").clicked() {
+                commands.push(Command::MoveToTrash(ids));
+                state.pending_batch_delete = None;
+                state.clear_multi_selection();
+            }
+            if ui.button("取消").clicked() {
+                state.pending_batch_delete = None;
+            }
+        });
     }
 
     if let Some(id) = toggle_star
@@ -1060,5 +1175,163 @@ mod tests {
         assert_eq!(q.from.as_deref(), Some("alice"));
         assert_eq!(q.to.as_deref(), Some("carol"));
         assert!(q.unread_only);
+    }
+
+    // --- 批量多选（批次 2）---
+
+    fn state_with_messages(count: usize) -> UiState {
+        let messages = (0..count)
+            .map(|i| me_core::MessageSummary {
+                id: MessageId(i as i64 + 1),
+                account: me_core::AccountId(1),
+                folder: me_core::FolderId(1),
+                uid: Some(i as u32 + 1),
+                message_id: None,
+                subject: Some(format!("邮件 {i}")),
+                from: None,
+                to: Vec::new(),
+                cc: Vec::new(),
+                date: None,
+                date_source: me_core::DateSource::Header,
+                size: None,
+                flags: me_core::Flags::NONE,
+                snippet: None,
+                has_attachment: false,
+                body_cached: false,
+            })
+            .collect();
+        UiState {
+            messages,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plain_click_clears_the_selection_set() {
+        let mut state = state_with_messages(3);
+        state.toggle_selected(MessageId(1));
+        state.toggle_selected(MessageId(2));
+        assert_eq!(state.selected_messages.len(), 2);
+
+        state.select_only(MessageId(3));
+        assert!(state.selected_messages.is_empty(), "裸点击应清空集合");
+        assert_eq!(state.selected_message, Some(MessageId(3)));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_a_single_message() {
+        let mut state = state_with_messages(3);
+        state.toggle_selected(MessageId(1));
+        assert!(state.selected_messages.contains(&MessageId(1)));
+
+        state.toggle_selected(MessageId(1));
+        assert!(
+            !state.selected_messages.contains(&MessageId(1)),
+            "再点一次应取消"
+        );
+
+        state.toggle_selected(MessageId(2));
+        assert_eq!(state.selected_messages.len(), 1);
+    }
+
+    #[test]
+    fn shift_click_selects_the_range_from_anchor() {
+        let mut state = state_with_messages(5);
+        let ordered: Vec<MessageId> = state.messages.iter().map(|m| m.id).collect();
+
+        state.select_only(MessageId(2));
+        state.select_range(MessageId(4), &ordered);
+
+        assert_eq!(state.selected_messages.len(), 3);
+        assert!(state.selected_messages.contains(&MessageId(2)));
+        assert!(state.selected_messages.contains(&MessageId(3)));
+        assert!(state.selected_messages.contains(&MessageId(4)));
+        assert!(!state.selected_messages.contains(&MessageId(5)));
+    }
+
+    #[test]
+    fn shift_click_backwards_selects_the_same_range() {
+        let mut state = state_with_messages(5);
+        let ordered: Vec<MessageId> = state.messages.iter().map(|m| m.id).collect();
+
+        state.select_only(MessageId(4));
+        state.select_range(MessageId(2), &ordered);
+
+        assert_eq!(state.selected_messages.len(), 3);
+        assert!(state.selected_messages.contains(&MessageId(2)));
+        assert!(state.selected_messages.contains(&MessageId(4)));
+    }
+
+    #[test]
+    fn shift_click_without_anchor_selects_only_that_message() {
+        let mut state = state_with_messages(3);
+        let ordered: Vec<MessageId> = state.messages.iter().map(|m| m.id).collect();
+
+        state.list_selection_anchor = None;
+        state.select_range(MessageId(2), &ordered);
+        assert_eq!(state.selected_messages.len(), 1);
+        assert!(state.selected_messages.contains(&MessageId(2)));
+    }
+
+    #[test]
+    fn shift_click_with_stale_anchor_falls_back_to_single_select() {
+        // 锚点不在当前列表里（列表换过但集合没清）——不能算出错误的区间。
+        let mut state = state_with_messages(3);
+        let ordered: Vec<MessageId> = state.messages.iter().map(|m| m.id).collect();
+        state.list_selection_anchor = Some(MessageId(999));
+
+        state.select_range(MessageId(2), &ordered);
+        assert_eq!(state.selected_messages.len(), 1);
+        assert!(state.selected_messages.contains(&MessageId(2)));
+    }
+
+    #[test]
+    fn batch_targets_follow_the_list_order() {
+        let mut state = state_with_messages(4);
+        // 故意乱序加入。
+        state.toggle_selected(MessageId(3));
+        state.toggle_selected(MessageId(1));
+        state.toggle_selected(MessageId(4));
+
+        let targets = state.batch_targets();
+        assert_eq!(
+            targets,
+            vec![MessageId(1), MessageId(3), MessageId(4)],
+            "批量目标应按列表顺序"
+        );
+    }
+
+    #[test]
+    fn batch_targets_fall_back_to_the_single_selection() {
+        let mut state = state_with_messages(3);
+        state.select_only(MessageId(2));
+        assert_eq!(state.batch_targets(), vec![MessageId(2)]);
+    }
+
+    #[test]
+    fn clearing_selection_also_drops_the_anchor_and_pending_delete() {
+        let mut state = state_with_messages(3);
+        state.toggle_selected(MessageId(1));
+        state.list_selection_anchor = Some(MessageId(1));
+        state.pending_batch_delete = Some(vec![MessageId(1)]);
+
+        state.clear_multi_selection();
+        assert!(state.selected_messages.is_empty());
+        assert!(state.list_selection_anchor.is_none());
+        assert!(state.pending_batch_delete.is_none());
+    }
+
+    #[test]
+    fn batch_toolbar_is_hidden_without_selection() {
+        let mut state = state_with_messages(2);
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                toolbar(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        assert!(
+            !texts.join("\n").contains("已选"),
+            "没选中时不该显示批量工具条"
+        );
     }
 }
