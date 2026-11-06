@@ -302,25 +302,34 @@ fn render_form(
                     ui.end_row();
 
                     ui.label("收件人");
-                    ui.add(
+                    let to_response = ui.add(
                         egui::TextEdit::singleline(&mut compose.to)
                             .hint_text("a@example.com, Name <b@example.com>")
                             .desired_width(ui.available_width() - 20.0),
                     );
+                    if to_response.changed() {
+                        compose.contact_focus = crate::state::ContactField::To;
+                    }
                     ui.end_row();
 
                     ui.label("抄送");
-                    ui.add(
+                    let cc_response = ui.add(
                         egui::TextEdit::singleline(&mut compose.cc)
                             .desired_width(ui.available_width() - 20.0),
                     );
+                    if cc_response.changed() {
+                        compose.contact_focus = crate::state::ContactField::Cc;
+                    }
                     ui.end_row();
 
                     ui.label("密送");
-                    ui.add(
+                    let bcc_response = ui.add(
                         egui::TextEdit::singleline(&mut compose.bcc)
                             .desired_width(ui.available_width() - 20.0),
                     );
+                    if bcc_response.changed() {
+                        compose.contact_focus = crate::state::ContactField::Bcc;
+                    }
                     ui.end_row();
 
                     ui.label("主题");
@@ -332,6 +341,33 @@ fn render_form(
                 });
 
             ui.separator();
+
+            // 联系人补全下拉。**只在有候选时显示**——
+            // 空列表会占掉一行高度，还让界面显得杂乱。
+            if !compose.contact_suggestions.is_empty() {
+                ui.label(RichText::new("补全：").small().color(Color32::GRAY));
+                ui.vertical(|ui| {
+                    let suggestions = compose.contact_suggestions.clone();
+                    let field = compose.contact_suggestion_field;
+                    for contact in suggestions {
+                        let label = match &contact.display_name {
+                            Some(name) if !name.trim().is_empty() => {
+                                format!("{name} <{}>", contact.addr)
+                            }
+                            _ => contact.addr.clone(),
+                        };
+                        let response =
+                            ui.add(egui::Button::new(RichText::new(label).small()).frame(false));
+                        if response.clicked() {
+                            compose.apply_suggestion(field, &contact);
+                            compose.contact_suggestions.clear();
+                            compose.contact_suggestion_prefix.clear();
+                        }
+                    }
+                });
+                ui.separator();
+            }
+
             ui.add(
                 egui::TextEdit::multiline(&mut compose.body)
                     .hint_text("纯文本正文（UTF-8）")

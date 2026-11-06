@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use crate::calendar::{CalendarEventDraft, CalendarEventId, CalendarId};
 use crate::error::CoreError;
 use crate::model::{
-    Account, AccountId, Address, AuthMethod, DraftId, DraftSyncState, Endpoint, FlagOp, Flags,
-    Folder, FolderId, MessageBody, MessageId, MessageSummary, OAuthClientConfig, OAuthProvider,
-    OutgoingMessage, SavedSearch, SavedSearchId, SavedSearchQuery, SearchQuery, TlsMode,
+    Account, AccountId, Address, AuthMethod, ContactId, DraftId, DraftSyncState, Endpoint, FlagOp,
+    Flags, Folder, FolderId, MessageBody, MessageId, MessageSummary, OAuthClientConfig,
+    OAuthProvider, OutgoingMessage, SavedSearch, SavedSearchId, SavedSearchQuery, SearchQuery,
+    TlsMode,
 };
 use crate::music::MusicOrder;
 
@@ -89,6 +90,12 @@ pub enum Command {
     /// `me-core` 类型，UI 持有它；而 `me-sync` 只认 `Command::Search`。
     RunSavedSearch {
         id: SavedSearchId,
+    },
+    /// 删除一个联系人（用户手动删除单个）。
+    ///
+    /// 删除是破坏性操作，走 `Command` 而不是 UI 直连仓储。
+    RemoveContact {
+        id: ContactId,
     },
 
     SetTheme(ThemeMode),

@@ -764,6 +764,12 @@ where
                 let service = self.clone();
                 tokio::spawn(async move { service.handle_run_saved_search(id).await });
             }
+            Command::RemoveContact { id } => {
+                let service = self.clone();
+                tokio::spawn(async move {
+                    let _ = service.db(move |s| s.remove_contact(id)).await;
+                });
+            }
             Command::SetTheme(mode) => {
                 let service = self.clone();
                 tokio::spawn(async move {
@@ -1921,6 +1927,14 @@ where
             .db(move |s| s.set_draft_status(draft_id, DraftStatus::Sent, error_for_db.as_deref()))
             .await;
 
+        // 联系人累积：**发信成功后把收件人与抄送记下来**——
+        // 用户给对方发过信，对方就是他以后最可能再联系的人。
+        // 失败不报错——联系人是附带行为。
+        let recipients = collect_outgoing_contacts(&outgoing);
+        if !recipients.is_empty() {
+            let _ = self.db(move |s| s.upsert_contacts(&recipients)).await;
+        }
+
         self.status(account.id, ConnectionState::Online).await;
         self.emit(Event::SendCompleted {
             draft: draft_id,
@@ -2708,3 +2722,27 @@ impl BrowserOpener for NoopBrowser {
 
 /// 应用名，便于上层展示。
 pub const NAME: &str = APP_NAME;
+
+/// 从一封**发出的**邮件构造待累积的联系人列表（收件人 + 抄送 + 密送）。
+///
+/// **不含发件人自己**——用户自己的地址不该进联系人的补全列表。
+fn collect_outgoing_contacts(outgoing: &OutgoingMessage) -> Vec<me_core::Contact> {
+    let now = me_core::now_unix();
+    let mut out: Vec<me_core::Contact> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for address in outgoing.all_recipients() {
+        let normalized = me_core::Contact::normalize(&address.addr);
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        out.push(me_core::Contact {
+            id: me_core::ContactId(0),
+            addr: address.addr.trim().to_string(),
+            normalized,
+            display_name: address.name.clone(),
+            last_seen: now,
+            seen_count: 1,
+        });
+    }
+    out
+}

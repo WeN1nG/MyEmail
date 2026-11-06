@@ -195,6 +195,14 @@ where
             return Err(CoreError::limit(me_core::LimitKind::ParseSize));
         }
 
+        // 联系人累积：**在正文解析之前**把收发件人取出来。
+        // 解析失败不阻断补全——联系人是**附带行为**，
+        // 一封畸形邮件不该让这封邮件的正文永远补不上。
+        let contacts = me_proto::mime::parse_addresses(&raw)
+            .ok()
+            .map(|(from, to, cc)| collect_contacts(from, to, cc))
+            .unwrap_or_default();
+
         let text = parsed.text;
         let attachments = parsed.attachments;
         let paths = paths.clone();
@@ -218,6 +226,13 @@ where
         let attachments_for_db = attachments.clone();
         self.db(move |s| s.upsert_attachments(message, &attachments_for_db))
             .await?;
+
+        // 联系人累积：**放在正文落库之后**——
+        // 它是额外的一笔写，放在后面不会拖慢「正文能搜到」这条主线。
+        // 失败也**不报错**——联系人是附带行为。
+        if !contacts.is_empty() {
+            let _ = self.db(move |s| s.upsert_contacts(&contacts)).await;
+        }
 
         let _ = raw_cached;
         Ok(())
@@ -517,4 +532,44 @@ where
         let _ = session.logout().await;
         result
     }
+}
+
+/// 从一封邮件的收发件人构造待累积的联系人列表。
+///
+/// **去重在这一层做**（同一个地址在一封邮件里出现多次只留一条），
+/// 存储层再按 `normalized` 跨邮件去重。
+fn collect_contacts(
+    from: Option<me_core::Address>,
+    to: Vec<me_core::Address>,
+    cc: Vec<me_core::Address>,
+) -> Vec<me_core::Contact> {
+    let now = me_core::now_unix();
+    let mut out: Vec<me_core::Contact> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut push = |address: me_core::Address, out: &mut Vec<me_core::Contact>| {
+        let normalized = me_core::Contact::normalize(&address.addr);
+        if normalized.is_empty() || !seen.insert(normalized.clone()) {
+            return;
+        }
+        out.push(me_core::Contact {
+            id: me_core::ContactId(0),
+            addr: address.addr.trim().to_string(),
+            normalized,
+            display_name: address.name,
+            last_seen: now,
+            seen_count: 1,
+        });
+    };
+
+    if let Some(from) = from {
+        push(from, &mut out);
+    }
+    for address in to {
+        push(address, &mut out);
+    }
+    for address in cc {
+        push(address, &mut out);
+    }
+    out
 }

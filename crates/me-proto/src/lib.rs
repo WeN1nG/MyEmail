@@ -18,8 +18,8 @@ pub use ai::HttpAiProvider;
 pub use imap::{ImapConnection, ProtoFactory, connect_imap};
 pub use me_core::port::ImapCapabilities;
 pub use mime::{
-    DecodedAttachment, ParsedBody, ParsedDraft, ParsedHeader, build_rfc822, parse_body,
-    parse_draft, parse_headers,
+    DecodedAttachment, ParsedBody, ParsedDraft, ParsedHeader, build_rfc822, parse_addresses,
+    parse_body, parse_draft, parse_headers,
 };
 pub use oauth::{
     BuildTimeClient, DeviceCodeResponse, DeviceTokenOutcome, OAuthClient, Pkce, ProviderConfig,

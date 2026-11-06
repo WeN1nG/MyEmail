@@ -244,6 +244,15 @@ impl ReadOnlyRepo for ReadOnlyStore {
         crate::drafts::get_draft_conn(&conn, id)
     }
 
+    fn list_contacts_readonly(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<me_core::Contact>, CoreError> {
+        let conn = self.conn()?;
+        crate::contacts::list_contacts_conn(&conn, prefix, limit)
+    }
+
     fn list_calendars_readonly(&self) -> Result<Vec<me_core::Calendar>, CoreError> {
         self.calendars_readonly()
     }

@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use me_core::{
-    Account, AccountId, Address, AuthMethod, ConnectionState, Draft, DraftId, FlagOp, Flags,
-    Folder, FolderId, HtmlRendererMode, MessageBody, MessageId, MessageSummary, ParsedQuery,
+    Account, AccountId, Address, AuthMethod, ConnectionState, Contact, Draft, DraftId, FlagOp,
+    Flags, Folder, FolderId, HtmlRendererMode, MessageBody, MessageId, MessageSummary, ParsedQuery,
     SavedSearch, ThemeMode, TlsMode, parse_search_syntax,
 };
 
@@ -508,6 +508,14 @@ impl UiState {
 
     pub fn account(&self, id: AccountId) -> Option<&Account> {
         self.accounts.iter().find(|a| a.id == id)
+    }
+
+    /// 撰写页状态（可写）。
+    pub fn compose_mut(&mut self) -> Option<&mut ComposeState> {
+        match &mut self.dialog {
+            Dialog::Compose(compose) => Some(compose),
+            _ => None,
+        }
     }
 
     pub fn folders_of(&self, account: AccountId) -> &[Folder] {
@@ -1069,6 +1077,25 @@ pub struct ComposeState {
     pub confirm_resend: bool,
     /// 打开时的草稿快照，用于判断是否有未保存修改。
     pub initial: ComposeSnapshot,
+    /// 收件人输入框的补全候选（撰写页）。
+    ///
+    /// 由 `refresh_contact_suggestions` 按当前输入的前缀查出——
+    /// **不持久化、不缓存**，每次输入变化重查（联系人表很小，读一次几微秒）。
+    pub contact_suggestions: Vec<Contact>,
+    /// 补全候选是针对哪个输入框的（收件人 / 抄送 / 密送）。
+    pub contact_suggestion_field: ContactField,
+    /// 补全候选上次查询时用的前缀——变了才需要重查。
+    pub contact_suggestion_prefix: String,
+    /// 哪个地址框最近被编辑过（决定补全针对哪个）。
+    pub contact_focus: ContactField,
+}
+
+/// 补全针对哪个地址输入框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactField {
+    To,
+    Cc,
+    Bcc,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1082,6 +1109,53 @@ pub struct ComposeSnapshot {
 }
 
 impl ComposeState {
+    /// 补全候选的前缀：从当前地址输入框里取出**最后一段**。
+    ///
+    /// 地址框里的内容是「a@example.com, Name <b@example.com>」这样的列表，
+    /// 补全只对**正在输入的那一段**有意义——所以取最后一个逗号之后的部分。
+    pub fn suggestion_prefix(&self, field: ContactField) -> String {
+        let raw = match field {
+            ContactField::To => &self.to,
+            ContactField::Cc => &self.cc,
+            ContactField::Bcc => &self.bcc,
+        };
+        let last = raw.rsplit(',').next().unwrap_or("");
+        // `Name <prefix` 形态里只取尖括号内的部分。
+        let prefix = match last.find('<') {
+            Some(idx) => &last[idx + 1..],
+            None => last,
+        };
+        prefix.trim().to_string()
+    }
+
+    /// 把选中的联系人填回地址框。
+    ///
+    /// **替换最后一段**（正在输入的那一段），前面的部分保持不变。
+    pub fn apply_suggestion(&mut self, field: ContactField, contact: &Contact) {
+        let display = match &contact.display_name {
+            Some(name) if !name.trim().is_empty() => {
+                format!("{} <{}>", name.trim(), contact.addr)
+            }
+            _ => contact.addr.clone(),
+        };
+        let target = match field {
+            ContactField::To => &mut self.to,
+            ContactField::Cc => &mut self.cc,
+            ContactField::Bcc => &mut self.bcc,
+        };
+        match target.rfind(',') {
+            Some(idx) => {
+                target.truncate(idx + 1);
+                target.push(' ');
+                target.push_str(&display);
+            }
+            None => {
+                target.clear();
+                target.push_str(&display);
+            }
+        }
+    }
+
     pub fn new(account: AccountId, from_email: &str) -> Self {
         let mut state = Self {
             account,
@@ -1108,6 +1182,10 @@ impl ComposeState {
                 body: String::new(),
                 attachments: Vec::new(),
             },
+            contact_suggestions: Vec::new(),
+            contact_suggestion_field: ContactField::To,
+            contact_suggestion_prefix: String::new(),
+            contact_focus: ContactField::To,
         };
         state.initial = state.snapshot();
         state
@@ -1298,5 +1376,84 @@ mod tests {
         assert!(state.ai_messages_dirty);
         assert!(state.ai.messages.is_empty(), "切会话要清掉上一条的缓冲");
         assert!(state.ai.loading, "等查询回来之前先显示加载中");
+    }
+
+    // --- 联系人补全（批次 3）---
+
+    #[test]
+    fn suggestion_prefix_takes_the_last_segment() {
+        let mut compose = ComposeState::new(AccountId(1), "me@example.com");
+        compose.to = "a@example.com, b@example.com".to_string();
+        assert_eq!(compose.suggestion_prefix(ContactField::To), "b@example.com");
+
+        compose.to = "a@example.com, zhang".to_string();
+        assert_eq!(compose.suggestion_prefix(ContactField::To), "zhang");
+    }
+
+    #[test]
+    fn suggestion_prefix_handles_the_name_angle_bracket_form() {
+        let mut compose = ComposeState::new(AccountId(1), "me@example.com");
+        compose.to = "Alice <alice@example.com>, Zh".to_string();
+        assert_eq!(compose.suggestion_prefix(ContactField::To), "Zh");
+
+        compose.to = "Alice <ali".to_string();
+        assert_eq!(compose.suggestion_prefix(ContactField::To), "ali");
+    }
+
+    #[test]
+    fn applying_a_suggestion_replaces_the_last_segment() {
+        let mut compose = ComposeState::new(AccountId(1), "me@example.com");
+        compose.to = "a@example.com, zhang".to_string();
+        compose.apply_suggestion(
+            ContactField::To,
+            &Contact {
+                id: me_core::ContactId(1),
+                addr: "zhang@example.com".to_string(),
+                normalized: "zhang@example.com".to_string(),
+                display_name: Some("张三".to_string()),
+                last_seen: 0,
+                seen_count: 1,
+            },
+        );
+        assert_eq!(compose.to, "a@example.com, 张三 <zhang@example.com>");
+    }
+
+    #[test]
+    fn applying_a_suggestion_without_a_name_uses_the_plain_address() {
+        let mut compose = ComposeState::new(AccountId(1), "me@example.com");
+        compose.to = "zhang".to_string();
+        compose.apply_suggestion(
+            ContactField::To,
+            &Contact {
+                id: me_core::ContactId(1),
+                addr: "zhang@example.com".to_string(),
+                normalized: "zhang@example.com".to_string(),
+                display_name: None,
+                last_seen: 0,
+                seen_count: 1,
+            },
+        );
+        assert_eq!(compose.to, "zhang@example.com");
+    }
+
+    #[test]
+    fn applying_a_suggestion_to_cc_and_bcc_uses_the_right_field() {
+        let mut compose = ComposeState::new(AccountId(1), "me@example.com");
+        compose.cc = "old@example.com".to_string();
+        compose.bcc = "secret@example.com".to_string();
+        let contact = Contact {
+            id: me_core::ContactId(1),
+            addr: "new@example.com".to_string(),
+            normalized: "new@example.com".to_string(),
+            display_name: None,
+            last_seen: 0,
+            seen_count: 1,
+        };
+        compose.apply_suggestion(ContactField::Cc, &contact);
+        compose.apply_suggestion(ContactField::Bcc, &contact);
+        assert_eq!(compose.cc, "new@example.com");
+        assert_eq!(compose.bcc, "new@example.com");
+        // 收件人没被动过。
+        assert!(compose.to.is_empty());
     }
 }

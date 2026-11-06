@@ -149,6 +149,41 @@ fn mail_date_to_unix(date: &MailDateTime) -> Option<i64> {
         .map(|value| value.timestamp())
 }
 
+/// 一封邮件的收发件人三元组：(发件人, 收件人, 抄送)。
+pub type ParsedAddresses = (Option<Address>, Vec<Address>, Vec<Address>);
+
+/// 从**完整邮件**里提取收发件人（用于联系人累积）。
+///
+/// 与 `parse_headers` 的区别：后者只接受 header 字节段，
+/// 这里直接吃 `BODY.PEEK[]` 抓回来的完整 raw——邮件头就在 raw 的开头，
+/// `mail_parser` 能自己定位。
+///
+/// **只解析地址，不碰正文与附件**——比 `parse_draft` 轻得多
+/// （后者会解码附件字节）。正文补全路径上每封邮件都要调一次，
+/// 代价必须小。
+///
+/// 解析失败返回 `Ok((None, vec![], vec![]))`——**不报错**：
+/// 联系人累积是**附带行为**，不该因为一封畸形邮件让整个补全失败。
+pub fn parse_addresses(raw: &[u8]) -> Result<ParsedAddresses, CoreError> {
+    let parsed = std::panic::catch_unwind(AssertUnwindSafe(|| parser().parse(raw)))
+        .map_err(|_| CoreError::parse("邮件地址解析崩溃"))?;
+    let Some(parsed) = parsed else {
+        return Ok((None, Vec::new(), Vec::new()));
+    };
+
+    let from = parsed.from().and_then(first_address);
+
+    let mut to = Vec::new();
+    for address in parsed.all_to() {
+        push_addresses(&mut to, address);
+    }
+    let mut cc = Vec::new();
+    for address in parsed.all_cc() {
+        push_addresses(&mut cc, address);
+    }
+    Ok((from, to, cc))
+}
+
 /// 解析整封邮件。超过 `MAX_PARSE_BYTES` 直接返回 `Limit(ParseSize)`；
 /// 解析过程中的 panic 会转换为 `CoreError::Parse`。
 pub fn parse_body(raw: &[u8]) -> Result<ParsedBody, CoreError> {

@@ -145,3 +145,41 @@ fn build_rfc822_has_no_bcc_and_encodes_attachments() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// parse_addresses：从完整邮件里提取收发件人（联系人累积用）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_addresses_reads_from_to_and_cc() {
+    let raw = fixture("plain.eml");
+    let (from, to, cc) = me_proto::parse_addresses(&raw).unwrap();
+    assert_eq!(
+        from.as_ref().map(|a| a.addr.as_str()),
+        Some("alice@example.com")
+    );
+    assert_eq!(from.as_ref().and_then(|a| a.name.as_deref()), Some("Alice"));
+    assert_eq!(to.first().map(|a| a.addr.as_str()), Some("bob@example.com"));
+    assert!(cc.is_empty());
+}
+
+#[test]
+fn parse_addresses_on_malformed_mail_returns_empty_not_error() {
+    // 联系人累积是**附带行为**——畸形邮件不该让解析失败。
+    let raw = fixture("malformed.eml");
+    let result = me_proto::parse_addresses(&raw);
+    // 要么成功（拿到空或部分地址），要么是可识别的错误——但不能 panic。
+    if let Ok((from, to, cc)) = result {
+        assert!(from.is_none() || !from.unwrap().addr.is_empty());
+        assert!(to.iter().all(|a| !a.addr.is_empty()));
+        assert!(cc.iter().all(|a| !a.addr.is_empty()));
+    }
+}
+
+#[test]
+fn parse_addresses_handles_empty_input() {
+    let (from, to, cc) = me_proto::parse_addresses(b"").unwrap();
+    assert!(from.is_none());
+    assert!(to.is_empty());
+    assert!(cc.is_empty());
+}

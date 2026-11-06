@@ -219,6 +219,35 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
         }
     }
 
+    /// 重查撰写页的联系人补全候选。
+    ///
+    /// **前缀没变就不查**——每次按键都查库没必要（联系人表虽小，
+    /// 但这是主线程路径）。
+    fn refresh_contact_suggestions(&mut self) {
+        let Some(compose) = self.state.compose_mut() else {
+            return;
+        };
+        let field = compose.contact_focus;
+        let prefix = compose.suggestion_prefix(field);
+        if prefix == compose.contact_suggestion_prefix {
+            return;
+        }
+        // 前缀太短时**不查**——「a」能匹配所有人，候选列表没意义。
+        let contacts = if prefix.len() < 2 {
+            Vec::new()
+        } else {
+            // 查失败**不报错**——补全是辅助功能，不该弹错误打扰用户。
+            self.repo
+                .list_contacts_readonly(&prefix, 8)
+                .unwrap_or_default()
+        };
+        if let Some(compose) = self.state.compose_mut() {
+            compose.contact_suggestion_prefix = prefix;
+            compose.contact_suggestion_field = field;
+            compose.contact_suggestions = contacts;
+        }
+    }
+
     /// 重查天气页数据：地点列表 + 当前地点的快照。
     fn refresh_ai_conversations(&mut self) {
         self.state.ai_conversations_dirty = false;
@@ -1779,6 +1808,10 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
         if let Some(event) = self.state.calendar.pending_open.take() {
             self.open_calendar_event(event);
         }
+        // 联系人补全：**只在撰写窗口开着时**查。
+        // 联系人表很小（几十到几百行），前缀查询走 `ux_contacts_normalized`，
+        // 但没必要在没开撰写窗口时付这个成本。
+        self.refresh_contact_suggestions();
         self.state.prune_toasts();
         self.apply_theme(ctx);
 

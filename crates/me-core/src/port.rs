@@ -707,6 +707,11 @@ pub trait ReadOnlyRepo: Send + Sync {
     fn list_drafts_readonly(&self, account: Option<AccountId>) -> Result<Vec<Draft>, CoreError>;
     fn get_draft_readonly(&self, id: DraftId) -> Result<Option<Draft>, CoreError>;
 
+    /// 按前缀查联系人（撰写页补全下拉用）。
+    ///
+    /// **只读、单次 `LIMIT ≤ 200`**——与本 trait 的其它方法同一套约束。
+    fn list_contacts_readonly(&self, prefix: &str, limit: u32) -> Result<Vec<Contact>, CoreError>;
+
     // 日历：主线程只读，单次 `LIMIT <= 200`。
     fn list_calendars_readonly(&self) -> Result<Vec<Calendar>, CoreError>;
     fn list_calendar_series_readonly(
