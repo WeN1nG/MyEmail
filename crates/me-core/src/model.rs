@@ -1024,6 +1024,13 @@ pub struct SearchQuery {
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub has_attachment: Option<bool>,
+    /// 头部字段的 AND 过滤（子串匹配）。AI 的 `email_search` 用它把
+    /// 「关键词 + 发件人 + 主题」合成一次查询；UI 搜索框留空。
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub subject: Option<String>,
+    /// 只要未读。与其它条件取交集。
+    pub unread_only: bool,
     /// 分页大小，后端强制 ≤ 200。
     pub limit: u32,
     /// `(date, id)` 键集游标。

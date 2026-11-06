@@ -176,6 +176,10 @@ pub enum Command {
     DeleteCalendarEvent {
         id: CalendarEventId,
     },
+    /// 撤销软删除（删除后 10 秒内的「撤销」）。只清 `deleted_at`，不改内容。
+    RestoreCalendarEvent {
+        id: CalendarEventId,
+    },
     CreateCalendar {
         name: String,
         color: String,
@@ -236,6 +240,68 @@ pub enum Command {
         id: crate::weather::WeatherLocationId,
         force: bool,
     },
+
+    // ---------- AI（v0.3）----------
+    /// 新建会话。`model = None` 时用当前选中的模型档案。
+    CreateAiConversation {
+        model: Option<String>,
+    },
+    RenameAiConversation {
+        id: crate::ai::AiConversationId,
+        title: String,
+    },
+    DeleteAiConversation {
+        id: crate::ai::AiConversationId,
+    },
+    ClearAiConversations,
+    /// 发送一条消息。`context` 只带引用 id 与模式，正文由后端读缓存后快照化。
+    SendAiMessage {
+        conversation: crate::ai::AiConversationId,
+        content: String,
+        context: Vec<crate::ai::AiContextRequest>,
+    },
+    CancelAiStream {
+        conversation: crate::ai::AiConversationId,
+    },
+    RegenerateAiMessage {
+        conversation: crate::ai::AiConversationId,
+    },
+    /// 保存模型档案：`id` 已存在则更新，否则新建。名称唯一性在这里校验。
+    SaveAiModel {
+        model: crate::ai::AiModel,
+    },
+    DeleteAiModel {
+        id: String,
+    },
+    /// 选中「当前模型」：新建对话与未绑定档案的旧对话都回退到它。
+    SetActiveAiModel {
+        id: String,
+    },
+    /// 把某个会话切到另一套参数（对话栏里的模型下拉）。
+    SetConversationAiModel {
+        conversation: crate::ai::AiConversationId,
+        model: String,
+    },
+    TestAiModel {
+        model: String,
+    },
+    SetAiPrivacyAck {
+        provider: crate::ai::AiProviderKind,
+        accepted: bool,
+    },
+    /// 撤销一条 AI 创建的日程（仅 `source = ai`）。
+    UndoAiCalendarCreate {
+        event: crate::calendar::CalendarEventId,
+    },
+    /// UI 执行完音乐工具后的回执。`me-sync` 用它唤醒等待中的工具调用。
+    AiMusicResult {
+        call_id: String,
+        outcome: crate::music::MusicOutcome,
+    },
+    DeleteAiEntity {
+        entity: i64,
+    },
+    ClearAiEntities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,7 +659,11 @@ pub enum Event {
         ok: bool,
         message: String,
     },
-    /// API Key 已保存。`persisted = false` 表示只保存在本次会话。
+    /// API Key 已保存到本机 `meta`（与 Host 同一处）。
+    ///
+    /// `persisted` 保留为字段：现在 Key 与 Host 一次写进同一个库，
+    /// 写失败会直接报错而不是降级，因此正常路径恒为 `true`。
+    /// **载荷里不带 Key 本身**——界面只需要知道「存好了」。
     WeatherKeyStored {
         persisted: bool,
     },
@@ -619,6 +689,126 @@ pub enum Event {
         message: String,
         has_cache: bool,
     },
+
+    // ---- AI（v0.3）----
+    /// 会话列表变化（新建 / 重命名 / 删除 / `updated_at` 变化）。
+    AiConversationsChanged,
+    /// 流已开始：助手占位消息已插入。`trimmed_turns` 是被裁掉的历史轮数。
+    AiStreamStarted {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        trimmed_turns: u32,
+    },
+    /// 工具开始执行。**带动机**：界面在工具跑着的时候就要能显示「为什么调它」，
+    /// 不能等 `Completed` 才有——那时已经做完了。
+    AiToolStarted {
+        conversation: crate::ai::AiConversationId,
+        call_id: String,
+        tool: crate::ai::AiToolName,
+        /// 模型给的动机；`None` = 没说，界面显示占位说明。
+        motive: Option<String>,
+        motive_source: crate::ai::MotiveSource,
+    },
+    AiToolCompleted {
+        conversation: crate::ai::AiConversationId,
+        call_id: String,
+        tool: crate::ai::AiToolName,
+        status: crate::ai::AiToolStatus,
+        summary: String,
+        duration_ms: u32,
+        /// 与 `AiToolStarted` 同源，避免同一条活动条前后文本不一致。
+        motive: Option<String>,
+        motive_source: crate::ai::MotiveSource,
+    },
+    /// 本轮清单发生变化（`plan_update` 之后发一次）。
+    ///
+    /// 带上 `message` 而不是只带 `conversation`：界面要把它挂到正在流式输出的
+    /// 那条助手消息上；同一条消息可能连发多次（每次改一步就发一次）。
+    AiPlanUpdated {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        plan: crate::ai_plan::Plan,
+    },
+    /// 邮件检索结果只给 id + 命中理由；UI 通过只读接口取摘要，事件里不放正文。
+    AiToolEmailResults {
+        conversation: crate::ai::AiConversationId,
+        call_id: String,
+        cards: Vec<crate::ai::MailCardRef>,
+        total: u32,
+    },
+    AiToolWeatherResult {
+        conversation: crate::ai::AiConversationId,
+        call_id: String,
+        location: crate::weather::WeatherLocationId,
+    },
+    AiToolCalendarCreated {
+        conversation: crate::ai::AiConversationId,
+        call_id: String,
+        event: crate::calendar::CalendarEventId,
+        start_utc: i64,
+        undoable: bool,
+    },
+    /// AI 音乐工具的执行请求。
+    ///
+    /// 这是**唯一**一处工具执行不在 `me-sync` 的地方：播放器是 UI 侧的本地线程
+    /// （`AudioPlayer::send(AudioCommand)`），不走 Command/Event。UI 执行完用
+    /// `Command::AiMusicResult` 回执。
+    AiMusicCommand {
+        conversation: crate::ai::AiConversationId,
+        call_id: String,
+        op: crate::music::MusicOp,
+    },
+    /// `calendar_delete` 发起了一次删除**请求**。
+    ///
+    /// 这里刻意不带任何「已删除」语义：用户点「确认删除」之后才走
+    /// `Command::DeleteCalendarEvent`。带上标题与开始时间是为了让卡片
+    /// 不依赖再查一次库——用户在确认的那一刻要看到自己删的是哪一条。
+    AiToolCalendarDeletePending {
+        conversation: crate::ai::AiConversationId,
+        call_id: String,
+        event: crate::calendar::CalendarEventId,
+        title: String,
+        start_utc: i64,
+    },
+    /// 实体注册表变化（记忆写入 / 删除 / 清空）。
+    AiEntitiesChanged,
+    /// 流式增量。**进度事件**：通道满时丢弃，UI 用 `seq` 检测缺口，
+    /// 终止事件后强制从数据库重载全文，因此丢一条不会丢字。
+    AiStreamDelta {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        seq: u64,
+        delta: String,
+    },
+    /// 终止事件（完成 / 取消）。不携带全文，UI 据此重载。
+    AiMessageCompleted {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        status: crate::ai::AiMessageStatus,
+    },
+    AiStreamFailed {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        error_text: String,
+        retryable: bool,
+    },
+    /// 连接测试结果。`detail` 只含状态码/错误类别，不含请求头、密钥或响应体。
+    AiConnectionTested {
+        model: String,
+        ok: bool,
+        detail: Option<String>,
+    },
+    /// 设置快照：模型档案列表、当前模型、隐私确认、实体条数。
+    ///
+    /// 档案里**带 key**（key 就是普通参数之一），所以这条事件只发给本进程的
+    /// 界面，不得进日志——`AiModel` 的 `Debug` 已把 key 脱敏。
+    AiConfigChanged {
+        models: Vec<crate::ai::AiModel>,
+        active: Option<String>,
+        privacy_ack_anthropic: bool,
+        privacy_ack_openai: bool,
+        entity_count: u32,
+    },
     Error {
         scope: ErrorScope,
         message: String,
@@ -627,10 +817,13 @@ pub enum Event {
 
 impl Event {
     /// 可合并/可丢弃的进度事件。
+    ///
+    /// `AiStreamDelta` 必须在这里：它每 ≥50 ms 就来一条，若被当作关键事件，
+    /// 通道一满就会 `send().await` 背压，UI 稍慢就形成「越卡越堵」的死循环。
     pub fn is_progress(&self) -> bool {
         matches!(
             self,
-            Event::SyncProgress { .. } | Event::IndexProgress { .. }
+            Event::SyncProgress { .. } | Event::IndexProgress { .. } | Event::AiStreamDelta { .. }
         )
     }
 

@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ai::{AiConversation, AiConversationId, AiEntity, AiMessage, AiMessageId};
 use crate::calendar::{
     Calendar, CalendarEvent, CalendarEventDraft, CalendarEventId, CalendarException, CalendarId,
     CalendarSeries, CalendarSource,
@@ -697,6 +698,22 @@ pub trait ReadOnlyRepo: Send + Sync {
         &self,
         location_id: WeatherLocationId,
     ) -> Result<Option<WeatherSnapshot>, CoreError>;
+
+    // AI：会话/消息/实体只读；流式期间 UI 靠这些方法重载最终内容。
+    fn list_ai_conversations_readonly(
+        &self,
+        before: Option<AiConversationId>,
+        limit: u32,
+    ) -> Result<Vec<AiConversation>, CoreError>;
+    fn list_ai_messages_readonly(
+        &self,
+        conversation: AiConversationId,
+        before: Option<AiMessageId>,
+        limit: u32,
+    ) -> Result<Vec<AiMessage>, CoreError>;
+    fn get_ai_message_readonly(&self, id: AiMessageId) -> Result<Option<AiMessage>, CoreError>;
+    fn list_ai_entities_readonly(&self, limit: u32) -> Result<Vec<AiEntity>, CoreError>;
+    fn count_ai_entities_readonly(&self) -> Result<u32, CoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +767,11 @@ pub trait CalendarRepo {
     ) -> Result<CalendarEvent, CoreError>;
     /// 软删除（写 `deleted_at` 墓碑）。
     fn soft_delete_event(&self, id: CalendarEventId) -> Result<(), CoreError>;
+    /// 撤销软删除：只把 `deleted_at` 清回 `NULL`（并刷新 `updated_at`）。
+    ///
+    /// 刻意**不动** `status` / `sequence` / `summary`：恢复不是修改，
+    /// 与 [`CalendarRepo::soft_delete_event`] 保持对称。
+    fn restore_event(&self, id: CalendarEventId) -> Result<CalendarEvent, CoreError>;
     fn get_event(&self, id: CalendarEventId) -> Result<Option<CalendarEvent>, CoreError>;
 
     /// 可视范围内的「主行」集合：一次性事件 + 尚未结束的重复系列（见 §4.6）。
@@ -807,6 +829,8 @@ pub trait StorePort:
     + SearchRepo
     + CalendarRepo
     + WeatherRepo
+    + crate::ai::AiRepo
+    + crate::ai::AiMemoryRepo
     + MetaRepo
     + Clone
     + Send
@@ -825,6 +849,8 @@ impl<T> StorePort for T where
         + SearchRepo
         + CalendarRepo
         + WeatherRepo
+        + crate::ai::AiRepo
+        + crate::ai::AiMemoryRepo
         + MetaRepo
         + Clone
         + Send
@@ -835,3 +861,6 @@ impl<T> StorePort for T where
 
 /// 天气仓储端口定义在 `me_core::weather`，此处转出以便统一从 `port` 导入。
 pub use crate::weather::WeatherRepo;
+
+/// AI 端口定义在 `me_core::ai`，此处转出以便统一从 `port` 导入。
+pub use crate::ai::{AiFuture, AiMemoryRepo, AiProvider, AiRepo, CancelFlag};

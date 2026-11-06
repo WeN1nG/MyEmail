@@ -151,6 +151,109 @@ impl MusicQueue {
     }
 }
 
+/// 播放控制动作。与 [`MusicOp::Control`] 一起跨层传递，不含任何 UI 状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MusicAction {
+    Play,
+    Pause,
+    Next,
+    Prev,
+    Stop,
+}
+
+impl MusicAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MusicAction::Play => "play",
+            MusicAction::Pause => "pause",
+            MusicAction::Next => "next",
+            MusicAction::Prev => "prev",
+            MusicAction::Stop => "stop",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "play" => Some(MusicAction::Play),
+            "pause" => Some(MusicAction::Pause),
+            "next" => Some(MusicAction::Next),
+            "prev" => Some(MusicAction::Prev),
+            "stop" => Some(MusicAction::Stop),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MusicAction::Play => "播放",
+            MusicAction::Pause => "暂停",
+            MusicAction::Next => "下一首",
+            MusicAction::Prev => "上一首",
+            MusicAction::Stop => "停止",
+        }
+    }
+}
+
+/// AI 音乐工具要执行的操作。
+///
+/// **执行方是 `me-app`**，不是 `me-sync`：播放器（`AudioPlayer`）住在 UI 线程侧，
+/// 走的是本地 `AudioCommand` 通道而不是 Command/Event。所以这里是「请求」，
+/// 真正做事的在 UI，结果通过 [`MusicOutcome`] 回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum MusicOp {
+    /// 在曲库里按标题搜索（大小写不敏感）。
+    Search { query: String },
+    /// 播放：按查询词找第一首，或按索引直接播。
+    Play {
+        query: Option<String>,
+        index: Option<usize>,
+    },
+    /// 当前播放状态（不产生副作用）。
+    State,
+    /// 播放控制。
+    Control { action: MusicAction },
+}
+
+impl MusicOp {
+    /// 给日志/活动条用的一句话，不含参数细节。
+    pub fn label(&self) -> &'static str {
+        match self {
+            MusicOp::Search { .. } => "搜索曲库",
+            MusicOp::Play { .. } => "播放",
+            MusicOp::State => "查看播放状态",
+            MusicOp::Control { action } => action.label(),
+        }
+    }
+}
+
+/// 音乐操作的执行结果。
+///
+/// `summary` 是**给模型看**的一句话（也是给用户的活动条摘要），
+/// `ok` 决定工具结果是不是 `is_error`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MusicOutcome {
+    pub ok: bool,
+    pub summary: String,
+}
+
+impl MusicOutcome {
+    pub fn ok(summary: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            summary: summary.into(),
+        }
+    }
+
+    pub fn fail(summary: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            summary: summary.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +366,20 @@ mod tests {
         let mut seen = q.play_order.clone();
         seen.sort_unstable();
         assert_eq!(seen, (0..4).collect::<Vec<_>>());
+    }
+
+    /// 音乐操作要能过 Command 的 serde 边界（UI 回执走的是同一条通道）。
+    #[test]
+    fn music_op_survives_serde() {
+        let op = MusicOp::Play {
+            query: Some("晴天".to_string()),
+            index: Some(3),
+        };
+        let text = serde_json::to_string(&op).expect("序列化");
+        let back: MusicOp = serde_json::from_str(&text).expect("反序列化");
+        assert_eq!(back, op);
+        assert_eq!(MusicAction::parse("pause"), Some(MusicAction::Pause));
+        assert_eq!(MusicAction::parse("PAUSE"), None, "不做模糊匹配");
     }
 
     #[test]

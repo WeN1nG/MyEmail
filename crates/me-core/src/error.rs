@@ -82,6 +82,50 @@ pub enum CoreError {
 
     #[error("操作已取消")]
     Cancelled,
+
+    /// AI 服务商错误。分类决定 UI 文案与是否给「重试」按钮（架构文档 §5.4.6）。
+    ///
+    /// `detail` 只允许状态码与错误类别，**不得**包含请求头、密钥或响应体原文。
+    #[error("AI 请求失败{}: {detail}", code.as_ref().map(|c| format!(" [{c}]")).unwrap_or_default())]
+    Ai {
+        kind: AiErrorKind,
+        code: Option<String>,
+        detail: String,
+        retryable: bool,
+    },
+}
+
+/// AI 错误的用户可见分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiErrorKind {
+    /// 401 / 403：Key 无效或无权限。
+    Auth,
+    /// 429：请求过于频繁（不自动重试）。
+    RateLimited,
+    /// 5xx / 网络超时：可重试。
+    Transient,
+    /// 400 / 上下文过长：请求本身有问题。
+    Request,
+    /// SSE 或响应格式异常。
+    Protocol,
+    /// 工具轮次/次数/结果超限。
+    Limit,
+    /// 本地配置不完整（缺 key、模型未填）。
+    Config,
+}
+
+impl AiErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AiErrorKind::Auth => "auth",
+            AiErrorKind::RateLimited => "rate_limited",
+            AiErrorKind::Transient => "transient",
+            AiErrorKind::Request => "request",
+            AiErrorKind::Protocol => "protocol",
+            AiErrorKind::Limit => "limit",
+            AiErrorKind::Config => "config",
+        }
+    }
 }
 
 impl CoreError {
@@ -180,6 +224,20 @@ impl CoreError {
         CoreError::Cancelled
     }
 
+    /// 构造 AI 错误。只有 `Transient` 默认可重试；429 由用户手动重试。
+    pub fn ai(
+        kind: AiErrorKind,
+        code: Option<impl Into<String>>,
+        detail: impl Into<String>,
+    ) -> Self {
+        CoreError::Ai {
+            kind,
+            code: code.map(Into::into),
+            detail: detail.into(),
+            retryable: matches!(kind, AiErrorKind::Transient),
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         matches!(self, CoreError::Cancelled)
     }
@@ -204,6 +262,7 @@ impl CoreError {
             | CoreError::Validation { .. }
             | CoreError::Limit { .. }
             | CoreError::Cancelled => false,
+            CoreError::Ai { retryable, .. } => *retryable,
         }
     }
 
@@ -233,6 +292,15 @@ impl CoreError {
             CoreError::Validation { message } => message.clone(),
             CoreError::Limit { what } => what.to_string(),
             CoreError::Cancelled => "操作已取消".to_string(),
+            CoreError::Ai { kind, .. } => match kind {
+                AiErrorKind::Auth => "API Key 无效或无权限，请到设置中检查".to_string(),
+                AiErrorKind::RateLimited => "请求过于频繁，请稍后手动重试".to_string(),
+                AiErrorKind::Transient => "服务暂时不可用，请稍后重试".to_string(),
+                AiErrorKind::Request => "请求过长或参数不合法，请新建对话或缩短引用".to_string(),
+                AiErrorKind::Protocol => "响应格式异常".to_string(),
+                AiErrorKind::Limit => "工具调用过多，请缩小问题范围".to_string(),
+                AiErrorKind::Config => "AI 尚未配置完成，请到设置中填写".to_string(),
+            },
         }
     }
 
