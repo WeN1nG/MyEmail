@@ -18,6 +18,7 @@ pub enum Page {
     Mail,
     Calendar,
     Weather,
+    AiChat,
     Music,
     Accounts,
     Settings,
@@ -29,6 +30,7 @@ impl Page {
             Page::Mail => "邮件",
             Page::Calendar => "日历",
             Page::Weather => "天气",
+            Page::AiChat => "AI",
             Page::Music => "音乐",
             Page::Accounts => "账户",
             Page::Settings => "设置",
@@ -72,6 +74,32 @@ pub struct HtmlJobView {
 }
 
 /// 音乐页状态。播放位置与时长**只来自音频线程**，界面不自己计时。
+/// AI 音乐工具正在等待的目标状态。
+///
+/// UI 是 immediate 模式，没有后台任务可等，所以「等状态达成」只能按帧轮询：
+/// `poll_ai_music` 每帧拿当前状态与这里比一次，达成或超时就回执。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MusicExpect {
+    /// 指定索引的那首正在播放。
+    Playing(usize),
+    /// 已经不在播放（暂停或停止）。
+    Paused,
+    /// 已经停止且没有当前曲目。
+    Stopped,
+    /// 当前曲目不再是这个索引（切歌了）。
+    Switched(Option<usize>),
+}
+
+/// 等待回执的音乐操作。同一时刻只保留一条：AI 一轮里连发两个播放命令没有意义。
+#[derive(Debug, Clone)]
+pub struct PendingAiMusic {
+    pub call_id: String,
+    pub expect: MusicExpect,
+    pub deadline: Instant,
+    /// 给用户看的一句话（动作描述），回执时补上结果状态。
+    pub action_label: String,
+}
+
 pub struct MusicState {
     /// 已保存的目录（来自 meta，或用户本次选择）。
     pub dir: Option<PathBuf>,
@@ -97,6 +125,8 @@ pub struct MusicState {
     pub analyzer: crate::audio::spectrum::SpectrumAnalyzer,
     /// 本帧产生的音频命令，由 app 统一转交给音频线程。
     pub pending: Vec<crate::audio::AudioCommand>,
+    /// AI 音乐工具等待中的操作；`None` = 没有待回执的调用。
+    pub ai_pending: Option<PendingAiMusic>,
 }
 
 impl Default for MusicState {
@@ -119,6 +149,7 @@ impl Default for MusicState {
             cover_texture: None,
             analyzer: crate::audio::spectrum::SpectrumAnalyzer::new(),
             pending: Vec::new(),
+            ai_pending: None,
         }
     }
 }
@@ -169,6 +200,10 @@ pub struct UiState {
     pub messages_has_more: bool,
 
     pub selected_message: Option<MessageId>,
+    /// 阅读窗是否打开。**不能**用 `selected_message.is_some()` 代替：
+    /// 切页时 `selected_message` 不清（方便回到列表继续看），那会让阅读窗
+    /// 跟着用户跑到每一个页面上；AI 页的卡片又需要它在 AI 页原地弹出。
+    pub reader_open: bool,
     pub open_body: Option<MessageBody>,
     pub body_loading: bool,
     pub reader_mode: ReaderMode,
@@ -194,6 +229,8 @@ pub struct UiState {
     pub weather: crate::views::weather::WeatherState,
     /// 音乐页状态：播放位置只在播放中由音频线程刷新。
     pub music: crate::state::MusicState,
+    /// AI 对话页状态（会话/消息/流缓冲/设置草稿）。
+    pub ai: crate::views::ai::AiPageState,
     pub search: SearchState,
     pub sync_progress: Option<SyncProgressView>,
     pub index_progress: Option<IndexProgressView>,
@@ -227,6 +264,10 @@ pub struct UiState {
     pub folders_dirty: bool,
     pub messages_dirty: bool,
     pub drafts_dirty: bool,
+    /// AI：会话列表 / 当前会话消息 / 实体注册表。
+    pub ai_conversations_dirty: bool,
+    pub ai_messages_dirty: bool,
+    pub ai_entities_dirty: bool,
     /// 视图请求加载下一页；由 app 在渲染后处理。
     pub load_more_requested: bool,
     /// 保存草稿后关闭窗口。
@@ -296,6 +337,7 @@ impl Default for UiState {
             messages_cursor: None,
             messages_has_more: false,
             selected_message: None,
+            reader_open: false,
             open_body: None,
             body_loading: false,
             reader_mode: ReaderMode::Rich,
@@ -312,6 +354,7 @@ impl Default for UiState {
             calendar: crate::views::calendar::CalendarState::default(),
             weather: crate::views::weather::WeatherState::default(),
             music: MusicState::default(),
+            ai: crate::views::ai::AiPageState::default(),
             search: SearchState::default(),
             sync_progress: None,
             index_progress: None,
@@ -333,6 +376,9 @@ impl Default for UiState {
             folders_dirty: true,
             messages_dirty: true,
             drafts_dirty: true,
+            ai_conversations_dirty: true,
+            ai_messages_dirty: true,
+            ai_entities_dirty: true,
             load_more_requested: false,
             exit_requested: false,
             dialog: Dialog::None,
@@ -374,6 +420,19 @@ impl UiState {
 
     pub fn selected_account_struct(&self) -> Option<&Account> {
         self.selected_account.and_then(|id| self.account(id))
+    }
+
+    /// 切换 AI 会话：清掉上一个会话的临时 UI，并让主区重查一次消息。
+    ///
+    /// 置脏必须和选中一起做。视图里只调 `ai.select()` 的话，页内切换会话后
+    /// 消息既不重查也不报错，主区就是一片空白——只有切到别的页再回来时，
+    /// `switch_page` 顺手置脏才把它盖住。
+    pub fn select_ai_conversation(&mut self, id: Option<me_core::ai::AiConversationId>) {
+        let changed = self.ai.selected != id;
+        self.ai.select(id);
+        if changed {
+            self.ai_messages_dirty = true;
+        }
     }
 
     pub fn is_offline(&self) -> bool {
@@ -936,5 +995,27 @@ mod tests {
         assert!(is_valid_addr("a@example.com"));
         assert!(!is_valid_addr("a@localhost"));
         assert!(!is_valid_addr("nope"));
+    }
+
+    #[test]
+    fn switching_ai_conversation_marks_messages_for_reload() {
+        let mut state = UiState::default();
+        use me_core::ai::AiConversationId;
+
+        state.ai_messages_dirty = false;
+        state.select_ai_conversation(Some(AiConversationId(1)));
+        assert!(
+            state.ai_messages_dirty,
+            "页内切换会话必须重查消息，否则主区一直空白"
+        );
+
+        state.ai_messages_dirty = false;
+        state.select_ai_conversation(Some(AiConversationId(1)));
+        assert!(!state.ai_messages_dirty, "点同一条不用白跑一次查询");
+
+        state.select_ai_conversation(Some(AiConversationId(2)));
+        assert!(state.ai_messages_dirty);
+        assert!(state.ai.messages.is_empty(), "切会话要清掉上一条的缓冲");
+        assert!(state.ai.loading, "等查询回来之前先显示加载中");
     }
 }

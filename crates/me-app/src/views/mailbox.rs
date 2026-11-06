@@ -262,6 +262,7 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
     }
     if let Some(id) = open {
         state.selected_message = Some(id);
+        state.reader_open = true;
         state.open_body = None;
         state.body_loading = true;
         commands.push(Command::OpenMessage(id));
@@ -400,6 +401,10 @@ fn submit_search(state: &mut UiState, commands: &mut Vec<Command>) {
         since,
         until,
         has_attachment: state.search.has_attachment,
+        from: None,
+        to: None,
+        subject: None,
+        unread_only: false,
         limit: 200,
         cursor: None,
     };

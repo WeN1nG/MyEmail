@@ -1,6 +1,7 @@
 //! 视图框架：页面导航、共享控件、整体布局。
 
 pub mod accounts;
+pub mod ai;
 pub mod calendar;
 pub mod compose;
 pub mod dialogs;
@@ -31,6 +32,7 @@ pub fn top_bar(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::Con
                 Page::Mail,
                 Page::Calendar,
                 Page::Weather,
+                Page::AiChat,
                 Page::Music,
                 Page::Accounts,
                 Page::Settings,
@@ -202,6 +204,11 @@ pub fn folder_sidebar(state: &mut UiState, commands: &mut Vec<Command>, ctx: &eg
                 weather::sidebar(state, commands, ui);
                 return;
             }
+            if state.page == Page::AiChat {
+                // AI 页的侧栏放会话列表与服务商设置入口。
+                ai::sidebar(state, commands, ui);
+                return;
+            }
             if state.page == Page::Music {
                 // 音乐页的侧栏放播放列表（主区留给专辑页与频谱）。
                 music::sidebar(state, commands, ui);
@@ -238,11 +245,21 @@ pub fn switch_page(state: &mut UiState, page: Page) {
         return;
     }
     state.page = page;
+    // 切页收起阅读窗：`selected_message` 仍然保留，方便回到邮件页接着看。
+    state.reader_open = false;
     if page == Page::Calendar {
         state.calendar.dirty = true;
     }
     if page == Page::Weather {
         state.weather.dirty = true;
+    }
+    if page == Page::AiChat {
+        state.ai_conversations_dirty = true;
+        state.ai_messages_dirty = true;
+        state.ai_entities_dirty = true;
+    } else {
+        // 设置是 AI 页的弹窗，离开页面就收掉，避免下次回来突然压在对话上。
+        state.ai.show_settings = false;
     }
 }
 

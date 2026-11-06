@@ -10,6 +10,23 @@ use me_core::{Command, MusicOrder};
 use crate::audio::AudioCommand;
 use crate::state::UiState;
 
+/// 按标题匹配曲目，返回**曲库里的索引**（不是命中序号）。
+///
+/// AI 的 `music_search` / `music_play` 与界面搜索框共用这一份：两边各写一遍，
+/// 匹配规则迟早会分叉，用户看到「搜索有、AI 说没有」。
+pub fn find_tracks(tracks: &[crate::audio::playlist::Track], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| track.title.to_lowercase().contains(&needle))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 const ROW_HEIGHT: f32 = 24.0;
 const DURATION_WIDTH: f32 = 56.0;
 /// 侧栏宽度小于它就不再挤时长列，只显示曲名。
@@ -877,6 +894,32 @@ mod tests {
     use crate::audio::spectrum::BANDS;
     use crate::state::Page;
     use std::path::PathBuf;
+
+    /// AI 工具与界面搜索共用的一份匹配：大小写不敏感、空词返回空。
+    #[test]
+    fn find_tracks_matches_case_insensitively() {
+        let tracks = vec![
+            Track {
+                path: PathBuf::from("a.mp3"),
+                title: "Blue Moon".to_string(),
+                duration_ms: None,
+            },
+            Track {
+                path: PathBuf::from("b.mp3"),
+                title: "blue 的夜".to_string(),
+                duration_ms: None,
+            },
+            Track {
+                path: PathBuf::from("c.mp3"),
+                title: "晴天".to_string(),
+                duration_ms: None,
+            },
+        ];
+        assert_eq!(find_tracks(&tracks, "BLUE"), vec![0, 1]);
+        assert_eq!(find_tracks(&tracks, "  晴天 "), vec![2]);
+        assert!(find_tracks(&tracks, "  ").is_empty(), "空查询不该命中全部");
+        assert!(find_tracks(&tracks, "不存在").is_empty());
+    }
 
     #[test]
     fn formats_short_and_long_durations() {

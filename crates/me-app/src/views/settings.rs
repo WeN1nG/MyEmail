@@ -28,6 +28,12 @@ pub fn show(
 
     page_scroll_area().show(ui, |ui| {
         egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("AI 服务").strong());
+            crate::views::ai::settings_section(state, commands, ui);
+        });
+
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("外观").strong());
             ui.horizontal(|ui| {
                 let mut theme = state.theme;

@@ -23,8 +23,17 @@ pub fn show_window(
     let Some(id) = state.selected_message else {
         return;
     };
-    let Some(message) = state.messages.iter().find(|m| m.id == id).cloned() else {
+    // 先找当前列表，再找 AI 卡片带出来的摘要：AI 页检索到的邮件可能不在
+    // 邮件列表里，但用户在 AI 页点「打开邮件」时照样要能读到。
+    let message = state
+        .messages
+        .iter()
+        .find(|m| m.id == id)
+        .or_else(|| state.ai.card_messages.iter().find(|m| m.id == id))
+        .cloned();
+    let Some(message) = message else {
         state.selected_message = None;
+        state.reader_open = false;
         return;
     };
 
@@ -57,6 +66,7 @@ pub fn show_window(
 
     if !open || close {
         state.selected_message = None;
+        state.reader_open = false;
         state.open_body = None;
         state.body_loading = false;
     }
@@ -161,6 +171,17 @@ fn header(
         if ui.button("回复").clicked() {
             *close = true;
             start_reply(state, message);
+        }
+
+        // 引用到 AI：只带正文（用户主动），不自动上传，也不含附件。
+        if ui
+            .button("引用到 AI 对话")
+            .on_hover_text("把这封邮件的正文作为资料带入 AI 对话；不会发送附件")
+            .clicked()
+        {
+            let subject = message.display_subject();
+            crate::views::ai::attach_context(state, message.id, subject);
+            *close = true;
         }
 
         let starred = message.flags.is_flagged();

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audio::{AudioCommand, AudioEvent, AudioPlayer};
 use eframe::egui;
@@ -216,6 +216,59 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
     }
 
     /// 重查天气页数据：地点列表 + 当前地点的快照。
+    fn refresh_ai_conversations(&mut self) {
+        self.state.ai_conversations_dirty = false;
+        let list = match self.repo.list_ai_conversations_readonly(None, 100) {
+            Ok(list) => list,
+            Err(err) => {
+                self.report_error(ErrorScope::Global, err);
+                return;
+            }
+        };
+        let selected_missing = self
+            .state
+            .ai
+            .selected
+            .is_none_or(|id| !list.iter().any(|item| item.id == id));
+        if selected_missing {
+            // 没有选中或选中的会话已被删除：落到第一条。
+            match list.first() {
+                Some(first) => {
+                    let id = first.id;
+                    self.state.select_ai_conversation(Some(id));
+                }
+                None => self.state.select_ai_conversation(None),
+            }
+        }
+        self.state.ai.conversations = list;
+    }
+
+    fn refresh_ai_messages(&mut self) {
+        self.state.ai_messages_dirty = false;
+        let Some(conversation) = self.state.ai.selected else {
+            self.state.ai.messages.clear();
+            return;
+        };
+        match self.repo.list_ai_messages_readonly(conversation, None, 200) {
+            Ok(messages) => {
+                // 清单跟着最后一条带清单的助手消息走：它是这一轮需求的最新进度，
+                // 上一条消息的清单已经过期，继续显示会让人以为任务还在跑。
+                self.state.ai.plan = messages.iter().rev().find_map(|item| item.plan.clone());
+                self.state.ai.messages = messages;
+                self.state.ai.loading = false;
+            }
+            Err(err) => self.report_error(ErrorScope::Global, err),
+        }
+    }
+
+    fn refresh_ai_entities(&mut self) {
+        self.state.ai_entities_dirty = false;
+        match self.repo.list_ai_entities_readonly(64) {
+            Ok(list) => self.state.ai.entities = list,
+            Err(err) => self.report_error(ErrorScope::Global, err),
+        }
+    }
+
     fn refresh_weather(&mut self) {
         self.state.weather.dirty = false;
         let locations = match self.repo.list_weather_locations_readonly() {
@@ -390,17 +443,8 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
     /// 音频线程只在首次进入音乐页时创建，切换页面不销毁——否则「切页不停止播放」
     /// 就成了空话。
     fn poll_music(&mut self, ctx: &egui::Context) {
-        if self.state.page == Page::Music && self.player.is_none() {
-            let player = AudioPlayer::start();
-            // 有已保存目录就自动扫描；扫描不等于播放。
-            if let Some(dir) = self.state.music.dir.clone() {
-                self.state.music.scanning = true;
-                player.send(AudioCommand::LoadDirectory(dir));
-            }
-            if self.state.music.order == MusicOrder::Shuffle {
-                player.send(AudioCommand::SetOrder(MusicOrder::Shuffle));
-            }
-            self.player = Some(player);
+        if self.state.page == Page::Music {
+            self.ensure_player();
         }
 
         // 先取出事件，避免同时借用 player 与 state。
@@ -433,6 +477,303 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             ctx.request_repaint_after(Duration::from_millis(66));
         } else if self.state.music.playing || self.state.music.scanning {
             ctx.request_repaint_after(Duration::from_millis(250));
+        }
+
+        // AI 音乐工具的等待：每帧比一次目标状态，达成或超时就回执。
+        self.poll_ai_music(ctx);
+    }
+
+    /// 惰性启动音频线程。
+    ///
+    /// 音乐页与 AI 音乐执行器**共用**这一处启动逻辑：AI 侧要能在从没进过音乐页的
+    /// 情况下直接放歌；两份启动代码只会越改越不一致。
+    fn ensure_player(&mut self) {
+        if self.player.is_some() {
+            return;
+        }
+        let player = AudioPlayer::start();
+        // 有已保存目录就自动扫描；扫描不等于播放。
+        if let Some(dir) = self.state.music.dir.clone() {
+            self.state.music.scanning = true;
+            player.send(AudioCommand::LoadDirectory(dir));
+        }
+        if self.state.music.order == MusicOrder::Shuffle {
+            player.send(AudioCommand::SetOrder(MusicOrder::Shuffle));
+        }
+        self.player = Some(player);
+    }
+
+    fn reply_ai_music(&self, call_id: &str, outcome: me_core::MusicOutcome) {
+        self.backend.send(Command::AiMusicResult {
+            call_id: call_id.to_string(),
+            outcome,
+        });
+    }
+
+    /// 当前播放状态的一句话（给模型、也给活动条）。
+    fn music_state_summary(&self) -> String {
+        let music = &self.state.music;
+        let order = match music.order {
+            MusicOrder::Shuffle => "随机",
+            MusicOrder::Sequential => "顺序",
+        };
+        if let Some(index) = music.current {
+            let title = music
+                .tracks
+                .get(index)
+                .map(|track| track.title.clone())
+                .unwrap_or_else(|| "未知曲目".to_string());
+            if music.playing {
+                format!(
+                    "正在播放「{title}」（第 {} / {} 首，顺序：{order}）",
+                    index + 1,
+                    music.tracks.len()
+                )
+            } else {
+                format!(
+                    "已暂停：当前是「{title}」（第 {} / {} 首）",
+                    index + 1,
+                    music.tracks.len()
+                )
+            }
+        } else if music.scanning {
+            "还没有开始播放，媒体库正在扫描".to_string()
+        } else if music.tracks.is_empty() {
+            "曲库为空：还没有扫描到可播放的音频文件".to_string()
+        } else {
+            format!("当前没有在播放（曲库共 {} 首）", music.tracks.len())
+        }
+    }
+
+    /// 执行一次 AI 音乐操作。
+    ///
+    /// 只有「需要等状态变化」的动作才挂 `ai_pending`；搜索/查询/失败路径当场回执，
+    /// 免得模型白等 2 秒。
+    fn begin_ai_music(&mut self, call_id: String, op: me_core::MusicOp) {
+        use crate::state::{MusicExpect, PendingAiMusic};
+        use me_core::music::{MusicAction, MusicOp};
+
+        // 只读查询先答，不看播放器。
+        if matches!(op, MusicOp::State) {
+            let text = self.music_state_summary();
+            self.reply_ai_music(&call_id, me_core::MusicOutcome::ok(text));
+            return;
+        }
+
+        if let Some(error) = self.state.music.device_error.clone() {
+            self.reply_ai_music(
+                &call_id,
+                me_core::MusicOutcome::fail(format!("音频设备不可用：{error}")),
+            );
+            return;
+        }
+        if self.state.music.dir.is_none() {
+            self.reply_ai_music(
+                &call_id,
+                me_core::MusicOutcome::fail("还没有选择音乐目录：请先到音乐页选一个文件夹"),
+            );
+            return;
+        }
+
+        self.ensure_player();
+
+        if self.state.music.tracks.is_empty() {
+            let text = if self.state.music.scanning {
+                "正在扫描媒体库，稍等几秒再试（大目录可能要十几秒）"
+            } else {
+                "音乐目录里没有找到可播放的音频文件"
+            };
+            self.reply_ai_music(&call_id, me_core::MusicOutcome::fail(text));
+            return;
+        }
+
+        let tracks = self.state.music.tracks.clone();
+        let mut expect: Option<MusicExpect> = None;
+        let mut label = String::new();
+        let mut outcome: Option<me_core::MusicOutcome> = None;
+
+        match op {
+            MusicOp::Search { query } => {
+                let hits = crate::views::music::find_tracks(&tracks, &query);
+                if hits.is_empty() {
+                    outcome = Some(me_core::MusicOutcome::ok(format!(
+                        "曲库里没有匹配「{query}」的曲目（共 {} 首）",
+                        tracks.len()
+                    )));
+                } else {
+                    let list = hits
+                        .iter()
+                        .take(8)
+                        .map(|&index| format!("{}. {}", index + 1, tracks[index].title))
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    outcome = Some(me_core::MusicOutcome::ok(format!(
+                        "匹配到 {} 首：{list}",
+                        hits.len()
+                    )));
+                }
+            }
+            MusicOp::Play { query, index } => {
+                let target = match (index, query.as_deref()) {
+                    (Some(raw), _) if raw >= 1 && raw <= tracks.len() => Some(raw - 1),
+                    (Some(raw), _) => {
+                        outcome = Some(me_core::MusicOutcome::fail(format!(
+                            "序号 {raw} 超出范围（曲库共 {} 首，序号从 1 开始）",
+                            tracks.len()
+                        )));
+                        None
+                    }
+                    (None, Some(word)) => {
+                        let hits = crate::views::music::find_tracks(&tracks, word);
+                        match hits.len() {
+                            0 => {
+                                outcome = Some(me_core::MusicOutcome::ok(format!(
+                                    "曲库里没有匹配「{word}」的曲目"
+                                )));
+                                None
+                            }
+                            1 => Some(hits[0]),
+                            _ => {
+                                let list = hits
+                                    .iter()
+                                    .take(8)
+                                    .map(|&index| format!("{}. {}", index + 1, tracks[index].title))
+                                    .collect::<Vec<_>>()
+                                    .join("、");
+                                outcome = Some(me_core::MusicOutcome::ok(format!(
+                                    "「{word}」匹配到 {} 首，没有自动播放。候选：{list}。\
+请让用户选一首（或用 index 指定序号）",
+                                    hits.len()
+                                )));
+                                None
+                            }
+                        }
+                    }
+                    (None, None) => Some(0),
+                };
+
+                if let Some(target) = target
+                    && let (Some(player), Some(track)) = (&self.player, tracks.get(target))
+                {
+                    player.send(AudioCommand::Play {
+                        index: target,
+                        path: track.path.clone(),
+                    });
+                    label = format!("播放「{}」", track.title);
+                    expect = Some(MusicExpect::Playing(target));
+                }
+            }
+            MusicOp::Control { action } => match action {
+                MusicAction::Play => {
+                    if self.state.music.playing {
+                        outcome = Some(me_core::MusicOutcome::ok("已经在播放"));
+                    } else if let Some(current) = self.state.music.current {
+                        if let Some(player) = &self.player {
+                            player.send(AudioCommand::Toggle);
+                        }
+                        label = "继续播放".to_string();
+                        expect = Some(MusicExpect::Playing(current));
+                    } else if let (Some(player), Some(track)) = (&self.player, tracks.first()) {
+                        player.send(AudioCommand::Play {
+                            index: 0,
+                            path: track.path.clone(),
+                        });
+                        label = format!("播放「{}」", track.title);
+                        expect = Some(MusicExpect::Playing(0));
+                    }
+                }
+                MusicAction::Pause => {
+                    if !self.state.music.playing {
+                        outcome = Some(me_core::MusicOutcome::ok("当前没有在播放"));
+                    } else {
+                        if let Some(player) = &self.player {
+                            player.send(AudioCommand::Toggle);
+                        }
+                        label = "暂停".to_string();
+                        expect = Some(MusicExpect::Paused);
+                    }
+                }
+                MusicAction::Next | MusicAction::Prev => {
+                    let before = self.state.music.current;
+                    if let Some(player) = &self.player {
+                        player.send(if action == MusicAction::Next {
+                            AudioCommand::Next
+                        } else {
+                            AudioCommand::Prev
+                        });
+                    }
+                    label = action.label().to_string();
+                    expect = Some(MusicExpect::Switched(before));
+                }
+                MusicAction::Stop => {
+                    if let Some(player) = &self.player {
+                        player.send(AudioCommand::Stop);
+                    }
+                    label = "停止播放".to_string();
+                    expect = Some(MusicExpect::Stopped);
+                }
+            },
+            MusicOp::State => {}
+        }
+
+        if let Some(outcome) = outcome {
+            self.reply_ai_music(&call_id, outcome);
+            return;
+        }
+        let Some(expect) = expect else {
+            self.reply_ai_music(
+                &call_id,
+                me_core::MusicOutcome::fail("这条音乐指令没有可执行的动作"),
+            );
+            return;
+        };
+        // 新的等待覆盖旧的：上一轮多半已经超时，留着只会把回执张冠李戴。
+        self.state.music.ai_pending = Some(PendingAiMusic {
+            call_id,
+            expect,
+            deadline: Instant::now() + Duration::from_millis(2500),
+            action_label: label,
+        });
+    }
+
+    /// 每帧检查 AI 音乐操作是否达成；达成或超时都回执一次。
+    fn poll_ai_music(&mut self, ctx: &egui::Context) {
+        use crate::state::MusicExpect;
+        let Some(pending) = self.state.music.ai_pending.clone() else {
+            return;
+        };
+        let music = &self.state.music;
+        let satisfied = match pending.expect {
+            MusicExpect::Playing(index) => music.playing && music.current == Some(index),
+            MusicExpect::Paused => !music.playing,
+            MusicExpect::Stopped => !music.playing,
+            MusicExpect::Switched(before) => music.current != before,
+        };
+        let outcome = if satisfied {
+            Some(me_core::MusicOutcome::ok(format!(
+                "{}：{}",
+                pending.action_label,
+                self.music_state_summary()
+            )))
+        } else if Instant::now() >= pending.deadline {
+            let error = self
+                .state
+                .music
+                .error
+                .clone()
+                .unwrap_or_else(|| "播放器没有响应".to_string());
+            Some(me_core::MusicOutcome::fail(format!(
+                "{}没有在 2 秒内完成：{error}",
+                pending.action_label
+            )))
+        } else {
+            // 等待期间保持重绘，否则状态变了也轮询不到。
+            ctx.request_repaint_after(Duration::from_millis(100));
+            None
+        };
+        if let Some(outcome) = outcome {
+            self.state.music.ai_pending = None;
+            self.reply_ai_music(&pending.call_id, outcome);
         }
     }
 
@@ -1038,9 +1379,9 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 self.state.weather.key_present = true;
                 self.state.weather.dirty = true;
                 let message = if persisted {
-                    "和风天气 API Key 已保存到系统密钥库"
+                    "和风天气 API Key 已保存到本机配置"
                 } else {
-                    "系统密钥库不可用，API Key 仅在本次会话有效"
+                    "API Key 仅在本次会话有效"
                 };
                 self.state.toast(ToastKind::Info, message);
             }
@@ -1084,6 +1425,173 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 });
                 self.state.weather.error_location = location_id;
                 self.state.toast(ToastKind::Warn, message);
+            }
+            // ---- AI ----
+            Event::AiConversationsChanged => {
+                self.state.ai_conversations_dirty = true;
+            }
+            Event::AiStreamStarted {
+                conversation,
+                trimmed_turns,
+                ..
+            } => {
+                if self.state.ai.selected == Some(conversation) {
+                    self.state.ai.on_stream_started(conversation);
+                    if trimmed_turns > 0 {
+                        self.state.toast(
+                            ToastKind::Info,
+                            format!("已省略较早的 {trimmed_turns} 轮对话"),
+                        );
+                    }
+                }
+                self.state.ai_messages_dirty = true;
+            }
+            Event::AiStreamDelta {
+                conversation,
+                seq,
+                delta,
+                ..
+            } => {
+                if self.state.ai.selected == Some(conversation) {
+                    self.state.ai.on_delta(conversation, seq, &delta);
+                }
+            }
+            Event::AiMessageCompleted {
+                conversation,
+                status,
+                ..
+            } => {
+                if self.state.ai.selected == Some(conversation) {
+                    self.state.ai.on_finished();
+                    if status == me_core::ai::AiMessageStatus::Cancelled {
+                        self.state.toast(ToastKind::Info, "已停止生成");
+                    }
+                }
+                self.state.ai_messages_dirty = true;
+                self.state.ai_conversations_dirty = true;
+            }
+            Event::AiStreamFailed {
+                conversation,
+                error_text,
+                retryable,
+                ..
+            } => {
+                if self.state.ai.selected == Some(conversation) {
+                    self.state.ai.on_finished();
+                }
+                self.state.ai_messages_dirty = true;
+                let suffix = if retryable { "（可重试）" } else { "" };
+                self.state
+                    .toast(ToastKind::Warn, format!("{error_text}{suffix}"));
+            }
+            Event::AiPlanUpdated {
+                conversation, plan, ..
+            } => {
+                if self.state.ai.selected == Some(conversation) {
+                    self.state.ai.plan = Some(plan);
+                }
+            }
+            Event::AiToolStarted { .. } => {
+                // 工具开始不单独展示：完成事件带摘要，活动条一次成型。
+            }
+            Event::AiToolWeatherResult { .. } => {
+                // 天气卡片由天气页负责；AI 页只保留文字摘要。
+            }
+            Event::AiToolCompleted {
+                call_id,
+                tool,
+                status,
+                summary,
+                duration_ms,
+                motive,
+                motive_source,
+                ..
+            } => {
+                self.state.ai.activity.push(me_core::ai::AiToolTrace {
+                    call_id,
+                    tool,
+                    status,
+                    summary,
+                    duration_ms,
+                    motive,
+                    motive_source,
+                });
+            }
+            Event::AiToolEmailResults {
+                conversation,
+                cards,
+                ..
+            } => {
+                if self.state.ai.selected == Some(conversation) {
+                    let mut built = Vec::new();
+                    for card in cards {
+                        if let Ok(Some(message)) = self.repo.get_message_readonly(card.message) {
+                            built.push(views::ai::AiCard {
+                                message: card.message,
+                                reason: card.reason,
+                                subject: message.subject.unwrap_or_else(|| "(无主题)".to_string()),
+                                from: message
+                                    .from
+                                    .as_ref()
+                                    .map(|address| address.display())
+                                    .unwrap_or_default(),
+                                date: message.date,
+                                snippet: message.snippet.unwrap_or_default(),
+                            });
+                        }
+                    }
+                    self.state.ai.cards = built;
+                }
+            }
+            Event::AiMusicCommand {
+                call_id,
+                op: music_op,
+                ..
+            } => {
+                self.begin_ai_music(call_id, music_op);
+            }
+            Event::AiToolCalendarCreated { event, .. } => {
+                self.state.ai.last_calendar_event = Some(event);
+            }
+            Event::AiToolCalendarDeletePending {
+                conversation,
+                event,
+                title,
+                start_utc,
+                ..
+            } => {
+                if self.state.ai.selected == Some(conversation) {
+                    self.state.ai.pending_delete = Some(crate::views::ai::PendingDelete {
+                        event,
+                        title,
+                        start_utc,
+                    });
+                }
+            }
+            Event::AiEntitiesChanged => {
+                self.state.ai_entities_dirty = true;
+            }
+            Event::AiConfigChanged {
+                models,
+                active,
+                privacy_ack_anthropic,
+                privacy_ack_openai,
+                entity_count,
+            } => {
+                self.state.ai.apply_config(
+                    models,
+                    active,
+                    (privacy_ack_anthropic, privacy_ack_openai),
+                    entity_count,
+                );
+            }
+            Event::AiConnectionTested { ok, detail, .. } => {
+                let text = detail.unwrap_or_default();
+                self.state.ai.test_result = Some((ok, text.clone()));
+                let kind = if ok { ToastKind::Info } else { ToastKind::Warn };
+                if !text.is_empty() {
+                    self.state.toast(kind, text);
+                }
             }
             Event::CalendarReminder {
                 summary,
@@ -1243,6 +1751,18 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
         if self.state.page == Page::Weather && self.state.weather.dirty {
             self.refresh_weather();
         }
+        // AI 同理：停在 AI 页才查库。
+        if self.state.page == Page::AiChat {
+            if self.state.ai_conversations_dirty {
+                self.refresh_ai_conversations();
+            }
+            if self.state.ai_messages_dirty {
+                self.refresh_ai_messages();
+            }
+            if self.state.ai_entities_dirty {
+                self.refresh_ai_entities();
+            }
+        }
         if let Some(event) = self.state.calendar.pending_open.take() {
             self.open_calendar_event(event);
         }
@@ -1254,13 +1774,15 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
 
         // 2b. 页面快捷键：Ctrl+1..5。输入控件聚焦时不抢键。
         if !ctx.wants_keyboard_input() {
+            // 顶栏顺序 = 编号顺序；插入 AI 后音乐/账户/设置各后移一位。
             let shortcuts = [
                 (egui::Key::Num1, Page::Mail),
                 (egui::Key::Num2, Page::Calendar),
                 (egui::Key::Num3, Page::Weather),
-                (egui::Key::Num4, Page::Music),
-                (egui::Key::Num5, Page::Accounts),
-                (egui::Key::Num6, Page::Settings),
+                (egui::Key::Num4, Page::AiChat),
+                (egui::Key::Num5, Page::Music),
+                (egui::Key::Num6, Page::Accounts),
+                (egui::Key::Num7, Page::Settings),
             ];
             for (key, page) in shortcuts {
                 if ctx.input(|i| i.modifiers.command && i.key_pressed(key)) {
@@ -1275,7 +1797,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
 
         if matches!(
             self.state.page,
-            Page::Mail | Page::Calendar | Page::Weather | Page::Music
+            Page::Mail | Page::Calendar | Page::Weather | Page::AiChat | Page::Music
         ) {
             views::folder_sidebar(&mut self.state, &mut commands, ctx);
         }
@@ -1293,6 +1815,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
             Page::Mail => views::mailbox::show(&mut self.state, &mut commands, ui),
             Page::Calendar => views::calendar::show(&mut self.state, &mut commands, ui),
             Page::Weather => views::weather::show(&mut self.state, &mut commands, ui),
+            Page::AiChat => views::ai::show(&mut self.state, &mut commands, ui),
             Page::Music => views::music::show(&mut self.state, &mut commands, ui),
             Page::Accounts => views::accounts::show(&mut self.state, &mut commands, ui),
             Page::Settings => views::settings::show(
@@ -1303,7 +1826,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
             ),
         });
 
-        if self.state.page == Page::Mail && self.state.selected_message.is_some() {
+        if self.state.reader_open && self.state.selected_message.is_some() {
             views::reader::show_window(
                 &mut self.state,
                 &mut commands,
@@ -1319,6 +1842,10 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
         }
         views::calendar::new_calendar_dialog(&mut self.state, &mut commands, ctx);
         views::dialogs::show(&mut self.state, &mut commands, ctx);
+        // AI 设置是弹窗：只在 AI 页渲染，切走后自动收掉。
+        if self.state.page == Page::AiChat {
+            views::ai::settings_modal(&mut self.state, &mut commands, ctx);
+        }
         views::toasts(&mut self.state, ctx);
 
         // 4. 分发命令。

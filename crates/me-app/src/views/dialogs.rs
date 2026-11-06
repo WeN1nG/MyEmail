@@ -75,10 +75,17 @@ fn credential_fallback(state: &mut UiState, commands: &mut Vec<Command>, ctx: &e
 /// 路径差异由程序自动探测（见 `me_proto::qweather`）。
 ///
 /// **Host 可以只填裸域名**（控制台复制到的就是这样）：程序负责补
-/// `https://`、拼端点路径，并把最终请求地址显示出来。
+/// `https://` 与端点路径，所以弹窗里不必预览最终 URL。
+///
+/// 版面按用户给的样式排，**只留这四块**：三步说明 → `API HOST :` /
+/// `API KEY :` 两行对齐的输入框 → 按钮行（右侧放「当前状态」）。
+/// 另有两条只在需要时出现的临时行：Host 非法时的红字原因、
+/// 「测试连接」的结果。
+///
+/// Key 输入框**始终是暗文**（`password(true)`），已保存过就用占位提示告知，
+/// 不把明文回灌进界面状态。
 ///
 /// 从天气页的「配置密钥」按钮打开（主页面未配置时也用同一个入口）。
-/// Key 只提交给后端写密钥库，**不留在界面状态里**——保存后立刻清空。
 fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::Context) {
     if !matches!(state.dialog, Dialog::WeatherConfig) {
         return;
@@ -91,7 +98,7 @@ fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::
         .id(egui::Id::new("me_weather_config"))
         .collapsible(false)
         .resizable(false)
-        .default_width(460.0)
+        .default_width(480.0)
         .show(ctx, |ui| {
             ui.label(RichText::new("天气数据来自和风天气（QWeather）。").size(13.0));
             ui.label(
@@ -105,66 +112,50 @@ fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::
             );
             ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
-                ui.label("API Host");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.weather.host_input.api_host)
-                        .desired_width(280.0)
-                        .hint_text("abcxyz.qweatherapi.com"),
-                );
-            });
-            ui.label(
-                RichText::new(me_core::HOST_HINT)
-                    .size(11.0)
-                    .color(Color32::GRAY),
-            );
+            // 两行字段用 Grid 对齐标签：冒号落在同一列上，和用户给的样式一致。
+            egui::Grid::new("me_weather_config_fields")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("API HOST :").size(12.5));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.weather.host_input.api_host)
+                            .desired_width(320.0)
+                            .hint_text("abcxyz.qweatherapi.com"),
+                    );
+                    ui.end_row();
 
-            // 实时预览：Host 规范化后程序实际会请求哪个地址。
-            // 协议与路径都由程序决定，用户只管填域名。
+                    ui.label(RichText::new("API KEY :").size(12.5));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.weather.key_input)
+                            // 暗文显示：输入的 Key 一律渲染成圆点；已保存时用圆点占位，
+                            // 让用户看见「配过了」而界面里不出现明文。
+                            .password(true)
+                            .desired_width(320.0)
+                            .hint_text(if state.weather.key_present {
+                                "•••••••• 已保存（留空表示不修改）"
+                            } else {
+                                "在「凭据」里生成的 API KEY"
+                            }),
+                    );
+                    ui.end_row();
+                });
+
+            // 只在 Host 非法时给一行红字原因（保存也会因此被拦下）。
+            // 正常情况下窗口里只有上面那两行输入，不再展示「将请求 xx 地址」之类的冗余信息。
             let host_input = state.weather.host_input.api_host.trim();
-            if !host_input.is_empty() {
-                match me_core::weather::normalize_host(host_input) {
-                    Ok(host) => {
-                        ui.label(
-                            RichText::new(format!(
-                                "将请求：{host}{}（城市搜索：{host}{}）",
-                                me_core::PATH_NOW,
-                                me_core::PATH_CITY_LOOKUP
-                            ))
-                            .size(11.0)
-                            .color(Color32::GRAY),
-                        );
-                    }
-                    Err(err) => {
-                        ui.label(
-                            RichText::new(err.user_message())
-                                .size(11.0)
-                                .color(Color32::from_rgb(200, 80, 80)),
-                        );
-                    }
-                }
-            }
-
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("API Key");
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.weather.key_input)
-                        .password(true)
-                        .desired_width(280.0),
+            if !host_input.is_empty()
+                && let Err(err) = me_core::weather::normalize_host(host_input)
+            {
+                ui.label(
+                    RichText::new(err.user_message())
+                        .size(11.0)
+                        .color(Color32::from_rgb(200, 80, 80)),
                 );
-            });
-            ui.label(
-                RichText::new(
-                    "Key 只保存在系统密钥库，不写入数据库、不写日志；密钥库不可用时仅本次会话有效。",
-                )
-                .size(11.0)
-                .color(Color32::GRAY),
-            );
+            }
 
             // 上一次测试连接的结果。
             if let Some((ok, message)) = &state.weather.test_result {
-                ui.add_space(6.0);
                 let color = if *ok {
                     Color32::from_rgb(70, 160, 90)
                 } else {
@@ -195,18 +186,23 @@ fn weather_config(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::
                     cancel = true;
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "当前状态：{}",
-                            if state.weather.key_present {
-                                "已配置 Key"
-                            } else {
-                                "尚未配置 Key"
-                            }
-                        ))
-                        .small()
-                        .color(Color32::GRAY),
-                    );
+                    let status = if !state.weather.key_present {
+                        "当前状态：未配置".to_string()
+                    } else {
+                        // 域名去掉协议前缀，省得把状态行挤爆。
+                        let host = state
+                            .weather
+                            .api_host
+                            .trim_start_matches("https://")
+                            .trim_start_matches("http://")
+                            .trim_end_matches('/');
+                        if host.is_empty() {
+                            "当前状态：已配置".to_string()
+                        } else {
+                            format!("当前状态：已配置 · {host}")
+                        }
+                    };
+                    ui.label(RichText::new(status).small().color(Color32::GRAY));
                 });
             });
         });
@@ -547,15 +543,15 @@ mod tests {
             "应弹出配置弹窗，实际 {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text.contains("API Host")),
-            "应有 API Host 输入"
+            texts.iter().any(|text| text.contains("API HOST")),
+            "应有 API HOST 输入"
         );
         assert!(
-            texts.iter().any(|text| text.contains("API Key")),
-            "应有 API Key 输入"
+            texts.iter().any(|text| text.contains("API KEY")),
+            "应有 API KEY 输入"
         );
         assert!(
-            texts.iter().any(|text| text.contains("qweatherapi.com")),
+            texts.iter().any(|text| text.contains("专属 API Host")),
             "应提示用户在哪里取专属 Host"
         );
         assert!(
@@ -573,28 +569,39 @@ mod tests {
         );
     }
 
-    /// 用户只填裸域名时，弹窗要能看到程序实际会请求的地址。
+    /// 弹窗只留用户指定的内容：不再有「将请求 xx 地址」、Host 取法提示、
+    /// Key 存储说明这些冗余行。
     #[test]
-    fn weather_config_previews_the_request_url_for_a_bare_host() {
+    fn weather_config_has_no_redundant_lines() {
         let mut state = UiState {
             dialog: Dialog::WeatherConfig,
             ..Default::default()
         };
         state.weather.open_config();
-        // 模拟用户把控制台里的裸域名填进 Host 输入框。
+        // 填一个合法裸域名：以前这种输入会多出一段「将请求 …」的预览。
         state.weather.host_input.api_host = "abcxyz.qweatherapi.com".into();
         let texts = dialog_texts(&mut state);
+        for redundant in ["将请求", "/v7/weather/now", "城市搜索：", "系统密钥库"] {
+            assert!(
+                !texts.iter().any(|text| text.contains(redundant)),
+                "不该出现冗余信息「{redundant}」，实际 {texts:?}"
+            );
+        }
+    }
+
+    /// 输入框里的 Key 必须是暗文：绘制的文本里不能出现明文。
+    #[test]
+    fn weather_config_masks_the_key_input() {
+        let mut state = UiState {
+            dialog: Dialog::WeatherConfig,
+            ..Default::default()
+        };
+        state.weather.open_config();
+        state.weather.key_input = "super-secret-key".into();
+        let texts = dialog_texts(&mut state);
         assert!(
-            texts
-                .iter()
-                .any(|text| text.contains("https://abcxyz.qweatherapi.com/v7/weather/now")),
-            "应预览最终请求地址，实际 {texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|text| text.contains("/geo/v2/city/lookup")),
-            "应预览城市搜索地址，实际 {texts:?}"
+            !texts.iter().any(|text| text.contains("super-secret-key")),
+            "Key 应以暗文显示，实际 {texts:?}"
         );
     }
 
