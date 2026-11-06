@@ -2763,7 +2763,6 @@ dependencies = [
  "rfd",
  "rodio",
  "scraper",
- "serde_json",
  "symphonia",
  "tempfile",
  "thiserror 2.0.21",
@@ -2785,7 +2784,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tracing",
  "uuid",
 ]
 
@@ -2819,7 +2817,6 @@ dependencies = [
 name = "me-store"
 version = "0.3.0"
 dependencies = [
- "dirs",
  "flate2",
  "fs2",
  "me-core",
@@ -2851,7 +2848,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]
