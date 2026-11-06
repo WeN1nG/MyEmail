@@ -97,8 +97,8 @@ fn insert(
 fn schema_creation_and_version() {
     let (dir, store) = open_store();
     let writable = store.writable();
+    // 只断言「跟随常量」：写死数字的那行会在每次加迁移时变成噪音。
     assert_eq!(writable.schema_version().unwrap(), me_core::SCHEMA_VERSION);
-    assert_eq!(writable.schema_version().unwrap(), 3);
 
     let paths = store.paths();
     assert!(paths.db_file().exists());
@@ -1748,4 +1748,74 @@ fn attachment_paths_are_rewritten_for_relocation() {
         untouched.local_path.as_deref(),
         Some(outside_path.as_path())
     );
+}
+
+/// 头部字段过滤与未读过滤：与全文短语**取交集**，不是互相覆盖。
+#[test]
+fn search_filters_combine_header_fields_and_unread() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+    let writable = store.writable();
+
+    let mut read = msg(1, "a@example.com", "Quarterly report", 10);
+    read.from = Some(Address::new(Some("张三".into()), "zhang@example.com"));
+    read.flags = Flags::SEEN;
+    let mut unread = msg(2, "b@example.com", "Quarterly report", 11);
+    unread.from = Some(Address::new(Some("张三".into()), "zhang@example.com"));
+    unread.has_attachment = true;
+    let mut other = msg(3, "c@example.com", "Weekly report", 12);
+    other.from = Some(Address::new(Some("李四".into()), "li@example.com"));
+    insert(&store, account, inbox, &[read, unread, other]);
+
+    let by_from = writable
+        .search(&SearchQuery {
+            text: "Quarterly".into(),
+            from: Some("zhang@example.com".into()),
+            limit: 20,
+            ..Default::default()
+        })
+        .expect("search");
+    assert_eq!(by_from.total, 2, "关键词 + 发件人取交集");
+
+    let unread_only = writable
+        .search(&SearchQuery {
+            text: "Quarterly".into(),
+            from: Some("zhang@example.com".into()),
+            unread_only: true,
+            limit: 20,
+            ..Default::default()
+        })
+        .expect("search");
+    assert_eq!(unread_only.total, 1, "再加未读只剩一封");
+    let only = &unread_only.messages[0];
+    assert_eq!(only.uid, Some(2));
+    assert!(only.has_attachment, "结果里要带附件标记");
+
+    let by_subject = writable
+        .search(&SearchQuery {
+            subject: Some("Weekly".into()),
+            limit: 20,
+            ..Default::default()
+        })
+        .expect("search");
+    assert_eq!(by_subject.total, 1, "没有全文词时也能按主题子串查");
+
+    let by_to = writable
+        .search(&SearchQuery {
+            to: Some("alice@example.com".into()),
+            limit: 20,
+            ..Default::default()
+        })
+        .expect("search");
+    assert_eq!(by_to.total, 3, "收件人过滤命中全部三封");
+
+    let no_hit = writable
+        .search(&SearchQuery {
+            text: "Quarterly".into(),
+            from: Some("li@example.com".into()),
+            limit: 20,
+            ..Default::default()
+        })
+        .expect("search");
+    assert!(no_hit.messages.is_empty(), "两个条件不匹配时不应有结果");
 }

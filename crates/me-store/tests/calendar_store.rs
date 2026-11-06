@@ -301,7 +301,12 @@ fn range_query_is_bounded_to_requested_calendars() {
 }
 
 #[test]
-fn schema_version_is_three() {
+fn schema_version_matches_the_constant() {
     let (_dir, store) = open();
-    assert_eq!(store.writable().schema_version().unwrap(), 3);
+    // 断言「跟随常量」而不是写死数字：每次加迁移都要改测试的话，
+    // 这条断言迟早会被顺手改成当前值而失去意义。
+    assert_eq!(
+        store.writable().schema_version().unwrap(),
+        me_core::SCHEMA_VERSION
+    );
 }

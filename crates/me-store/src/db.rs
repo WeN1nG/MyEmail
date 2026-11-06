@@ -282,4 +282,36 @@ impl ReadOnlyRepo for ReadOnlyStore {
     ) -> Result<Option<me_core::WeatherSnapshot>, CoreError> {
         self.weather_snapshot_readonly(location_id)
     }
+
+    fn list_ai_conversations_readonly(
+        &self,
+        before: Option<me_core::AiConversationId>,
+        limit: u32,
+    ) -> Result<Vec<me_core::AiConversation>, CoreError> {
+        crate::ai::list_conversations_readonly(self, before, limit)
+    }
+
+    fn list_ai_messages_readonly(
+        &self,
+        conversation: me_core::AiConversationId,
+        before: Option<me_core::AiMessageId>,
+        limit: u32,
+    ) -> Result<Vec<me_core::AiMessage>, CoreError> {
+        crate::ai::list_messages_readonly(self, conversation, before, limit)
+    }
+
+    fn get_ai_message_readonly(
+        &self,
+        id: me_core::AiMessageId,
+    ) -> Result<Option<me_core::AiMessage>, CoreError> {
+        crate::ai::get_message_readonly(self, id)
+    }
+
+    fn list_ai_entities_readonly(&self, limit: u32) -> Result<Vec<me_core::AiEntity>, CoreError> {
+        crate::ai::list_entities_readonly(self, limit)
+    }
+
+    fn count_ai_entities_readonly(&self) -> Result<u32, CoreError> {
+        crate::ai::count_entities_readonly(self)
+    }
 }

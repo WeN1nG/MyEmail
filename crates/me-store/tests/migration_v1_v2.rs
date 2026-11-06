@@ -574,7 +574,7 @@ fn migrated_matches_fresh_schema() {
 /// 用「新建 v3 库 → 删掉 v3 对象 → 把版本改回 2」构造 v2 形态：这比手工维护
 /// 一份冻结的 v2 DDL 更不容易与真实 v2 漂移（v2 的表结构本就由迁移测试守护）。
 #[test]
-fn v2_database_upgrades_to_v3_in_place() {
+fn v2_database_upgrades_to_latest_in_place() {
     const V3_OBJECTS: [&str; 11] = [
         "ai_conversation_entities",
         "ai_entity_aliases",
@@ -604,8 +604,12 @@ fn v2_database_upgrades_to_v3_in_place() {
         .expect("rewind version");
     }
 
-    let store = Store::open(dir.path()).expect("migrate v2 -> v3");
-    assert_eq!(store.writable().schema_version().unwrap(), 3);
+    let store = Store::open(dir.path()).expect("migrate v2 -> latest");
+    // 用常量而不是写死版本号：v2 路径要一路升到最新，不能停在 v3。
+    assert_eq!(
+        store.writable().schema_version().unwrap(),
+        me_core::SCHEMA_VERSION
+    );
 
     let conn = Connection::open(dir.path().join("myemail.db")).expect("open");
     for table in V3_OBJECTS {
@@ -627,7 +631,10 @@ fn v2_database_upgrades_to_v3_in_place() {
     drop(store);
 
     let reopened = Store::open(dir.path()).expect("reopen");
-    assert_eq!(reopened.writable().schema_version().unwrap(), 3);
+    assert_eq!(
+        reopened.writable().schema_version().unwrap(),
+        me_core::SCHEMA_VERSION
+    );
     drop(reopened);
     let conn = Connection::open(dir.path().join("myemail.db")).expect("open");
     assert_eq!(

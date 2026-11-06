@@ -465,6 +465,25 @@ impl CalendarRepo for WritableStore {
         Ok(())
     }
 
+    fn restore_event(&self, id: CalendarEventId) -> Result<CalendarEvent, CoreError> {
+        let conn = self.lock();
+        let now = now_unix();
+        let affected = conn
+            .execute(
+                "UPDATE calendar_events SET deleted_at = NULL, updated_at = ?2 \
+                 WHERE id = ?1 AND deleted_at IS NOT NULL",
+                params![id.0, now],
+            )
+            .store()?;
+        if affected == 0 {
+            return Err(storage(format!("事件 {id} 不存在或未被删除")));
+        }
+        // 恢复后不能再用 `get_event_conn`——它带 `deleted_at IS NULL` 过滤是没错的，
+        // 但我们要在同一个连接上确认恢复结果，直接用不带过滤的取法。
+        let sql = format!("SELECT {EVENT_COLUMNS} FROM calendar_events WHERE id = ?1");
+        conn.query_row(&sql, params![id.0], map_event).store()
+    }
+
     fn get_event(&self, id: CalendarEventId) -> Result<Option<CalendarEvent>, CoreError> {
         let conn = self.lock();
         get_event_conn(&conn, id)

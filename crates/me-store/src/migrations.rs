@@ -268,6 +268,8 @@ CREATE TABLE ai_conversations (
     title      TEXT NOT NULL,
     provider   TEXT NOT NULL CHECK (provider IN ('anthropic','openai_compatible')),
     model      TEXT NOT NULL,
+    -- 绑定的模型档案 id。v3 库升级时由 v3→v4 迁移补上（见 migrate_v3_to_v4）。
+    model_id   TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -286,6 +288,9 @@ CREATE TABLE ai_messages (
     input_tokens    INTEGER,
     output_tokens   INTEGER,
     tool_trace      TEXT,
+    -- 本轮任务清单（JSON）。v5 起新建库直接带上；v4 及更早的库由
+    -- migrate_v4_to_v5 补列（见该函数）。
+    plan            TEXT,
     created_at      INTEGER NOT NULL
 );
 CREATE INDEX ix_ai_messages_conversation
@@ -438,19 +443,42 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             let started = std::time::Instant::now();
             migrate_v1_to_v2(&mut conn)?;
             migrate_v2_to_v3(&mut conn)?;
+            migrate_v3_to_v4(&mut conn)?;
+            migrate_v4_to_v5(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 backup = %backup.display(),
-                "database migrated v1 -> v3"
+                "database migrated v1 -> v5"
             );
             Ok(conn)
         }
         Some(2) => {
             let started = std::time::Instant::now();
             migrate_v2_to_v3(&mut conn)?;
+            migrate_v3_to_v4(&mut conn)?;
+            migrate_v4_to_v5(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v2 -> v3"
+                "database migrated v2 -> v5"
+            );
+            Ok(conn)
+        }
+        Some(3) => {
+            let started = std::time::Instant::now();
+            migrate_v3_to_v4(&mut conn)?;
+            migrate_v4_to_v5(&mut conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "database migrated v3 -> v5"
+            );
+            Ok(conn)
+        }
+        Some(4) => {
+            let started = std::time::Instant::now();
+            migrate_v4_to_v5(&mut conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "database migrated v4 -> v5"
             );
             Ok(conn)
         }
@@ -529,6 +557,9 @@ fn migrate_v1_to_v2(conn: &mut Connection) -> Result<(), CoreError> {
 ///
 /// 失败时整个事务回滚，`schema_version` 保持 2，下次启动可重试。
 fn migrate_v2_to_v3(conn: &mut Connection) -> Result<(), CoreError> {
+    // 注意目标版本写成固定的 3，而不是 SCHEMA_VERSION：
+    // 若写 SCHEMA_VERSION，v2 库会被标成「已是最新」，v3→v4 的补列就被跳过了。
+    const TARGET: u32 = 3;
     let tx = conn
         .transaction()
         .map_err(|e| storage(format!("开始 v2→v3 迁移事务失败: {e}")))?;
@@ -538,7 +569,7 @@ fn migrate_v2_to_v3(conn: &mut Connection) -> Result<(), CoreError> {
 
     tx.execute(
         "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
-        params![SCHEMA_VERSION.to_string()],
+        params![TARGET.to_string()],
     )
     .map_err(|e| storage(format!("写入 schema_version 失败: {e}")))?;
 
@@ -552,15 +583,86 @@ fn migrate_v2_to_v3(conn: &mut Connection) -> Result<(), CoreError> {
         )
         .optional()
         .map_err(|e| storage(format!("迁移后读取 schema_version 失败: {e}")))?;
-    let expected = SCHEMA_VERSION.to_string();
-    if version.as_deref() != Some(expected.as_str()) {
-        return Err(storage(format!(
-            "迁移后 schema_version 未更新为 {SCHEMA_VERSION}"
-        )));
+    if version.as_deref() != Some("3") {
+        return Err(storage("迁移后 schema_version 未更新为 3"));
     }
 
     tx.commit()
         .map_err(|e| storage(format!("提交 v2→v3 迁移失败: {e}")))?;
+    Ok(())
+}
+
+/// v3 → v4：给会话补上模型档案 id。
+///
+/// 幂等：新建库的 `ai_conversations` 已经带 `model_id`（DDL 里直接有），
+/// 而 v2 库刚跑完 v3 时同样带列。所以先查 `PRAGMA table_info`，缺了才加。
+/// 靠版本号判断不可行——两条路径到这里时列的情况不同。
+fn migrate_v3_to_v4(conn: &mut Connection) -> Result<(), CoreError> {
+    // 目标版本写死 4：写 `SCHEMA_VERSION` 会让 v3 库被一步标成最新版本，
+    // 后面的 v4→v5 补列就被跳过了（v2→v3 的注释里踩过同一个坑）。
+    const TARGET: u32 = 4;
+    let tx = conn
+        .transaction()
+        .map_err(|e| storage(format!("开始 v3→v4 迁移事务失败: {e}")))?;
+
+    let has_column: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ai_conversations') WHERE name = 'model_id')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| storage(format!("读取 ai_conversations 列信息失败: {e}")))?;
+    if !has_column {
+        tx.execute_batch("ALTER TABLE ai_conversations ADD COLUMN model_id TEXT;")
+            .map_err(|e| storage(format!("执行 v3→v4 迁移失败: {e}")))?;
+    }
+
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        params![TARGET.to_string()],
+    )
+    .map_err(|e| storage(format!("写入 schema_version 失败: {e}")))?;
+
+    check_foreign_keys(&tx)?;
+    tx.commit()
+        .map_err(|e| storage(format!("提交 v3→v4 迁移失败: {e}")))?;
+    Ok(())
+}
+
+/// v4 → v5：给 `ai_messages` 补一列 `plan`（本轮任务清单 JSON）。
+///
+/// 纯加列，不改任何既有约束——`ai_messages` 上有 CHECK（role/status），
+/// 动它们就得重建表，风险远大于收益。
+///
+/// 按列存在性判断而不是无条件 `ALTER`：新建库走 `create_schema`，
+/// 它的 `SCHEMA_V3_DDL` 已经带上了这一列，重复 ALTER 会报「duplicate column」。
+fn migrate_v4_to_v5(conn: &mut Connection) -> Result<(), CoreError> {
+    const TARGET: u32 = 5;
+    let tx = conn
+        .transaction()
+        .map_err(|e| storage(format!("开始 v4→v5 迁移事务失败: {e}")))?;
+
+    let has_column: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ai_messages') WHERE name = 'plan')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| storage(format!("读取 ai_messages 列信息失败: {e}")))?;
+    if !has_column {
+        tx.execute_batch("ALTER TABLE ai_messages ADD COLUMN plan TEXT;")
+            .map_err(|e| storage(format!("执行 v4→v5 迁移失败: {e}")))?;
+    }
+
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        params![TARGET.to_string()],
+    )
+    .map_err(|e| storage(format!("写入 schema_version 失败: {e}")))?;
+
+    check_foreign_keys(&tx)?;
+    tx.commit()
+        .map_err(|e| storage(format!("提交 v4→v5 迁移失败: {e}")))?;
     Ok(())
 }
 
@@ -628,5 +730,143 @@ impl MetaRepo for WritableStore {
 
     fn available_bytes(&self) -> Result<Option<u64>, CoreError> {
         Ok(fs2::available_space(self.paths().root()).ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 手工造一个 v3 库（`ai_conversations` 没有 `model_id`），验证升级会补列、
+    /// 保留旧行、并且重复执行不会报「duplicate column」。
+    #[test]
+    fn v3_to_v4_adds_model_id_and_is_idempotent() {
+        let mut conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta(key, value) VALUES ('schema_version', '3');
+            CREATE TABLE ai_conversations (
+                id         INTEGER PRIMARY KEY,
+                title      TEXT NOT NULL,
+                provider   TEXT NOT NULL,
+                model      TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO ai_conversations(title, provider, model, created_at, updated_at)
+            VALUES ('旧会话', 'anthropic', 'claude-sonnet-4-5', 1, 1);
+            "#,
+        )
+        .expect("建 v3 库");
+
+        migrate_v3_to_v4(&mut conn).expect("升级失败");
+
+        let has_column: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ai_conversations') \
+                 WHERE name = 'model_id')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读取列");
+        assert!(has_column, "v3 库升级后必须有 model_id 列");
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读版本");
+        assert_eq!(version, "4");
+
+        // 旧会话保留，`model_id` 为空：界面按「当前模型」回退。
+        let (title, model_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT title, model_id FROM ai_conversations WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("读旧会话");
+        assert_eq!(title, "旧会话");
+        assert!(model_id.is_none());
+
+        // 幂等：新建库 / v2 升级路径到这里时列已经有了。
+        migrate_v3_to_v4(&mut conn).expect("重复执行应当成功");
+    }
+
+    /// v4 → v5：补 `ai_messages.plan`，老消息读出来是 NULL（= 没有清单）。
+    #[test]
+    fn v4_to_v5_adds_plan_column() {
+        let mut conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta(key, value) VALUES ('schema_version', '4');
+            CREATE TABLE ai_conversations (
+                id         INTEGER PRIMARY KEY,
+                title      TEXT NOT NULL,
+                provider   TEXT NOT NULL,
+                model      TEXT NOT NULL,
+                model_id   TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            INSERT INTO ai_conversations(title, provider, model, model_id, created_at, updated_at)
+            VALUES ('旧会话', 'anthropic', 'claude', 'm1', 1, 1);
+            CREATE TABLE ai_messages (
+                id              INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL,
+                role            TEXT NOT NULL,
+                content         TEXT NOT NULL DEFAULT '',
+                context_refs    TEXT,
+                status          TEXT NOT NULL DEFAULT 'complete',
+                error           TEXT,
+                input_tokens    INTEGER,
+                output_tokens   INTEGER,
+                tool_trace      TEXT,
+                created_at      INTEGER NOT NULL
+            );
+            INSERT INTO ai_messages(conversation_id, role, content, created_at)
+            VALUES (1, 'assistant', '旧回复', 1);
+            "#,
+        )
+        .expect("建 v4 库");
+
+        migrate_v4_to_v5(&mut conn).expect("升级失败");
+
+        let has_column: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ai_messages') \
+                 WHERE name = 'plan')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读取列");
+        assert!(has_column, "v4 库升级后必须有 plan 列");
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读版本");
+        assert_eq!(version, "5");
+
+        // 老消息保留，plan 为空：界面按「这一轮没有清单」处理。
+        let (content, plan): (String, Option<String>) = conn
+            .query_row(
+                "SELECT content, plan FROM ai_messages WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("读旧消息");
+        assert_eq!(content, "旧回复");
+        assert!(plan.is_none());
+
+        // 幂等：v3 的升级路径会连走两步，到这里列已经存在。
+        migrate_v4_to_v5(&mut conn).expect("重复执行应当成功");
     }
 }

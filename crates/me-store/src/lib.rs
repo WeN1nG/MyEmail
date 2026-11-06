@@ -11,6 +11,7 @@
 //! - 事务内不做网络 IO（本 crate 也没有网络能力）。
 
 mod accounts;
+mod ai;
 mod attachments;
 pub mod cache;
 mod calendars;
@@ -29,6 +30,9 @@ use me_core::CoreError;
 
 pub use cache::CachePaths;
 pub use db::{ReadOnlyStore, Store, WritableStore};
+
+/// 会话自动标题（取首条用户消息前 30 字符）。`me-sync` 落库时使用。
+pub use ai::auto_title;
 
 /// 把任意底层错误折叠成 `CoreError::Storage`，避免 `rusqlite` / `io` 类型越过本层。
 pub(crate) fn storage(err: impl Display) -> CoreError {

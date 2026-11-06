@@ -117,7 +117,10 @@ fn escape_like(text: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// 非文本过滤条件（账户 / 文件夹 / 时间 / 附件）。
+/// 非文本过滤条件（账户 / 文件夹 / 时间 / 附件 / 头部字段 / 未读）。
+///
+/// 头部字段用 `LIKE` 子串匹配而不是 FTS：它们要和全文短语**取交集**，
+/// 而 `messages_fts` 一次只能吃一个短语。
 fn base_filters(query: &SearchQuery) -> (Vec<String>, Vec<SqlValue>) {
     let mut parts = Vec::new();
     let mut values = Vec::new();
@@ -148,6 +151,21 @@ fn base_filters(query: &SearchQuery) -> (Vec<String>, Vec<SqlValue>) {
         Some(true) => parts.push("m.has_attachment = 1".to_string()),
         Some(false) => parts.push("m.has_attachment = 0".to_string()),
         None => {}
+    }
+    for (column, value) in [
+        ("m.from_addr", query.from.as_deref()),
+        ("m.to_addrs", query.to.as_deref()),
+        ("m.subject", query.subject.as_deref()),
+    ] {
+        let Some(value) = value.map(str::trim).filter(|text| !text.is_empty()) else {
+            continue;
+        };
+        parts.push(format!("{column} LIKE ? ESCAPE '\\'"));
+        values.push(SqlValue::Text(format!("%{}%", escape_like(value))));
+    }
+    // 与 `messages::unread_count_conn` 同一个位：`flags & 1` 是 `\Seen`。
+    if query.unread_only {
+        parts.push("(m.flags & 1) = 0".to_string());
     }
 
     (parts, values)
