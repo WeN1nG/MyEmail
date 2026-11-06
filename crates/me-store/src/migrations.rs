@@ -71,6 +71,12 @@ CREATE TABLE messages (
     snippet        TEXT,
     has_attachment INTEGER NOT NULL DEFAULT 0,
     body_path      TEXT,                -- NULL = 正文未缓存；非 NULL = 已写入 FTS
+    -- 会话线程（v7 加列）：`In-Reply-To` / `References` 头。
+    -- **必须可空**：NOT NULL DEFAULT '' 会让历史行全是空串，
+    -- 与「有但为空」混淆；用 NULL 表示「未知」。
+    -- 注：`references` 是 SQLite 的**保留关键字**，列名必须加引号。
+    in_reply_to    TEXT,
+    "references"   TEXT,                -- JSON 数组
     UNIQUE(folder_id, uid)
 );
 -- 索引列序必须与查询的 ORDER BY 前缀严格对齐，否则 SQLite 退化成
@@ -353,6 +359,46 @@ SELECT '我的日历', '#3B82F6', 1, 1,
  WHERE NOT EXISTS (SELECT 1 FROM calendars);
 "#;
 
+/// **v7 DDL**：新增 `contacts` / `saved_searches` 两张表；给 `messages` 补两列。
+///
+/// **只放 v0.4 的三个新增项**——v6 的 6 条索引定义已在 `SCHEMA_V3_DDL`
+/// （即 `create_schema` 的 DDL）里，改索引列序属于 v6 的职责，不要在这里重复。
+///
+/// 幂等策略**按变更类型分开**：
+/// - 建表 → `IF NOT EXISTS`；
+/// - 加列 → 由 `migrate_v6_to_v7` 用 `pragma_table_info` 判存在性（新建库的
+///   `SCHEMA_V3_DDL` 已带这两列，无条件 `ALTER` 会报 duplicate column）。
+pub(crate) const SCHEMA_V7_DDL: &str = r#"
+-- 联系人：**本地派生数据**，由正文补全落库 / 发信归档时累积。
+-- 永不出网、不参与 AI 请求；ClearCache 不清理它（与 D30 一致）。
+CREATE TABLE IF NOT EXISTS contacts (
+    id            INTEGER PRIMARY KEY,
+    -- 显示用的原始地址（保留大小写）。邮箱大小写不敏感，
+    -- 但显示时保留原样更友好。
+    addr          TEXT NOT NULL,
+    -- **归一化后**的小写地址，唯一性判据用它——见下方唯一索引。
+    normalized    TEXT NOT NULL,
+    display_name  TEXT,
+    last_seen     INTEGER NOT NULL,
+    seen_count    INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_contacts_normalized ON contacts(normalized);
+-- 补全下拉的排序：last_seen 最近 > seen_count 高。
+CREATE INDEX IF NOT EXISTS ix_contacts_recent ON contacts(last_seen DESC, seen_count DESC);
+
+-- 保存的搜索：只存**条件**，不做自动动作（D42）。
+-- `query_json` 存 `SearchQuery` 的**持久化子集**——不含 `cursor` / `limit`
+-- 这类分页态（详见 crates/me-core/src/model.rs 的 SavedSearchQuery）。
+CREATE TABLE IF NOT EXISTS saved_searches (
+    id            INTEGER PRIMARY KEY,
+    name          TEXT NOT NULL,
+    query_json    TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    last_used_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_saved_searches_name ON saved_searches(name);
+"#;
+
 /// v1 → v2 的纯加列 + 索引 + 数据整理。
 ///
 /// 注意：`messages` 清理依赖 `ON DELETE CASCADE`，调用方必须保持外键开启。
@@ -453,10 +499,11 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v3_to_v4(&mut conn)?;
             migrate_v4_to_v5(&mut conn)?;
             migrate_v5_to_v6(&mut conn)?;
+            migrate_v6_to_v7(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 backup = %backup.display(),
-                "database migrated v1 -> v6"
+                "database migrated v1 -> v7"
             );
             Ok(conn)
         }
@@ -466,9 +513,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v3_to_v4(&mut conn)?;
             migrate_v4_to_v5(&mut conn)?;
             migrate_v5_to_v6(&mut conn)?;
+            migrate_v6_to_v7(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v2 -> v6"
+                "database migrated v2 -> v7"
             );
             Ok(conn)
         }
@@ -477,9 +525,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v3_to_v4(&mut conn)?;
             migrate_v4_to_v5(&mut conn)?;
             migrate_v5_to_v6(&mut conn)?;
+            migrate_v6_to_v7(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v3 -> v6"
+                "database migrated v3 -> v7"
             );
             Ok(conn)
         }
@@ -487,18 +536,29 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             let started = std::time::Instant::now();
             migrate_v4_to_v5(&mut conn)?;
             migrate_v5_to_v6(&mut conn)?;
+            migrate_v6_to_v7(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v4 -> v6"
+                "database migrated v4 -> v7"
             );
             Ok(conn)
         }
         Some(5) => {
             let started = std::time::Instant::now();
             migrate_v5_to_v6(&mut conn)?;
+            migrate_v6_to_v7(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v5 -> v6"
+                "database migrated v5 -> v7"
+            );
+            Ok(conn)
+        }
+        Some(6) => {
+            let started = std::time::Instant::now();
+            migrate_v6_to_v7(&mut conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "database migrated v6 -> v7"
             );
             Ok(conn)
         }
@@ -517,6 +577,10 @@ fn create_schema(conn: &mut Connection) -> Result<(), CoreError> {
         .map_err(|e| storage(format!("创建 schema 失败: {e}")))?;
     tx.execute_batch(SCHEMA_V3_DDL)
         .map_err(|e| storage(format!("创建 v3 schema 失败: {e}")))?;
+    // v7 的两张新表。`messages` 的两列已随 `SCHEMA_V3_DDL` 建好——
+    // 新建库走的是「累积式 DDL」，与 v4/v5 的列一样直接进主 DDL。
+    tx.execute_batch(SCHEMA_V7_DDL)
+        .map_err(|e| storage(format!("创建 v7 schema 失败: {e}")))?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -766,6 +830,56 @@ fn migrate_v5_to_v6(conn: &mut Connection) -> Result<(), CoreError> {
     check_foreign_keys(&tx)?;
     tx.commit()
         .map_err(|e| storage(format!("提交 v5→v6 迁移失败: {e}")))?;
+    Ok(())
+}
+
+/// v6 → v7：新增 `contacts` / `saved_searches` 两张表；给 `messages` 补两列。
+///
+/// 这是 v0.4 的**唯一 DDL 级变更**——三项合并做一次迁移。
+/// 拆分意味着三次迁移、三次备份、三次签名比对测试，收益为零。
+///
+/// **目标版本写死 `7`**，不能写 `SCHEMA_VERSION`——否则 v6 库会被一步盖上
+/// 「已是最新」的章（v2→v3 的注释里踩过同一个坑）。
+///
+/// 幂等策略**按变更类型分开**：
+/// - 建表 → `SCHEMA_V7_DDL` 里用 `CREATE TABLE IF NOT EXISTS`；
+/// - 加列 → 用 `pragma_table_info` 判存在性，因为新建库走 `create_schema`，
+///   它的 DDL（`SCHEMA_V3_DDL`）已经带上了这两列，无条件 `ALTER` 会报
+///   duplicate column（v3→v4 就是这么处理的）。
+fn migrate_v6_to_v7(conn: &mut Connection) -> Result<(), CoreError> {
+    const TARGET: u32 = 7;
+    let tx = conn
+        .transaction()
+        .map_err(|e| storage(format!("开始 v6→v7 迁移事务失败: {e}")))?;
+
+    tx.execute_batch(SCHEMA_V7_DDL)
+        .map_err(|e| storage(format!("执行 v6→v7 建表失败: {e}")))?;
+
+    // 加列按列存在性判断，保证幂等。
+    // 注：`references` 是 SQLite 的保留关键字，列名必须加引号。
+    for column in ["in_reply_to", "\"references\""] {
+        let has: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name = ?1)",
+                params![column.trim_matches('"')],
+                |row| row.get(0),
+            )
+            .map_err(|e| storage(format!("读取 messages 列信息失败: {e}")))?;
+        if !has {
+            tx.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {column} TEXT;"))
+                .map_err(|e| storage(format!("执行 v6→v7 加列失败: {e}")))?;
+        }
+    }
+
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        params![TARGET.to_string()],
+    )
+    .map_err(|e| storage(format!("写入 schema_version 失败: {e}")))?;
+
+    check_foreign_keys(&tx)?;
+    tx.commit()
+        .map_err(|e| storage(format!("提交 v6→v7 迁移失败: {e}")))?;
     Ok(())
 }
 
