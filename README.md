@@ -4,7 +4,7 @@
 
 **用 Rust 从零实现的多账户原生邮件客户端**
 
-*自研 HTML 排版引擎 · 自研 SSE 流式解码 · 分层架构 · 604 个测试全绿*
+*自研 HTML 排版引擎 · 自研 SSE 流式解码 · 分层架构 · 684 个测试全绿*
 
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-000?logo=rust)](https://www.rust-lang.org/)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
@@ -30,7 +30,7 @@
 | 指标 | 数值 |
 |:--|:--|
 | 代码规模 | 57,500 行(不含测试) / 66,600 行(含测试) |
-| 测试 | **604 passed / 0 failed / 6 ignored** |
+| 测试 | **684 passed / 0 failed / 6 ignored** |
 | 测试文件 | 15 个集成测试 + 46 个内联测试模块 |
 | 直接依赖 | 50 个 crates(`async-imap` / `lettre` / `rusqlite` / `rodio` / `scraper`…) |
 | 外部服务 | 0(全部本地化,可完全离线使用) |
@@ -179,6 +179,10 @@ v6 换了个判据:它是**纯索引调整**(不改列),幂等靠「先 DROP 再
 - 全量摘要入库 + 正文文件缓存,断网仍可读
 - FTS5 trigram 全文检索(≥3 字命中正文)
 - 速记语法:`from:` `to:` `subject:` `has:` `is:unread` `before:` `after:`
+- 保存的搜索:条件存本地,一键重跑
+- 批量多选(Ctrl / Shift):已读、加星、删除
+- 统一收件箱:各账户收件箱的并集,带来源账户列
+- 联系人自动补全:发信时累积,只存本地
 - IDLE 实时推送,自动降级轮询
 - 草稿双向同步,冲突保留两份不静默覆盖
 - 富文本 / 纯文本 / Markdown 三视图
@@ -223,10 +227,10 @@ v6 换了个判据:它是**纯索引调整**(不改列),幂等靠「先 DROP 再
 
 ## 工程实践
 
-**测试**:604 个测试全部通过。分层架构的直接收益是测试不需要真实服务器——`me-core` 的领域规则是纯函数,毫秒级跑完;`me-proto` 用本机 mock IMAP 测协议时序;`me-sync` 注入 mock provider 测端到端编排。
+**测试**:684 个测试全部通过。分层架构的直接收益是测试不需要真实服务器——`me-core` 的领域规则是纯函数,毫秒级跑完;`me-proto` 用本机 mock IMAP 测协议时序;`me-sync` 注入 mock provider 测端到端编排。
 
 ```bash
-cargo test --workspace        # 604 passed / 6 ignored
+cargo test --workspace        # 684 passed / 6 ignored
 ```
 
 **质量门禁**:`cargo fmt` / `cargo clippy -D warnings` / `cargo deny check`(许可证白名单 + 禁 OpenSSL / native-tls)全部通过,CI 只在 `windows-latest` 上跑这四道。
