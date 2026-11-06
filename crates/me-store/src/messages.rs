@@ -247,6 +247,22 @@ pub(crate) fn body_coverage_conn(
     })
 }
 
+/// 正文补全队列：**文件夹分组内按邮件时间从新到旧**出队（`date DESC`）。
+///
+/// 早期实现是 `ORDER BY folder_id, uid` 升序，而 IMAP 的 UID 递增，等价于**从最老的邮件开始补**。
+/// 搜索价值的衰减极快——用户搜的是「最近发生的事」，而「最近的邮件」又常常是自动通知这类
+/// 用户不会主动打开、但最需要被搜到的邮件。把它们排在队尾，会让正文索引长期落后于真实时间线，
+/// 直接削弱「离线全文检索」这个核心卖点。
+///
+/// **排序必须保持 `folder_id` 在前**：执行侧（`me-sync/src/indexer.rs`）是**游程式**的——
+/// 取 `jobs[index].folder` 后只消费**连续同 folder** 的那一段，对每个文件夹做一次 `SELECT`
+/// 再批量 `FETCH`。若把 `date` 放到 `folder_id` 前面，不同文件夹的邮件会交错，
+/// 同一个文件夹会被反复 `SELECT`，IMAP 往返成倍增加。因此这里用
+/// `folder_id, date DESC, id DESC`：文件夹之间仍按 id 升序（INBOX 等主文件夹 id 小、先补），
+/// **文件夹内部严格按时间倒序**——绝大多数待补全邮件都在 INBOX，这一项即覆盖主要场景。
+///
+/// `date` 可为 NULL（邮件缺 Date 头）：SQLite 在 `DESC` 下把 NULL 排在最后，
+/// 即「日期未知的最后补」，符合直觉。`id DESC` 作 tiebreaker，保证同一天内次序稳定不抖动。
 pub(crate) fn body_jobs_conn(
     conn: &Connection,
     account: AccountId,
@@ -257,7 +273,7 @@ pub(crate) fn body_jobs_conn(
             "SELECT id, folder_id, uid FROM messages
               WHERE account_id = ?1 AND body_path IS NULL AND uid IS NOT NULL
                 AND folder_id NOT IN (SELECT id FROM folders WHERE role = 'drafts')
-              ORDER BY folder_id, uid
+              ORDER BY folder_id, date DESC, id DESC
               LIMIT ?2",
         )
         .store()?;

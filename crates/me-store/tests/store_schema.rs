@@ -1054,6 +1054,116 @@ fn body_jobs_and_coverage_respect_uid_and_filters() {
 }
 
 #[test]
+fn body_jobs_are_ordered_newest_first_by_date_not_uid() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+    // UID 递增但 date 与之相反：最新那封的 UID 最小。
+    // 旧实现按 `ORDER BY folder_id, uid` 升序会先给出 UID 最小的（最旧的）那封。
+    insert(
+        &store,
+        account,
+        inbox,
+        &[
+            msg(3, "c@example.com", "newest", 300),
+            msg(2, "b@example.com", "middle", 200),
+            msg(1, "a@example.com", "oldest", 100),
+        ],
+    );
+
+    let jobs = store.writable().body_jobs(account, 10).unwrap();
+    assert_eq!(jobs.len(), 3);
+    assert_eq!(jobs[0].uid, 3, "最新的一封应最先补全");
+    assert_eq!(jobs[1].uid, 2);
+    assert_eq!(jobs[2].uid, 1, "最旧的一封最后补全");
+}
+
+#[test]
+fn body_jobs_put_undated_last_and_keep_same_date_stable() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+    let mut undated = msg(1, "a@example.com", "no date", 0);
+    undated.date = None;
+    insert(
+        &store,
+        account,
+        inbox,
+        &[
+            msg(3, "c@example.com", "same day first inserted", 500),
+            msg(4, "d@example.com", "same day second inserted", 500),
+            undated,
+        ],
+    );
+
+    let jobs = store.writable().body_jobs(account, 10).unwrap();
+    assert_eq!(jobs.len(), 3);
+    // 同一日期内按 `id DESC`（后插入的先补，符合「最近优先」），次序稳定不抖动。
+    assert_eq!(jobs[0].uid, 4);
+    assert_eq!(jobs[1].uid, 3);
+    // 缺 Date 头的邮件排在最后（SQLite 在 DESC 下把 NULL 排末位）。
+    assert_eq!(jobs[2].uid, 1);
+}
+
+#[test]
+fn body_jobs_keep_folders_grouped_while_sorting_newest_first_inside_each() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+    let archive = upsert_folder(&store, account, "Archive", &["\\Archive"]);
+    let writable = store.writable();
+    // 两个文件夹的邮件日期刻意交错。
+    // indexer 是游程式消费：取 `jobs[index].folder` 后只吃「连续同 folder」的一段，
+    // 每段做一次 SELECT 再批量 FETCH。若排序不再按 folder_id 分组，
+    // 同一文件夹会被拆成多段 → IMAP SELECT 往返成倍增加。
+    writable
+        .insert_messages(
+            account,
+            inbox,
+            &[msg(1, "i1@example.com", "inbox old", 100)],
+            1,
+        )
+        .unwrap();
+    writable
+        .insert_messages(
+            account,
+            archive.id,
+            &[msg(1, "a1@example.com", "archive new", 900)],
+            1,
+        )
+        .unwrap();
+    writable
+        .insert_messages(
+            account,
+            inbox,
+            &[msg(2, "i2@example.com", "inbox new", 800)],
+            2,
+        )
+        .unwrap();
+
+    let jobs = writable.body_jobs(account, 10).unwrap();
+    assert_eq!(jobs.len(), 3);
+
+    // 每个 folder 只应占一段（不出现 A,B,A 这种交错）。
+    let folders: Vec<FolderId> = jobs.iter().map(|job| job.folder).collect();
+    let mut segments = 1;
+    for pair in folders.windows(2) {
+        if pair[0] != pair[1] {
+            segments += 1;
+        }
+    }
+    assert_eq!(
+        segments, 2,
+        "同一文件夹必须连续，否则 indexer 会反复 SELECT"
+    );
+
+    // 同一文件夹内部仍是时间倒序（inbox 段里 date=800 的先于 date=100）。
+    let inbox_dates: Vec<u32> = jobs
+        .iter()
+        .filter(|job| job.folder == inbox)
+        .map(|job| job.uid)
+        .collect();
+    assert_eq!(inbox_dates, vec![2, 1], "文件夹内部应按时间倒序");
+}
+
+#[test]
 fn reset_body_cache_keeps_body_path_and_fts_invariant() {
     let (_dir, store) = open_store();
     let (account, inbox) = setup(&store);
