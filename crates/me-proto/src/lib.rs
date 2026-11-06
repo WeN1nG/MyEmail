@@ -3,15 +3,18 @@
 //! 唯一允许 `use async_imap / lettre` 的 crate。对外只暴露 `me-core::port` 中的
 //! 契约类型与纯编解码函数；任何 `async-imap` / `lettre` 类型都不出现在公共签名中。
 
+pub mod ai;
 pub mod imap;
 pub mod mime;
 pub mod oauth;
 pub mod qweather;
 pub mod smtp;
+pub mod sse;
 pub mod utf7;
 
 mod bodystructure;
 
+pub use ai::HttpAiProvider;
 pub use imap::{ImapConnection, ProtoFactory, connect_imap};
 pub use me_core::port::ImapCapabilities;
 pub use mime::{
