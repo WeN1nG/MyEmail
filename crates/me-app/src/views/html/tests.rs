@@ -602,3 +602,60 @@ fn large_table_parse_performance() {
         "large table parse too slow: {elapsed:?}"
     );
 }
+
+/// 性能基准：**CSS 规则很多**的邮件（营销邮件常见形态）。
+///
+/// 与 `large_html_parse` 互补：那封邮件**没有 `<style>` 块**，测的是 HTML 解析与排版；
+/// 这封邮件有 450+ 条 CSS 规则，测的是**样式匹配**的开销 —— 分桶前的实现
+/// 是「每个元素扫全部规则」，成本 O(规则数 × 元素数)。
+#[test]
+#[ignore = "性能基准：cargo test -p me-app large_css_parse --release -- --ignored --nocapture"]
+fn large_css_parse_performance() {
+    let mut css = String::new();
+    for index in 0..150 {
+        css.push_str(&format!(
+            ".blk-{index} {{ color: #333333; font-size: {}px; }}\n",
+            12 + index % 8
+        ));
+        css.push_str(&format!(
+            ".wrap-{index} span.c-{index} {{ margin-top: {}px; }}\n",
+            index % 10
+        ));
+        css.push_str(&format!(
+            "div.sec-{index} > p.t-{index} {{ padding: {}px; }}\n",
+            index % 5
+        ));
+    }
+    css.push_str("body { margin: 0px; }\n");
+    css.push_str("a:hover { color: #0000ff; }\n");
+    css.push_str("[data-x] { color: #111111; }\n");
+
+    let mut body = String::new();
+    for index in 0..5_000 {
+        body.push_str(&format!(
+            "<div class='wrap-{} sec-{}'><p class='t-{} c-{} blk-{}'>line {index}</p></div>",
+            index % 50,
+            index % 37,
+            index % 23,
+            index % 17,
+            index % 11
+        ));
+    }
+    let html = format!("<html><head><style>{css}</style></head><body>{body}</body></html>");
+
+    let started = Instant::now();
+    let rendered = render_html(&html).expect("render large css html");
+    let elapsed = started.elapsed();
+    println!(
+        "HTML {} bytes, {} css rules -> {} blocks in {:?}",
+        html.len(),
+        css.lines().count(),
+        count_blocks(&rendered.blocks),
+        elapsed
+    );
+    assert!(count_blocks(&rendered.blocks) > 1_000);
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "large css parse too slow: {elapsed:?}"
+    );
+}

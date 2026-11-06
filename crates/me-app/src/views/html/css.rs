@@ -232,18 +232,100 @@ struct Rule {
     specificity: (u16, u16, u16),
     order: usize,
     declarations: Vec<Declaration>,
+    /// 桶键（见 [`RuleKey`]）。`None` = 取不出必要条件，对每个元素都要试。
+    key: Option<RuleKey>,
+}
+
+/// 规则的**桶键**：命中该选择器的**必要条件**。
+///
+/// 键只用来做**候选筛选**（跳过一定不匹配的规则），最终是否匹配仍由
+/// `Selector::matches` 决定 —— 所以键取错最多是「多试几条」，不会漏匹配。
+///
+/// 大小写：键一律转小写存储与查找。这让筛选**偏宽**（保守方向）：
+/// 例如规则 `.Foo` 与元素 `class="foo"` 会落进同一个桶，但 `matches()` 会否掉它。
+/// 反过来若按大小写精确匹配，一旦浏览器按 quirks 模式放宽 class 匹配就会**漏掉**规则。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RuleKey {
+    /// `#id`
+    Id(String),
+    /// `.class`
+    Class(String),
+    /// 标签名
+    Tag(String),
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
     rules: Vec<Rule>,
+    /// 规则下标，按 `(specificity, order)` 排好序 —— 即 CSS 层叠顺序。
+    /// 排一次即可，不必每个元素重排。
+    ordered: Vec<u32>,
+    /// 取不出键的规则：对每个元素都要试。
+    universal: Vec<u32>,
+    /// 按键分桶，桶内是 `ordered` 里的下标（已按层叠顺序递增）。
+    buckets: std::collections::HashMap<RuleKey, Vec<u32>>,
 }
 
 impl Stylesheet {
     pub fn parse(css: &str) -> Self {
         let mut sheet = Self::default();
         sheet.parse_block(&strip_comments(css));
+        sheet.build_index();
         sheet
+    }
+
+    /// 排序 + 分桶。解析完调一次。
+    fn build_index(&mut self) {
+        let mut ordered: Vec<u32> = (0..self.rules.len() as u32).collect();
+        ordered.sort_by_key(|&index| {
+            let rule = &self.rules[index as usize];
+            (rule.specificity, rule.order)
+        });
+        self.ordered = ordered;
+
+        // 桶里存的是**层叠序号**（在 `ordered` 中的位置），不是规则下标。
+        // 层叠序号递增 = 层叠顺序递增；规则下标则与层叠无关（源文件里靠前的
+        // 规则可能特异度更低）。混用会让高特异度的规则被低特异度的覆盖。
+        let mut universal = Vec::new();
+        let mut buckets: std::collections::HashMap<RuleKey, Vec<u32>> =
+            std::collections::HashMap::new();
+        for (rank, &rule_index) in self.ordered.iter().enumerate() {
+            let rule = &self.rules[rule_index as usize];
+            match &rule.key {
+                Some(key) => {
+                    buckets.entry(key.clone()).or_default().push(rank as u32);
+                }
+                None => universal.push(rank as u32),
+            }
+        }
+        self.universal = universal;
+        self.buckets = buckets;
+    }
+
+    /// 把可能命中该元素的规则收集到 `scratch`（层叠下标）。
+    ///
+    /// 只收「键命中」的桶 + 无键规则；**最终判定仍走 `Selector::matches`**。
+    /// 返回的候选需要按层叠顺序应用，故调用方要排序（桶内已递增，跨桶需归并）。
+    fn collect_candidates(&self, element: &ElementRef<'_>, scratch: &mut Vec<u32>) {
+        scratch.clear();
+        scratch.extend_from_slice(&self.universal);
+
+        if let Some(id) = element.value().id()
+            && let Some(bucket) = self.buckets.get(&RuleKey::Id(id.to_lowercase()))
+        {
+            scratch.extend_from_slice(bucket);
+        }
+        for class in element.value().classes() {
+            if let Some(bucket) = self.buckets.get(&RuleKey::Class(class.to_lowercase())) {
+                scratch.extend_from_slice(bucket);
+            }
+        }
+        if let Some(bucket) = self
+            .buckets
+            .get(&RuleKey::Tag(element.value().name().to_lowercase()))
+        {
+            scratch.extend_from_slice(bucket);
+        }
     }
 
     fn parse_block(&mut self, css: &str) {
@@ -292,19 +374,30 @@ impl Stylesheet {
                     specificity: selector_specificity(part),
                     order,
                     declarations: declarations.clone(),
+                    key: rule_key(part),
                 });
             }
         }
     }
 
     pub fn apply(&self, style: &mut ComputedStyle, element: &ElementRef<'_>) {
-        let mut matched: Vec<&Rule> = self
-            .rules
-            .iter()
-            .filter(|rule| rule.selector.matches(element))
-            .collect();
-        matched.sort_by_key(|rule| (rule.specificity, rule.order));
-        for rule in matched {
+        // 先按桶收候选，再按层叠顺序应用。
+        //
+        // 候选来自「键命中」的桶 + 无键规则；**最终判定仍走 `Selector::matches`** ——
+        // 桶只是「可能命中」的快速筛子，键取错只会多试几条，不会漏匹配。
+        let mut candidates: Vec<u32> = Vec::new();
+        self.collect_candidates(element, &mut candidates);
+        if candidates.is_empty() {
+            return;
+        }
+        // 候选存的是**层叠序号**，数值递增即层叠顺序递增；跨桶归并后排序即可。
+        candidates.sort_unstable();
+        candidates.dedup();
+        for rank in candidates {
+            let rule = &self.rules[self.ordered[rank as usize] as usize];
+            if !rule.selector.matches(element) {
+                continue;
+            }
             for declaration in &rule.declarations {
                 apply_declaration(style, &declaration.name, &declaration.value);
             }
@@ -933,6 +1026,126 @@ fn split_selector_list(prelude: &str) -> Vec<&str> {
     parts
 }
 
+/// 从选择器文本取出**桶键**（命中该选择器的必要条件）。
+///
+/// 只看**最右一段**（最后一个组合符之后的部分）—— 组合符左边约束的是祖先，
+/// 不是被匹配的元素本身。对 `div p.foo` 而言，元素必须同时满足 `p` 与 `.foo`，
+/// 两者都是必要条件；取其中**更具体**的那个（id > class > 标签）做键，
+/// 筛选面更窄、候选更少。
+///
+/// 返回 `None` 表示**取不出可靠的必要条件**（含伪类、属性选择器、通配等），
+/// 这类规则进「通用桶」，每个元素都要试 —— 宁可多试，也不能漏。
+///
+/// 常见形态：
+/// - `.foo` → `Class("foo")`
+/// - `#bar` → `Id("bar")`
+/// - `p` → `Tag("p")`
+/// - `div p.foo` → `Class("foo")`
+/// - `div > p` → `Tag("p")`
+/// - `a:hover` → `None`（伪类不猜）
+fn rule_key(selector: &str) -> Option<RuleKey> {
+    let segment = rightmost_segment(selector.trim())?;
+    compound_key(segment)
+}
+
+/// 取选择器**最右一段**（最后一个顶层组合符之后的部分）。
+///
+/// 组合符（后代 / 子 / 相邻 / 兄弟）左边的部分约束的是**祖先**，
+/// 与被匹配元素自身的身份无关，不能拿来当桶键。
+fn rightmost_segment(selector: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (index, ch) in selector.char_indices() {
+        match ch {
+            '"' | '\'' if quote.is_none() => quote = Some(ch),
+            c if Some(c) == quote => quote = None,
+            '[' | '(' if quote.is_none() => depth += 1,
+            ']' | ')' if quote.is_none() => depth -= 1,
+            // 顶层逗号 = 选择器组（`.a, .b`）。各段是「或」关系，
+            // 任何一段的键都不能代表整条规则 —— 整体进通用桶。
+            ',' if depth == 0 && quote.is_none() => return None,
+            // 顶层组合符：切断，左边是祖先约束。
+            ' ' | '\t' | '\n' | '\r' | '>' | '+' | '~' if depth == 0 && quote.is_none() => {
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let segment = selector[start..].trim();
+    if segment.is_empty() {
+        None
+    } else {
+        Some(segment)
+    }
+}
+
+/// 取一个**复合选择器**（compound selector）里的桶键。
+///
+/// 复合选择器是若干简单选择器的串联（如 `p.foo#bar`）。每个简单选择器都是
+/// 命中该复合选择器的**必要条件**，取最具体的那个（id > class > 标签）。
+///
+/// 遇到伪类（`:`）、属性选择器（`[`）、通配（`*`）、转义（`\`）等一律返回
+/// `None`：这些会让「必要条件」推断变得不可靠，宁可放进通用桶。
+fn compound_key(segment: &str) -> Option<RuleKey> {
+    let bytes = segment.as_bytes();
+    let mut pos = 0usize;
+    let mut id: Option<&str> = None;
+    let mut class: Option<&str> = None;
+    let mut tag: Option<&str> = None;
+    let mut first = true;
+
+    while pos < bytes.len() {
+        let kind = match bytes[pos] {
+            b'#' => b'#',
+            b'.' => b'.',
+            c if c.is_ascii_alphanumeric() || c == b'-' || c == b'_' => b't',
+            // 伪类 / 属性 / 通配 / 转义 / 命名空间 —— 不猜。
+            _ => return None,
+        };
+        if kind == b't' && !first {
+            // 标签名只能出现在复合选择器最前面。
+            return None;
+        }
+        // 标签名的标识符**从当前位置开始**；`.`/`#` 之后才开始。
+        let name_start = if kind == b't' { pos } else { pos + 1 };
+        pos = name_start;
+        while pos < bytes.len()
+            && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'-' || bytes[pos] == b'_')
+        {
+            pos += 1;
+        }
+        let name = &segment[name_start..pos];
+        if name.is_empty() {
+            return None;
+        }
+        match kind {
+            b'#' => {
+                if id.is_some() {
+                    return None;
+                }
+                id = Some(name);
+            }
+            b'.' => {
+                if class.is_some() {
+                    return None;
+                }
+                class = Some(name);
+            }
+            _ => tag = Some(name),
+        }
+        first = false;
+    }
+
+    if let Some(id) = id {
+        Some(RuleKey::Id(id.to_lowercase()))
+    } else if let Some(class) = class {
+        Some(RuleKey::Class(class.to_lowercase()))
+    } else {
+        tag.map(|tag| RuleKey::Tag(tag.to_lowercase()))
+    }
+}
+
 /// 近似 CSS specificity：(id, class/attr/pseudo, type)。
 fn selector_specificity(selector: &str) -> (u16, u16, u16) {
     let mut ids = 0u16;
@@ -1009,5 +1222,151 @@ mod tests {
         let id = selector_specificity("#a");
         assert!(id > class);
         assert!(selector_specificity("div p") > selector_specificity("p"));
+    }
+
+    // -- 桶键（rule_key）与分桶匹配 --------------------------------------
+
+    /// 参考实现：**不做任何分桶**，逐条规则试匹配。
+    ///
+    /// 分桶版必须与它给出完全相同的计算样式 —— 这是分桶正确性的判据。
+    fn apply_reference(sheet: &Stylesheet, style: &mut ComputedStyle, element: &ElementRef<'_>) {
+        let mut matched: Vec<&Rule> = sheet
+            .rules
+            .iter()
+            .filter(|rule| rule.selector.matches(element))
+            .collect();
+        matched.sort_by_key(|rule| (rule.specificity, rule.order));
+        for rule in matched {
+            for declaration in &rule.declarations {
+                apply_declaration(style, &declaration.name, &declaration.value);
+            }
+        }
+    }
+
+    /// 桶键必须是「命中该选择器的必要条件」：凡匹配的元素，都必须带这个键。
+    ///
+    /// 这条不变量保证分桶**只会少试规则、不会漏规则**。
+    #[test]
+    fn rule_key_is_a_necessary_condition() {
+        let cases = [
+            (".foo", Some(RuleKey::Class("foo".into()))),
+            ("#bar", Some(RuleKey::Id("bar".into()))),
+            ("p", Some(RuleKey::Tag("p".into()))),
+            ("div p.foo", Some(RuleKey::Class("foo".into()))),
+            ("div > p", Some(RuleKey::Tag("p".into()))),
+            ("DIV P", Some(RuleKey::Tag("p".into()))),
+            // 有伪类/属性/通配 —— 取不出可靠必要条件，进通用桶。
+            ("a:hover", None),
+            ("[data-x]", None),
+            ("*", None),
+            (".a, .b", None),
+        ];
+        for (selector, expected) in cases {
+            assert_eq!(
+                rule_key(selector),
+                expected,
+                "选择器 {selector:?} 的桶键不对"
+            );
+        }
+    }
+
+    /// 收集文档里所有元素（递归遍历）。
+    fn collect_elements(document: &scraper::Html) -> Vec<ElementRef<'_>> {
+        fn walk<'a>(element: ElementRef<'a>, out: &mut Vec<ElementRef<'a>>) {
+            out.push(element);
+            for child in element.children() {
+                if let Some(child_element) = ElementRef::wrap(child) {
+                    walk(child_element, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(document.root_element(), &mut out);
+        out
+    }
+
+    /// 分桶匹配与逐条扫描必须给出**完全相同**的计算样式。
+    ///
+    /// 覆盖各种选择器形态（标签 / 类 / id / 后代 / 子代 / 伪类 / 属性 / 逗号组），
+    /// 以及大小写不同的类名与 id —— 后者是关键：桶键统一转小写，
+    /// 若分桶改成精确匹配就会漏规则。
+    #[test]
+    fn bucketed_apply_matches_reference_scan() {
+        let css = "\
+            p { color: #111111; }\
+            .foo { color: #222222; }\
+            #bar { color: #333333; }\
+            div p.foo { color: #444444; }\
+            div > span { color: #555555; }\
+            a:hover { color: #666666; }\
+            [data-tag] { color: #777777; }\
+            .Foo { color: #888888; }\
+            #Bar { color: #999999; }\
+            table td { font-size: 13px; }\
+            * { margin: 0px; }\
+        ";
+        let sheet = Stylesheet::parse(css);
+        let html = "\
+            <div id='wrap'>\
+              <p class='foo'>one</p>\
+              <p class='Foo'>two</p>\
+              <p>three</p>\
+              <span class='foo'>four</span>\
+              <a href='#' data-tag='x'>five</a>\
+              <table><tr><td>six</td></tr></table>\
+              <div id='bar'>seven</div>\
+            </div>";
+        let document = scraper::Html::parse_document(html);
+        let mut compared = 0;
+        for element in collect_elements(&document) {
+            let mut reference = ComputedStyle::default();
+            apply_reference(&sheet, &mut reference, &element);
+            let mut bucketed = ComputedStyle::default();
+            sheet.apply(&mut bucketed, &element);
+            assert_eq!(
+                reference,
+                bucketed,
+                "分桶结果与逐条扫描不一致：{:?}",
+                element.value().name()
+            );
+            compared += 1;
+        }
+        assert!(
+            compared >= 10,
+            "比对的元素过少（{compared}），样例可能没覆盖到"
+        );
+    }
+
+    /// 大规则表下分桶仍须与参考实现一致（桶多、命中分散）。
+    #[test]
+    fn bucketed_apply_matches_reference_on_many_rules() {
+        let mut css = String::new();
+        for index in 0..200 {
+            css.push_str(&format!(".c{index} {{ color: #0000{index:02x}; }}\n"));
+            css.push_str(&format!(
+                "p.c{index} {{ font-size: {}px; }}\n",
+                index % 20 + 10
+            ));
+            css.push_str(&format!("div span.c{index} {{ margin-top: {index}px; }}\n"));
+        }
+        let sheet = Stylesheet::parse(&css);
+        let mut html = String::from("<div><span>");
+        for index in 0..300 {
+            html.push_str(&format!("<p class='c{index}'>x</p>"));
+        }
+        html.push_str("</span></div>");
+        let document = scraper::Html::parse_document(&html);
+        for element in collect_elements(&document) {
+            let mut reference = ComputedStyle::default();
+            apply_reference(&sheet, &mut reference, &element);
+            let mut bucketed = ComputedStyle::default();
+            sheet.apply(&mut bucketed, &element);
+            assert_eq!(
+                reference,
+                bucketed,
+                "规则较多时分桶结果与逐条扫描不一致：{:?}",
+                element.value().name()
+            );
+        }
     }
 }

@@ -795,7 +795,7 @@ fn decode_svg(bytes: &[u8]) -> Option<egui::ColorImage> {
     if !looks_like_svg(bytes) {
         return None;
     }
-    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
+    let tree = resvg::usvg::Tree::from_data(bytes, &svg_options()).ok()?;
     let size = tree.size().to_int_size();
     let width = size.width().max(1);
     let height = size.height().max(1);
@@ -820,6 +820,33 @@ fn decode_svg(bytes: &[u8]) -> Option<egui::ColorImage> {
     ))
 }
 
+/// SVG 解析选项。**必须带字体库**，否则 `<text>` 会被静默丢弃
+/// （`usvg` 的 `text::convert()` 解析不到字体时返回 `None`，
+/// `parser/text.rs` 直接 `return`，该节点根本不会进渲染树）。
+///
+/// `usvg::Options::default()` 的 `fontdb` 是**空库**——它只设了 4 个默认族名，
+/// 不加载任何字体。usvg/resvg 的**库代码从不自动调** `load_system_fonts()`，
+/// 只有它们自带的 CLI 才调（`resvg/src/main.rs`、`usvg/src/main.rs`）。
+/// 所以这里必须自己填。
+///
+/// 系统字体扫描（Windows 下是 `C:\Windows\Fonts` + 用户字体目录）**只做一次**，
+/// 之后复用同一份 `Arc`——`Options::default()` 每次都会新建一个空库，
+/// 逐封邮件重扫系统字体目录会明显拖慢阅读页。
+fn svg_options() -> resvg::usvg::Options<'static> {
+    static FONTS: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+
+    let fonts = FONTS.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        std::sync::Arc::new(db)
+    });
+
+    resvg::usvg::Options {
+        fontdb: fonts.clone(),
+        ..Default::default()
+    }
+}
 fn looks_like_svg(bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(2048)];
     let Ok(text) = std::str::from_utf8(head) else {
@@ -877,6 +904,32 @@ mod tests {
         ));
         assert!(!looks_like_svg(b"\x89PNG\r\n\x1a\n"));
         assert!(!looks_like_svg(b"<html><body>no</body></html>"));
+    }
+
+    /// 回归测试：SVG 里的 `<text>` 必须真的被渲染出来。
+    ///
+    /// 曾经的 bug：`decode_svg` 传的是 `usvg::Options::default()`，它的 `fontdb`
+    /// 是**空库**（`usvg` 的库代码从不自动 `load_system_fonts()`，只有 CLI 才调）。
+    /// 字体解析不到时 `text::convert()` 返回 `None`，`usvg` 的 `parser/text.rs`
+    /// 直接丢弃该节点 —— **`<text>` 被静默吞掉，签名图里的文字凭空消失**。
+    #[test]
+    fn renders_svg_text_content() {
+        // 浅色底 + 深色文字：文字像素必须比纯底色深。
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40">
+            <rect width="120" height="40" fill="#eeeeee"/>
+            <text x="6" y="26" font-size="20" fill="#202020">Hello</text>
+        </svg>"##;
+        let image = decode_svg(svg).expect("含文字的 SVG 应能光栅化");
+        assert_eq!(image.size, [120, 40]);
+        let dark = image
+            .pixels
+            .iter()
+            .filter(|pixel| pixel.r() < 120 && pixel.g() < 120 && pixel.b() < 120)
+            .count();
+        assert!(
+            dark > 0,
+            "SVG 的 <text> 没有渲染出任何文字像素（字体库为空会让 text 节点被静默丢弃）"
+        );
     }
 
     #[test]
