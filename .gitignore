@@ -222,3 +222,4 @@ venv/
 /.aider*
 /.plan/
 /plans/
+/.perf-audit
