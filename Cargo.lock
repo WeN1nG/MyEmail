@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "me-app"
-version = "0.3.0-dev"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "me-core"
-version = "0.3.0-dev"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "me-proto"
-version = "0.3.0-dev"
+version = "0.3.0"
 dependencies = [
  "async-imap",
  "base64 0.23.1",
@@ -2817,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "me-store"
-version = "0.3.0-dev"
+version = "0.3.0"
 dependencies = [
  "dirs",
  "flate2",
@@ -2826,6 +2826,7 @@ dependencies = [
  "r2d2",
  "r2d2_sqlite",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",
@@ -2834,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "me-sync"
-version = "0.3.0-dev"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "keyring",
