@@ -765,4 +765,103 @@ mod tests {
         let state = UiState::default();
         assert!(state.search.is_empty_query());
     }
+
+    // --- 离屏渲染 ---
+
+    /// 跑一帧，收集所有绘制出来的文本。
+    fn run_frame(mut body: impl FnMut(&egui::Context)) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), &mut body);
+        let output = ctx.run(input(), body);
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<String>) {
+        if let egui::Shape::Text(text) = shape {
+            out.push(text.galley.text().to_string());
+        }
+        if let egui::Shape::Vec(shapes) = shape {
+            for s in shapes {
+                collect_texts(s, out);
+            }
+        }
+    }
+
+    #[test]
+    fn conditions_panel_renders_the_four_new_controls() {
+        // 条件面板必须真的画出来——后端支持九个条件，UI 只暴露三个是缺口。
+        let mut state = UiState::default();
+        state.search.show_filters = true;
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                toolbar(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        let joined = texts.join("\n");
+        assert!(joined.contains("发件人："), "缺少发件人条件");
+        assert!(joined.contains("收件人："), "缺少收件人条件");
+        assert!(joined.contains("主题："), "缺少主题条件");
+        assert!(joined.contains("仅未读"), "缺少仅未读条件");
+    }
+
+    #[test]
+    fn chips_are_rendered_with_deletable_labels() {
+        // 条件标签要真的出现在界面上，且带删除标记。
+        let mut state = UiState::default();
+        state.search.text = "from:zhang".to_string();
+        state.search.sync_parsed(now_unix());
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                toolbar(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("发件人含 zhang"),
+            "条件标签未渲染，实际文本：{joined}"
+        );
+        assert!(joined.contains('×'), "条件标签应带删除标记");
+    }
+
+    #[test]
+    fn unknown_syntax_fragment_is_shown_but_not_blocking() {
+        // 拼错的片段要有提示，同时搜索照常可用。
+        let mut state = UiState::default();
+        state.search.text = "fromm:zhang".to_string();
+        state.search.sync_parsed(now_unix());
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                toolbar(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("无法识别"),
+            "未知片段应给出提示，实际文本：{joined}"
+        );
+    }
+
+    #[test]
+    fn search_hint_mentions_the_syntax() {
+        // 搜索框的提示文案要告诉用户支持哪些语法。
+        let mut state = UiState::default();
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                toolbar(&mut state, &mut Vec::new(), ui);
+            });
+        });
+        let joined = texts.join("\n");
+        assert!(joined.contains("from:"), "提示未提及速记语法：{joined}");
+    }
 }

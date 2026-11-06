@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 项目概览
 
 MyEmail 是 Rust + egui/eframe 的原生桌面邮件客户端：多账户 IMAP 收信、SMTP 发信、SQLite 全量摘要 + 文件正文缓存、FTS5 离线全文检索。**v0.1、v0.2 已闭环**；当前为 **v0.3（0.3.0）**：schema **v5**，在邮件主链路上新增**日历 / 天气 / AI 对话 / 音乐播放器**四个页面（顶部页签 `邮件 / 日历 / 天气 / AI / 音乐 / 账户 / 设置`，`Ctrl+1..7` 直达）。
-自动化测试 **600 passed / 6 ignored**（`cargo test --workspace` 实测）；`cargo deny check` 已在本机通过。**尚未做**真实 Gmail/Outlook 授权、真实天气/AI 密钥、真机音频与 Docker E2E 的人工验收——见 [doc/versiondoc/v03收尾.md](doc/versiondoc/v03收尾.md) §7。
+自动化测试 **604 passed / 6 ignored**（`cargo test --workspace` 实测）；`cargo deny check` 已在本机通过。**尚未做**真实 Gmail/Outlook 授权、真实天气/AI 密钥、真机音频与 Docker E2E 的人工验收——见 [doc/versiondoc/v03收尾.md](doc/versiondoc/v03收尾.md) §7。
 
 v0.3 的**未交付项**（写代码前先看，别当成已实现）：`.ics` 导入导出与邮件 `text/calendar` 邀请导入、系统通知（只有应用内 toast）、日历「仅此次」编辑界面、四个模块的 `feature_*` 开关接线（`FEATURE_CALENDAR` / `FEATURE_AI` 只有常量、无读取方）、AI 会话滚动分页（当前固定拉 100 条）。收尾进度见 [doc/versiondoc/v3收尾项清单.md](doc/versiondoc/v3收尾项清单.md)。
 
