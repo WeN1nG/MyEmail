@@ -132,6 +132,8 @@ struct MockAiProvider {
     message_counts: Mutex<Vec<usize>>,
     /// 每轮请求用的 `(protocol, model)`（用于验证切档案真的换了参数）。
     targets: Mutex<Vec<(String, String)>>,
+    /// 每轮请求里**用户消息**的文本（用于验证引擎给模型说了什么）。
+    message_bodies: Mutex<Vec<String>>,
 }
 
 impl MockAiProvider {
@@ -142,6 +144,7 @@ impl MockAiProvider {
             tool_names: Mutex::new(Vec::new()),
             message_counts: Mutex::new(Vec::new()),
             targets: Mutex::new(Vec::new()),
+            message_bodies: Mutex::new(Vec::new()),
         })
     }
 }
@@ -175,6 +178,19 @@ impl AiProvider for MockAiProvider {
                 request.config.kind.as_str().to_string(),
                 request.config.model.clone(),
             ));
+        }
+        // 记下这一轮用户角色的全部文本：引擎给模型的提示都在这里。
+        let body = request
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                me_core::ai::AiWireMessage::User { content } => Some(content.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Ok(mut bodies) = self.message_bodies.lock() {
+            bodies.push(body);
         }
         let turn = self.script.lock().expect("script").pop_front();
         Box::pin(async move {
@@ -2588,4 +2604,100 @@ async fn plan_events_are_emitted() {
 
     assert!(attempts >= 1, "每次尝试都要发事件");
     assert!(finished, "收尾要发 AiPlanFinished");
+}
+
+/// 跨轮延续：上一轮没做完的清单，第二轮要能看到「还剩哪几步」。
+///
+/// 没有这个，用户说「继续」时模型会从头规划一遍，用户会以为自己前面做的白费了。
+#[tokio::test]
+async fn unfinished_plan_carries_over_to_the_next_turn() {
+    let (_dir, store) = open();
+    // 第一轮：清单里两步，但模型只做了第一步就停。
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(tool_call(
+            "plan1",
+            AiToolName::PlanSubmit,
+            json!({
+                "motive": "分两步查",
+                "goal": "把重要的邮件整理出来",
+                "steps": [
+                    {"id": 1, "title": "检索星标邮件", "kind": "tool", "capability": "mail",
+                     "tool": "email_search", "args": {"flagged_only": true}, "expect": "列出星标邮件"},
+                    {"id": 2, "title": "读第一封正文", "kind": "tool", "capability": "mail",
+                     "tool": "mail_read", "args": {"message_id": 1}, "expect": "拿到正文"}
+                ]
+            }),
+        )),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "执行第 1 步", "step_id": 1, "flagged_only": true }),
+        )),
+        // 第一轮到这里就停了（清单还有第 2 步没做）。
+        Turn::text("找到了 1 封星标邮件，正文还没读。"),
+        // 第二轮：用户说「继续」。
+        Turn::with_tool(tool_call(
+            "plan2",
+            AiToolName::PlanSubmit,
+            json!({
+                "motive": "接着上一步做",
+                "goal": "把重要的邮件整理出来",
+                "steps": [
+                    {"id": 1, "title": "读第一封正文", "kind": "tool", "capability": "mail",
+                     "tool": "mail_read", "args": {"message_id": 1}, "expect": "拿到正文"}
+                ]
+            }),
+        )),
+        Turn::with_tool(tool_call(
+            "c2",
+            AiToolName::MailRead,
+            json!({ "motive": "执行第 1 步", "step_id": 1, "message_id": 1 }),
+        )),
+        Turn::text("正文读完了。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    // 第一轮。
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "帮我整理重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    // 第二轮：用户说「继续」。
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "继续".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    // 等第二轮跑完。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        else {
+            continue;
+        };
+        if let Event::AiMessageCompleted { .. } = event {
+            break;
+        }
+    }
+
+    // 直接查第二轮的请求：MockAiProvider 记录了每轮的消息内容。
+    let rounds = provider.message_bodies.lock().unwrap().clone();
+    assert!(
+        rounds
+            .iter()
+            .any(|body| body.contains("还没做完的清单") && body.contains("读第一封正文")),
+        "第二轮要告诉模型上一轮还剩什么：{rounds:?}"
+    );
 }

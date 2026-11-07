@@ -404,6 +404,12 @@ pub struct PlanStep {
     /// 0 命中时的策略。
     #[serde(default)]
     pub on_empty: OnEmpty,
+    /// 这一步累计花掉的毫秒数（所有尝试之和）。
+    ///
+    /// 用来调 `MAX_STEP_ATTEMPTS` 这类常量：哪一步最慢、哪一步最常失败，
+    /// 光看成功率看不出来，得看时间。
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 impl PlanStep {
@@ -426,6 +432,7 @@ impl PlanStep {
             evidence: None,
             failure: None,
             on_empty: OnEmpty::Narrow,
+            duration_ms: 0,
         }
     }
 
@@ -600,6 +607,78 @@ impl Plan {
 
     pub fn has_open_steps(&self) -> bool {
         self.open_steps() > 0
+    }
+
+    /// 这份清单是不是「上一轮没做完、可以接着做」的。
+    ///
+    /// 判据是**还有没终结的步**：全做完的清单不需要续，用户再问就是新需求。
+    /// 取消掉的清单也不算——那是用户明确放弃了。
+    pub fn is_resumable(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step.status, PlanStatus::Pending | PlanStatus::Running))
+    }
+
+    /// 还没做完的步（给「继续上一条」的提示用）。
+    pub fn unfinished(&self) -> Vec<&PlanStep> {
+        self.steps
+            .iter()
+            .filter(|step| matches!(step.status, PlanStatus::Pending | PlanStatus::Running))
+            .collect()
+    }
+
+    /// 把一次尝试的耗时记到某一步上。
+    pub fn add_duration(&mut self, id: u8, millis: u64) {
+        if let Some(step) = self.steps.iter_mut().find(|step| step.id == id) {
+            step.duration_ms = step.duration_ms.saturating_add(millis);
+        }
+    }
+
+    /// 清单的统计摘要：给日志与「调参」用。
+    ///
+    /// 三件事：总耗时、最慢的一步、失败率。
+    /// 失败率特别有用——它直接回答「`MAX_STEP_ATTEMPTS` 是不是给少了」。
+    pub fn stats(&self) -> PlanStats {
+        let mut total_ms = 0u64;
+        let mut slowest: Option<(u8, &str, u64)> = None;
+        let mut failed = 0usize;
+        let mut retried = 0usize;
+        for step in &self.steps {
+            total_ms = total_ms.saturating_add(step.duration_ms);
+            if step.status == PlanStatus::Failed {
+                failed += 1;
+            }
+            if step.attempts > 1 {
+                retried += 1;
+            }
+            let candidate = (step.id, step.title.as_str(), step.duration_ms);
+            if slowest.is_none_or(|(_, _, current)| candidate.2 > current) {
+                slowest = Some(candidate);
+            }
+        }
+        let total = self.steps.len();
+        PlanStats {
+            total_steps: total,
+            done_steps: self.done_steps(),
+            failed_steps: failed,
+            retried_steps: retried,
+            total_ms,
+            slowest: slowest.map(|(id, title, ms)| (id, title.to_string(), ms)),
+            failure_rate: if total == 0 {
+                0.0
+            } else {
+                failed as f64 / total as f64
+            },
+        }
+    }
+
+    /// 一句话摘要：还剩哪几步没做。
+    pub fn unfinished_summary(&self) -> String {
+        self.unfinished()
+            .iter()
+            .map(|step| format!("第 {} 步「{}」", step.id, step.title))
+            .collect::<Vec<_>>()
+            .join("、")
     }
 
     /// `(已结束, 总数)`，给「已完成 4 步 · 1 步未完成」这类摘要用。
@@ -1118,6 +1197,45 @@ pub fn relax_args(args: &serde_json::Value) -> Option<serde_json::Value> {
     }
     // 没有可放宽的了。
     None
+}
+
+/// 清单的统计摘要。
+///
+/// 这些数字是给**调参**用的，不是给用户看的：它们回答
+/// 「`MAX_STEP_ATTEMPTS` 是不是给少了」「哪一步最慢」这类问题。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanStats {
+    pub total_steps: usize,
+    pub done_steps: usize,
+    pub failed_steps: usize,
+    /// 试过不止一次的步数。
+    pub retried_steps: usize,
+    /// 全部步骤累计耗时（毫秒）。
+    pub total_ms: u64,
+    /// 最慢的一步：`(步号, 标题, 毫秒)`。
+    pub slowest: Option<(u8, String, u64)>,
+    /// 失败步占比（0.0 ~ 1.0）。
+    pub failure_rate: f64,
+}
+
+impl PlanStats {
+    /// 一行摘要，给日志看。
+    pub fn summary(&self) -> String {
+        let slowest = match &self.slowest {
+            Some((id, title, ms)) => format!("最慢第 {id} 步「{title}」{ms}ms"),
+            None => "无耗时数据".to_string(),
+        };
+        format!(
+            "{}/{} 步完成，{} 步失败，{} 步重试过，失败率 {:.0}%，累计 {}ms，{}",
+            self.done_steps,
+            self.total_steps,
+            self.failed_steps,
+            self.retried_steps,
+            self.failure_rate * 100.0,
+            self.total_ms,
+            slowest
+        )
+    }
 }
 
 /// 一次执行的归类结果。引擎用它推进步骤状态，不用自己数 attempts。
@@ -2640,6 +2758,78 @@ mod tests {
         );
         assert_eq!(plan.steps[0].attempts, 2);
         assert_eq!(plan.steps[0].status, PlanStatus::Done);
+    }
+
+    // ---- 统计与跨轮延续 ----
+
+    #[test]
+    fn stats_report_failures_and_slowest_step() {
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "目标",
+                vec![
+                    tool_step(1, "检索", AiToolName::EmailSearch, json!({ "days": 7 })),
+                    tool_step(
+                        2,
+                        "读正文",
+                        AiToolName::MailRead,
+                        json!({ "message_id": 1 }),
+                    ),
+                    tool_step(3, "归纳", AiToolName::EmailSearch, json!({ "days": 3 })),
+                ],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+        plan.add_duration(1, 100);
+        plan.add_duration(2, 900);
+        plan.add_duration(3, 50);
+        plan.steps[0].status = PlanStatus::Done;
+        plan.steps[1].status = PlanStatus::Failed;
+        plan.steps[2].attempts = 2;
+
+        let stats = plan.stats();
+        assert_eq!(stats.total_steps, 3);
+        assert_eq!(stats.done_steps, 1);
+        assert_eq!(stats.failed_steps, 1);
+        assert_eq!(stats.retried_steps, 1, "试过两次的步要算进去");
+        assert_eq!(stats.total_ms, 1050);
+        assert_eq!(stats.slowest.as_ref().unwrap().0, 2, "最慢的是第 2 步");
+        assert!((stats.failure_rate - 1.0 / 3.0).abs() < 1e-9);
+        assert!(
+            stats.summary().contains("失败率 33%"),
+            "{}",
+            stats.summary()
+        );
+    }
+
+    #[test]
+    fn resumable_detects_an_unfinished_plan() {
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "目标",
+                vec![tool_step(
+                    1,
+                    "检索",
+                    AiToolName::EmailSearch,
+                    json!({ "days": 7 }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+        assert!(plan.is_resumable(), "还没开始的步可以续做");
+        assert_eq!(plan.unfinished_summary(), "第 1 步「检索」");
+
+        plan.steps[0].status = PlanStatus::Done;
+        assert!(!plan.is_resumable(), "全做完的不用续");
+        assert!(plan.unfinished_summary().is_empty());
+
+        // 跳过的步也不算「没做完」：那不是用户的未竟之事。
+        plan.steps[0].status = PlanStatus::Skipped;
+        assert!(!plan.is_resumable());
     }
 
     #[test]

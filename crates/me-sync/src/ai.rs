@@ -128,6 +128,11 @@ struct StreamSetup {
     /// 用户这一轮的原始输入。REFLECT 要把「用户到底要什么」再摆到模型面前，
     /// 否则它只能对着一份清单自评，容易自说自话。
     user_input: String,
+    /// 上一轮**没做完**的清单（同一会话里最近一份带未完成步的）。
+    ///
+    /// 跨轮延续靠它：用户说「继续」时，模型看到的是「还剩哪几步」，
+    /// 而不是从零开始重新规划——那会让用户以为自己前面做的白费了。
+    resumable: Option<me_core::ai_plan::Plan>,
 }
 
 impl Default for AiState {
@@ -892,6 +897,15 @@ where
             .db(move |s| me_core::ai::AiRepo::list_messages(&s, conversation, None, HISTORY_FETCH))
             .await
             .unwrap_or_default();
+        // 上一轮没做完的清单：找最近一份「还有未终结步」的。
+        // 从后往前找——最近的那份才是用户记得的那份。
+        let resumable = history.iter().rev().find_map(|message| {
+            message
+                .plan
+                .as_ref()
+                .filter(|plan| plan.is_resumable())
+                .cloned()
+        });
         // 用户引用的邮件 id：`mail_read` 用它短路「正文已在上下文」。
         // 只留 id，不留正文快照——后者每轮克隆几千字符没有任何收益。
         let context_refs: Vec<MessageId> = refs.iter().map(|item| item.message_id).collect();
@@ -982,6 +996,7 @@ where
                         context_refs,
                         replay_only,
                         user_input: content.clone(),
+                        resumable,
                     },
                 )
                 .await;
@@ -1135,6 +1150,7 @@ where
             context_refs,
             replay_only,
             user_input,
+            mut resumable,
         } = setup;
         let started = Instant::now();
         let permit = self
@@ -1229,6 +1245,20 @@ where
             .cloned()
             .collect();
         request.tools = plan_tools.clone();
+        // 上一轮有没做完的清单 → **第一次请求就**告诉模型可以接着做。
+        //
+        // 必须在请求发出前注入，而不是等模型回答之后再补：模型可能第一轮就
+        // 直接提交计划（那是正常路径），那时再补就晚了，它已经规划完了。
+        if let Some(previous) = resumable.take() {
+            request.messages.push(me_core::ai::AiWireMessage::User {
+                content: format!(
+                    "上一轮有一份还没做完的清单：目标「{}」，还剩 {}。\n如果用户是在说「继续」，就照着这份清单接着做：plan_submit 提交一份**只包含剩余步骤**的计划（已完成的步不要重做），然后执行。\n{}",
+                    previous.goal,
+                    previous.unfinished_summary(),
+                    previous.facts_block(),
+                ),
+            });
+        }
         let mut budget = crate::ai_tools::ToolBudget {
             permissions,
             context_refs,
@@ -1708,6 +1738,9 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 if let Some(id) = bound
                     && let Some(current) = plan.as_mut()
                 {
+                    // 记耗时：这一趟（含所有引擎重试）花了多久。
+                    // 用来调 `MAX_STEP_ATTEMPTS` 与各工具的超时。
+                    current.add_duration(id, u64::from(result.trace.duration_ms));
                     let empty =
                         !result.is_error && crate::ai_tools::is_empty_result(&result.trace.summary);
                     if empty {
@@ -2020,6 +2053,14 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
         // 清单必须是**最终态**再落库：取消时只把「进行中」的步标跳过，
         // 还没开始的步保持 pending（用户可能接着说「继续」）。
         let plan_for_db = finalize_plan(plan, status);
+        // 清单统计：调 `MAX_STEP_ATTEMPTS` 与各工具超时时看这行。
+        if let Some(current) = plan_for_db.as_ref() {
+            tracing::info!(
+                conversation = conversation.0,
+                stats = %current.stats().summary(),
+                "AI 清单统计"
+            );
+        }
         // 收尾结论：有清单才算（模型声明「不需要工具」的对话没有清单）。
         if let Some(current) = plan_for_db.as_ref() {
             let (done, total) = current.progress();
