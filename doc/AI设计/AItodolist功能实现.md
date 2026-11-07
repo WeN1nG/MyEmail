@@ -26,7 +26,7 @@
 
 三个必须先说清的判断：
 
-1. **提示词治不了这个病。** `SYSTEM_PROMPT` 第 10 条（[ai.rs:1342](../crates/me-core/src/ai.rs)）
+1. **提示词治不了这个病。** `SYSTEM_PROMPT` 第 10 条（[ai.rs:1342](../../crates/me-core/src/ai.rs)）
    早就写了「需要 2 步以上先建清单」，那一轮依然没建——因为同一条规则的后半句
    「一句话能答完的事情不要建清单」给了模型一个合法出口。要求「强制」时，
    只能靠**下发哪些工具**来约束，不能靠**说了什么话**来约束。
@@ -34,7 +34,7 @@
    所以「实时更新」的上限就是模型愿意调几次。v2 里步骤状态由引擎在执行工具后直接改写，
    模型只在「跳步 / 改判 / 放弃」时介入。
 3. **重试必须分类，否则就是刷调用。** 那次 8 连击里 6 次是同一个参数校验错误
-   （`Validation`，`is_retryable() == false`，见 [error.rs:246](../crates/me-core/src/error.rs)）。
+   （`Validation`，`is_retryable() == false`，见 [error.rs:246](../../crates/me-core/src/error.rs)）。
    对不可重试错误原样重发，不叫重试，叫空转。
 
 ---
@@ -69,9 +69,9 @@
 
 **D1 · 契约缺口：`email_search` 的 schema 允许一种实现必然拒绝的调用。**
 
-schema（[ai.rs:1608](../crates/me-core/src/ai.rs)）只把 `motive` 设为必填，
+schema（[ai.rs:1608](../../crates/me-core/src/ai.rs)）只把 `motive` 设为必填，
 `after` / `before` / `folder` / `unread_only` / `limit` 全都可以单独出现；
-实现（[ai_tools.rs:366](../crates/me-sync/src/ai_tools.rs)）却要求
+实现（[ai_tools.rs:366](../../crates/me-sync/src/ai_tools.rs)）却要求
 `query | from | subject | to` 至少有一个：
 
 ```rust
@@ -85,7 +85,7 @@ if query_text.is_none() && from.is_none() && subject.is_none() && to.is_none() {
 **8 次调用里有 6 次死在这个错上。**
 
 **D2 · 「重要」在系统里没有语义。**
-`SearchQuery`（[model.rs:1036](../crates/me-core/src/model.rs)）有 `since` / `until` /
+`SearchQuery`（[model.rs:1036](../../crates/me-core/src/model.rs)）有 `since` / `until` /
 `unread_only`，**没有星标（`FLAG_FLAGGED`）条件**；搜索语法（`search_syntax.rs`）
 只有 `is:unread`，没有 `is:flagged`。用户说的「重要」在可用工具里根本无法表达，
 模型只能瞎猜关键词，于是猜到了「招聘」这种窄口径。
@@ -98,24 +98,24 @@ if query_text.is_none() && from.is_none() && subject.is_none() && to.is_none() {
 > 让它自己把定性词翻译成条件，而客观维度（星标、未读、时间…）才是一等过滤条件。
 
 **D3 · 清单的触发条件被写反。**
-`plan_update` 的描述（[ai.rs:1811](../crates/me-core/src/ai.rs)）：
+`plan_update` 的描述（[ai.rs:1811](../../crates/me-core/src/ai.rs)）：
 「只有需要 **2 步以上**或跨模块的需求才建清单；一句话能答完的事情**不要**建」。
 `SYSTEM_PROMPT` 第 10 条同义复述。模型判断「有什么重要的邮件」是一句话 → 不建清单 →
-引擎的 `nudge` 机制（[ai.rs:1185](../crates/me-sync/src/ai.rs)）因为 `plan.is_none()` 而完全不生效。
+引擎的 `nudge` 机制（[ai.rs:1185](../../crates/me-sync/src/ai.rs)）因为 `plan.is_none()` 而完全不生效。
 于是整轮没有任何「你在做什么、做到哪一步、还剩几步」的结构。
 
 **D4 · 没有重试语义，也没有熔断。**
-唯一的刹车是 `MAX_TOOL_CALLS = 12`（[ai.rs:72](../crates/me-core/src/ai.rs)）。
+唯一的刹车是 `MAX_TOOL_CALLS = 12`（[ai.rs:72](../../crates/me-core/src/ai.rs)）。
 模型在 12 次预算里用 8 次重复同一个错误调用，引擎全盘接受。
 系统提示第 8 条写着「同一个失败调用最多重试一次」，这是**提示**，不是**机制**。
 
 **D5 · 空回复被当成成功。**
-`turn.tool_calls.is_empty()` 时直接 `break`（[ai.rs:1182](../crates/me-sync/src/ai.rs)），
+`turn.tool_calls.is_empty()` 时直接 `break`（[ai.rs:1182](../../crates/me-sync/src/ai.rs)），
 随后 `finish_assistant_message` 原样落库。`content` 是 13 个 `\n`，`status` 是 `complete`，
 用户界面上是一块空白。**没有任何一处校验「模型是否真的回答了用户」。**
 
 **D6 · `Plan` 不足以表达一份可执行计划。**
-`PlanStep`（[ai_plan.rs:121](../crates/me-core/src/ai_plan.rs)）只有
+`PlanStep`（[ai_plan.rs:121](../../crates/me-core/src/ai_plan.rs)）只有
 `id / capability / title / status / evidence`。它回答不了用户最关心的四个问题：
 这步**要不要调工具**、调**哪个**、传**什么参数**、**期待什么结果**。
 所以即使模型建了清单，那也只是一个目录，引擎无法据此校验、重试或诊断。
@@ -149,7 +149,7 @@ if query_text.is_none() && from.is_none() && subject.is_none() && to.is_none() {
 
 R1 与 R11 有一处容易做错：现在 `plan` 只在**落库**时写 `ai_messages.plan`，
 流式期间靠 `Event::AiPlanUpdated` 送内存。用户切页再回来（`AiPageState::select` 会
-`self.plan = None`，[views/ai.rs:261](../crates/me-app/src/views/ai.rs)）清单就消失了。
+`self.plan = None`，[views/ai.rs:261](../../crates/me-app/src/views/ai.rs)）清单就消失了。
 v2 要保持「流式不落库」的不变量，但**清单快照不能随切会话清空**——它是本轮的过程状态，
 不是会话内容。详见 §10.3。
 
@@ -421,7 +421,7 @@ fn plan_version_default() -> u8 { PLAN_VERSION_V1 }
 
 ### 4.3 兼容性：不需要 schema v8
 
-`ai_messages.plan` 是 TEXT 列（[migrations.rs:307](../crates/me-store/src/migrations.rs)，
+`ai_messages.plan` 是 TEXT 列（[migrations.rs:307](../../crates/me-store/src/migrations.rs)，
 v4→v5 加入），存的是 `Plan` 的 JSON。v2 只增加字段且全部带 `#[serde(default)]`：
 
 - 老数据缺 `version` → 默认 1，UI 走 v1 分支（只画 title/status）。
@@ -430,7 +430,7 @@ v4→v5 加入），存的是 `Plan` 的 JSON。v2 只增加字段且全部带 `
   一个显式的 `#[serde(default)]` 指向新枚举值 `Legacy`，或干脆在解析时按
   `version == 1` 强制视为「只读展示」，不参与任何执行判定。本文取后者：
   `Plan::is_executable()` 要求 `version >= 2`。
-- `parse_plan`（[ai.rs:89](../crates/me-store/src/ai.rs)）解析失败按「无清单」处理，
+- `parse_plan`（[ai.rs:89](../../crates/me-store/src/ai.rs)）解析失败按「无清单」处理，
   这个兜底保留。
 
 结论：**零迁移**。这是把 plan 做成 JSON 列而不是独立表带来的直接收益。
@@ -472,7 +472,7 @@ pub fn plan_phase_tool_specs() -> Vec<AiToolSpec> {
 
 两处必须同步的细节：
 
-1. `AiToolPermissions::enabled()`（[ai.rs:1301](../crates/me-core/src/ai.rs)）是**穷尽 match**，
+1. `AiToolPermissions::enabled()`（[ai.rs:1301](../../crates/me-core/src/ai.rs)）是**穷尽 match**，
    新增两个 `AiToolName` 变体会直接编译失败——这是好事，它强制实现者决定
    「这个工具归不归用户开关管」。两个都返回 `true`（与 `PlanUpdate => true` 同理由：
    清单是引擎机制，关掉它模型就没法把多步需求说清楚）。
@@ -805,7 +805,7 @@ verdict == failed  &&  replans.len() == 2 →  FINAL（说明「两次重列后�
 - 未完成项必须逐条写原因（取 `PlanStep.failure` 的人话版本）。
 
 > 为什么不给 `[结果]` 加「计划：4/5」这类行：`split_result_block`
-> （[views/ai.rs:872](../crates/me-app/src/views/ai.rs)）是按 `状态：/做了什么：/关键信息：/未完成：`
+> （[views/ai.rs:872](../../crates/me-app/src/views/ai.rs)）是按 `状态：/做了什么：/关键信息：/未完成：`
 > 四个前缀逐行匹配的，`ResultBlock` 只有四个字段，未知行会被静默丢弃——写进去也不会显示。
 > 要加就得同时改解析器、渲染、三个单测，收益不抵成本。清单条已经把这件事件讲清楚了。
 
@@ -846,7 +846,7 @@ fn is_blank_answer(text: &str) -> bool {
 状态保持 `Complete`，`error = "模型未输出正文，已用执行回执兜底"`。
 
 > **为什么不是 `Partial`**：`ai_messages.status` 有 CHECK 约束
-> `IN ('streaming','complete','failed','cancelled')`（[migrations.rs:299](../crates/me-store/src/migrations.rs)），
+> `IN ('streaming','complete','failed','cancelled')`（[migrations.rs:299](../../crates/me-store/src/migrations.rs)），
 > 加第五个值需要一次表重建迁移。P0 不做迁移，所以「没拿到结果」这层语义由
 > **正文首句**（`这次没有拿到可用的结果。`）与 `error` 字段承担。
 > 真要引入 `partial` 状态时，和 v8 的其他改动一起做。
@@ -857,7 +857,7 @@ fn is_blank_answer(text: &str) -> bool {
 
 沿用 `finish_assistant_message`（文本 / plan / traces / 用量一次性写）。
 `plan` 写**最终态**：`finalize_plan` 已有「取消只标 running → skipped」的逻辑
-（[ai.rs:1438](../crates/me-sync/src/ai.rs)），v2 追加「预算耗尽 → 未终结步标 skipped 并写 `StepFailure::Budget`」。
+（[ai.rs:1438](../../crates/me-sync/src/ai.rs)），v2 追加「预算耗尽 → 未终结步标 skipped 并写 `StepFailure::Budget`」。
 
 ---
 
@@ -902,7 +902,7 @@ fn is_blank_answer(text: &str) -> bool {
 规则：
 
 - **未完成时默认展开**，全部终结后折叠成一行（沿用现有 `show_plan` 的分支，
-  [views/ai.rs:704](../crates/me-app/src/views/ai.rs)）；
+  [views/ai.rs:704](../../crates/me-app/src/views/ai.rs)）；
 - 每步两行：标题行（状态图标 + 序号 + 标题 + 尝试角标）、细节行（kind/工具/参数摘要/期望）；
 - 参数摘要用**脱敏 + 截断**：`flagged_only:true, limit:10`，超过 60 字截断，
   `message_id` 这类引用显示为 `→ 第 3 步结果`；
@@ -911,7 +911,7 @@ fn is_blank_answer(text: &str) -> bool {
 
 ### 10.3 切页不丢清单
 
-现状：`AiPageState::select` 清 `self.plan`（[views/ai.rs:261](../crates/me-app/src/views/ai.rs)），
+现状：`AiPageState::select` 清 `self.plan`（[views/ai.rs:261](../../crates/me-app/src/views/ai.rs)），
 而流式期间 plan 不落库 → 切走再回来，清单消失、界面只剩半截文本。
 
 v2 的处理：把「正在流式的那一条消息的清单」提到 `UiState` 层（`streaming_plan: Option<(AiMessageId, Plan)>`），

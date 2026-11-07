@@ -12,7 +12,7 @@
 
 | 检查 | 结果 |
 | --- | --- |
-| 工作区状态 | 干净，只有未跟踪的 `doc/AItodolist功能实现.md` |
+| 工作区状态 | 干净，只有未跟踪的 `doc/AItodolist功能实现.md`（现位于 `doc/AI设计/AItodolist功能实现.md`） |
 | 测试基线 | **710 passed / 0 failed / 6 ignored** |
 | 格式与静态检查 | `cargo fmt --check` ✅、`clippy -D warnings` ✅ |
 
@@ -36,6 +36,9 @@ cargo test --workspace      # 710 passed / 0 failed / 6 ignored（16s，增量�
 cargo fmt --check                                  # 通过
 cargo clippy --workspace --all-targets -- -D warnings   # 通过
 ```
+
+> 上述命令输出是**开工当时的原样快照**，路径未回改。文档后来归入 `doc/AI设计/`，
+> 所以 `doc/AItodolist功能实现.md` 现在的位置是 `doc/AI设计/AItodolist功能实现.md`。
 
 `cargo deny` 未跑：本轮没有新增依赖，`deny.toml` 与 `Cargo.toml` 都不动，
 P0–P2 全程不需要 `cargo deny`（除非 P3 引入新 crate）。
