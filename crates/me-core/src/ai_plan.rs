@@ -1809,15 +1809,38 @@ pub fn repair_plan_step(step: &mut PlanStep) -> Vec<StepRepair> {
         }
     }
 
-    // 2) 推理/提问步却带了 tool：多半是模型想调工具，把 kind 改成 tool。
+    // 2) 推理/提问步却带了 tool 或 args：多半是模型想调工具。
     //
     // 这一条值得单独修：事故里模型为了一步 reason 反复改 kind，
     // 改了 4 次，每次都撞「不能带 tool / args」。
-    if matches!(step.kind, StepKind::Reason | StepKind::Ask) && step.tool.is_some() {
-        step.kind = StepKind::Tool;
-        repairs.push(StepRepair {
-            note: format!("第 {} 步写了 tool，已按工具步处理", step.id),
-        });
+    //
+    // 带 tool 的改判成工具步（工具名已经在了，改判之后就能执行）；
+    // **只带 args 没带 tool** 的没法改判——不知道该调哪个工具——
+    // 但参数挂在推理步上是校验必拒的，所以直接把参数摘掉，让这一步
+    // 变成一条纯粹的「推理」。总比整份计划被拒划算。
+    //
+    // 2026-11-07 的事故就是这一种：模型写了一个 reason 步并带上 args，
+    // 引擎报「第 3 步是 推理 步，不能带 tool / args」，白费一轮模型往返。
+    if matches!(step.kind, StepKind::Reason | StepKind::Ask) {
+        if step.tool.is_some() {
+            step.kind = StepKind::Tool;
+            repairs.push(StepRepair {
+                note: format!("第 {} 步写了 tool，已按工具步处理", step.id),
+            });
+        } else if step.args.is_some() {
+            step.args = None;
+            repairs.push(StepRepair {
+                note: format!(
+                    "第 {} 步是{}步且没有工具，已去掉它的参数",
+                    step.id,
+                    if step.kind == StepKind::Ask {
+                        "提问"
+                    } else {
+                        "推理"
+                    }
+                ),
+            });
+        }
     }
 
     // 3) 工具步的 expect 缺失：用标题兜底。
@@ -2564,6 +2587,41 @@ mod tests {
         // 改完之后这份计划能过校验。
         validate_plan_v2(None, &v2_draft("目标", vec![step]), &allowed())
             .expect("改过之后应该能过校验");
+    }
+
+    /// 事故里模型给 reason 步写了参数、却没写工具名，引擎报
+    /// 「第 3 步是 推理 步，不能带 tool / args」，白费一轮模型往返。
+    ///
+    /// 没有工具名就没法改判成工具步，但参数挂在推理步上是**校验必拒**的，
+    /// 所以直接摘掉参数：这一步退回成一条纯粹的推理。
+    #[test]
+    fn reason_step_carrying_only_args_loses_them() {
+        let mut step = reason_step(3, "归纳画像");
+        step.args = Some(json!({ "days": 30 }));
+        let repairs = repair_plan_step(&mut step);
+        assert_eq!(step.kind, StepKind::Reason, "没有工具名就不改判成工具步");
+        assert!(step.args.is_none(), "推理步不该带参数：{:?}", step.args);
+        assert!(
+            repairs.iter().any(|r| r.note.contains("参数")),
+            "摘参数要有说明：{repairs:?}"
+        );
+        // 关键：不再被拒——这份计划一次就该过。
+        validate_plan_v2(None, &v2_draft("目标", vec![step]), &allowed())
+            .expect("摘掉参数之后应该能过校验");
+    }
+
+    /// 提问步同理：带参数一样必拒。
+    #[test]
+    fn ask_step_carrying_only_args_loses_them() {
+        let mut step = reason_step(2, "问用户用哪个邮箱");
+        step.kind = StepKind::Ask;
+        step.args = Some(json!({}));
+        let repairs = repair_plan_step(&mut step);
+        assert_eq!(step.kind, StepKind::Ask);
+        assert!(step.args.is_none());
+        assert!(repairs.iter().any(|r| r.note.contains("参数")));
+        validate_plan_v2(None, &v2_draft("目标", vec![step]), &allowed())
+            .expect("摘掉参数之后应该能过校验");
     }
 
     /// 事故里判据项漏了 `label`，被整份计划拒掉。

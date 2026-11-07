@@ -402,6 +402,8 @@ struct TurnState {
     input_tokens: Option<u32>,
     output_tokens: Option<u32>,
     stop_reason: Option<String>,
+    /// 正文扫描器：把「正文」与「文本形态的工具调用」分开。
+    scanner: TextToolScanner,
 }
 
 impl TurnState {
@@ -459,6 +461,23 @@ impl TurnState {
                 parse_ok,
             });
         }
+        // 文本形态的工具调用排在结构化调用之后：模型先正经调工具、
+        // 又在正文里补写一段标签时，正文里的那份是「补话」，不该抢在前面。
+        for (offset, call) in self.scanner.calls.iter().enumerate() {
+            let Some(name) = AiToolName::parse(&call.name) else {
+                tracing::warn!(
+                    tool = %call.name,
+                    "正文里的工具调用不在白名单内，已忽略"
+                );
+                continue;
+            };
+            tool_calls.push(AiToolCall {
+                id: format!("text_call_{}", offset + 1),
+                name,
+                arguments: Value::Object(call.arguments.clone()),
+                parse_ok: true,
+            });
+        }
         Ok(AiTurnResult {
             text: self.text,
             tool_calls,
@@ -467,6 +486,253 @@ impl TurnState {
             stop_reason: self.stop_reason,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// 文本形态的工具调用
+// ---------------------------------------------------------------------------
+
+/// 标签名：`<tool_call>` … `</tool_call>`。
+const TEXT_TOOL_TAG: &str = "tool_call";
+
+/// 文本形态的一次工具调用：工具名 + 参数。
+struct TextToolCall {
+    name: String,
+    arguments: serde_json::Map<String, Value>,
+}
+
+/// 正文扫描器：把「正文」与「文本形态的工具调用」分开。
+///
+/// ## 为什么需要它
+///
+/// 2026-11-07 的真实事故（模型 `agnes-2.5-flash`）：收尾阶段引擎没下发任何
+/// 工具，模型却仍想调 `plan_update`，于是把调用写进了正文：
+///
+/// ```text
+/// <tool_call>
+/// <function=plan_update>
+/// <parameter=goal>
+/// 检索近期邮件并基于内容生成用户画像
+/// </parameter>
+/// ...
+/// </function>
+/// </tool_call>
+/// ```
+///
+/// 协议层只认 `delta.tool_calls`，于是这段 XML 原样落进正文：用户看到的是一坨
+/// 标签，真正的答案（模型已经写进思考区）一个字都没显示。
+///
+/// 这里把标签从正文里剥掉，并还原成一次**真正的**工具调用。
+#[derive(Default)]
+struct TextToolScanner {
+    /// 还没判定归属的原文。
+    buf: String,
+    /// 从正文里认出来的工具调用。
+    calls: Vec<TextToolCall>,
+}
+
+impl TextToolScanner {
+    /// 吃进一段正文增量，返回**可以对外发**的那部分。
+    ///
+    /// 标签是分片到达的（`<` 和 `tool_call>` 可能落在两个 delta 里），
+    /// 所以没看到结束标签之前不能把后半截放出去。
+    fn feed(&mut self, chunk: &str) -> String {
+        self.buf.push_str(chunk);
+        let mut out = String::new();
+        loop {
+            let Some((open_start, open_end)) = find_text_tool_tag(&self.buf, 0, false) else {
+                // 没有开始标签：留一个可能是不完整标签的尾巴，其余交出去。
+                let cut = self.buf.len() - partial_tag_len(&self.buf);
+                out.push_str(&self.buf[..cut]);
+                self.buf.drain(..cut);
+                break;
+            };
+            let Some((_, close_end)) = find_text_tool_tag(&self.buf, open_end, true) else {
+                // 开始标签到了、结束标签还没来：先把前面的正文交出去，剩下的等。
+                out.push_str(&self.buf[..open_start]);
+                self.buf.drain(..open_start);
+                break;
+            };
+            out.push_str(&self.buf[..open_start]);
+            if let Some(call) = parse_text_tool_call(&self.buf[open_start..close_end]) {
+                self.calls.push(call);
+            }
+            self.buf.drain(..close_end);
+        }
+        out
+    }
+
+    /// 收尾：把剩下的原文交出去。
+    ///
+    /// 没收完的标签（只有 `<tool_call>` 没有结束）不是正文，直接丢掉——
+    /// 宁可少一句话，也不能让一段 XML 标签落到用户眼前。
+    fn flush(&mut self) -> String {
+        let mut out = String::new();
+        if let Some((open_start, _)) = find_text_tool_tag(&self.buf, 0, false) {
+            out.push_str(&self.buf[..open_start]);
+        } else {
+            out.push_str(&self.buf);
+        }
+        self.buf.clear();
+        out
+    }
+}
+
+/// 找到形如 `<tool_call>` / `</tool_call>` 的标签。
+///
+/// 返回 `(标签起点, 标签终点)`，终点是 `>` 之后的位置。
+///
+/// 标签里可能夹着零宽字符（U+200B / U+FEFF / U+2060）——那是模型把
+/// 结构化调用「写出来」时最常见的花样，匹配时必须跳过。
+fn find_text_tool_tag(buf: &str, from: usize, closing: bool) -> Option<(usize, usize)> {
+    let bytes = buf.as_bytes();
+    let mut at = from;
+    while at < bytes.len() {
+        let rel = buf[at..].find('<')?;
+        let start = at + rel;
+        let mut k = start + 1;
+        if closing {
+            if !buf[k..].starts_with('/') {
+                at = start + 1;
+                continue;
+            }
+            k += 1;
+        }
+        while let Some(len) = zero_width_len(bytes, k) {
+            k += len;
+        }
+        if buf[k..].starts_with(TEXT_TOOL_TAG) {
+            let mut j = k + TEXT_TOOL_TAG.len();
+            while let Some(len) = zero_width_len(bytes, j) {
+                j += len;
+            }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'>' {
+                return Some((start, j + 1));
+            }
+        }
+        at = start + 1;
+    }
+    None
+}
+
+/// 零宽字符的字节长度。三个候选都是 3 字节的 UTF-8 序列，
+/// 跳过它们不会切到字符中间。
+fn zero_width_len(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = bytes.get(at..)?;
+    if rest.starts_with(&[0xE2, 0x80, 0x8B]) {
+        return Some(3); // U+200B ZERO WIDTH SPACE
+    }
+    if rest.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return Some(3); // U+FEFF ZERO WIDTH NO-BREAK SPACE
+    }
+    if rest.starts_with(&[0xE2, 0x81, 0xA0]) {
+        return Some(3); // U+2060 WORD JOINER
+    }
+    None
+}
+
+/// 缓冲区末尾有多长的一段可能是**不完整**的开始标签。
+///
+/// 差一个 `>` 的 `<tool_ca` 必须留住，等下一段补齐；否则会把
+/// 半截标签当成正文发出去。
+fn partial_tag_len(buf: &str) -> usize {
+    const PREFIX: &str = "<tool_call";
+    let bytes = buf.as_bytes();
+    let max = PREFIX.len().min(bytes.len());
+    for len in (1..=max).rev() {
+        let start = buf.len() - len;
+        if !buf.is_char_boundary(start) {
+            continue;
+        }
+        if PREFIX.as_bytes().starts_with(&bytes[start..]) {
+            return len;
+        }
+    }
+    0
+}
+
+/// 把一段文本形态的工具调用解析成「工具名 + 参数」。
+///
+/// 格式是模型自己约定的：
+///
+/// ```text
+/// <function=plan_update>
+/// <parameter=goal>
+/// 检索近期邮件
+/// </parameter>
+/// </function>
+/// ```
+fn parse_text_tool_call(block: &str) -> Option<TextToolCall> {
+    let fn_at = block.find("<function=")?;
+    let name_start = fn_at + "<function=".len();
+    let name_end = name_start + block[name_start..].find('>')?;
+    let name = block[name_start..name_end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut arguments = serde_json::Map::new();
+    let mut at = name_end;
+    while let Some(rel) = block[at..].find("<parameter=") {
+        let key_start = at + rel + "<parameter=".len();
+        let Some(rel) = block[key_start..].find('>') else {
+            break;
+        };
+        let key_end = key_start + rel;
+        let key = block[key_start..key_end].trim().to_string();
+        let value_start = key_end + 1;
+        let Some(rel) = block[value_start..].find("</parameter>") else {
+            break;
+        };
+        let value_end = value_start + rel;
+        let value = coerce_value(block[value_start..value_end].trim());
+        if !key.is_empty() {
+            // 有些模型把整包参数塞进 `arguments` / `input` 里，
+            // 那是一个对象，应该摊平到参数表，而不是当成一个叫
+            // `arguments` 的参数。
+            if is_argument_wrapper(&key) && value.is_object() {
+                if let Some(object) = value.as_object() {
+                    for (inner_key, inner_value) in object {
+                        arguments.insert(inner_key.clone(), inner_value.clone());
+                    }
+                }
+            } else {
+                arguments.insert(key, value);
+            }
+        }
+        at = value_end + "</parameter>".len();
+    }
+    Some(TextToolCall { name, arguments })
+}
+
+/// 参数名是「整包参数」的包装名。
+fn is_argument_wrapper(key: &str) -> bool {
+    matches!(
+        key,
+        "arguments" | "args" | "parameters" | "params" | "input" | "tool_input"
+    )
+}
+
+/// 参数值：能当 JSON 就当 JSON，否则当字符串。
+///
+/// `steps` 这种数组参数在文本形态里就是一段 JSON 数组；
+/// `goal` 这种就是一句话。
+fn coerce_value(raw: &str) -> Value {
+    if raw.is_empty() {
+        return Value::String(String::new());
+    }
+    let looks_json = raw.starts_with('{')
+        || raw.starts_with('[')
+        || raw.starts_with('"')
+        || matches!(raw, "true" | "false" | "null")
+        || raw.parse::<f64>().is_ok();
+    if looks_json && let Ok(value) = serde_json::from_str::<Value>(raw) {
+        return value;
+    }
+    Value::String(raw.to_string())
 }
 
 fn apply_anthropic(
@@ -508,8 +774,13 @@ fn apply_anthropic(
                 Some("text_delta") => {
                     let text = value["delta"]["text"].as_str().unwrap_or("");
                     if !text.is_empty() {
-                        state.text.push_str(text);
-                        sink(AiDelta::Text(text.to_string()));
+                        // 与 OpenAI 路径同一把尺子：正文里混进来的「文本形态
+                        // 工具调用」也要剥掉，不能原样落到用户眼前。
+                        let clean = state.scanner.feed(text);
+                        if !clean.is_empty() {
+                            state.text.push_str(&clean);
+                            sink(AiDelta::Text(clean));
+                        }
                     }
                 }
                 Some("input_json_delta") => {
@@ -583,8 +854,14 @@ fn apply_openai(
     if let Some(text) = delta["content"].as_str()
         && !text.is_empty()
     {
-        state.text.push_str(text);
-        sink(AiDelta::Text(text.to_string()));
+        // 正文里可能混着「文本形态的工具调用」：模型有时不填 `tool_calls`
+        // 字段，而是把调用直接写成标签。扫描器把标签剥掉，还原成真正的调用，
+        // 绝不能让这段 XML 原样落进用户看到的答复。
+        let clean = state.scanner.feed(text);
+        if !clean.is_empty() {
+            state.text.push_str(&clean);
+            sink(AiDelta::Text(clean));
+        }
     }
     if let Some(calls) = delta["tool_calls"].as_array() {
         for call in calls {
@@ -742,6 +1019,13 @@ async fn stream_turn(
             input: Some(input),
             output: Some(output),
         });
+    }
+
+    // 收尾：把扫描器里还没判定的尾巴交出去（没收完的标签已经被丢掉）。
+    let tail = state.scanner.flush();
+    if !tail.is_empty() {
+        state.text.push_str(&tail);
+        sink(AiDelta::Text(tail));
     }
 
     state.finish()
@@ -1197,5 +1481,251 @@ mod tests {
             vec![AiDelta::Text("你好".to_string())]
         );
         assert_eq!(state.thinking, "");
+    }
+
+    // -----------------------------------------------------------------------
+    // 文本形态的工具调用（2026-11-07 的真实事故）
+    // -----------------------------------------------------------------------
+
+    /// 事故原文：**生产库里那条失败回复的正文，一字不改**（2026-11-07，
+    /// `ai_messages.id = 6`）。模型在收尾阶段把 `plan_update` / `plan_submit`
+    /// 写成了正文里的标签，用户看到的就是这一坨。
+    const INCIDENT_ANSWER: &str = r#"
+
+
+
+
+
+
+
+
+从搜索结果看，你的邮件涉及较多校园招聘信息。让我读取几封关键邮件的细节来获取更完整的画像。
+
+
+
+
+
+<tool_call>
+<function=plan_update>
+<parameter=goal>
+检索近期邮件并基于内容生成用户画像
+</parameter>
+<parameter=motive>
+已完成第二步：读取代表性邮件正文
+</parameter>
+<parameter=steps>
+[{"capability": "mail", "evidence": "获取到近30天共95封邮件，读取了星际悦动拒绝通知、中国石油AI面试邀请、提交作业邮件等关键内容", "id": 1, "status": "done", "title": "检索近30天邮件"}, {"capability": "mail", "evidence": "读取了3封代表性邮件：星际悦动校招拒绝（AI应用工程师岗）、中国石油AI面试通知（含考试时间链接）、提交Demo和方案作业（闻凝），以及东软集团职业测评邀请、西藏电信校招等", "id": 2, "status": "done", "title": "读取代表性邮件正文"}]
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=plan_submit>
+<parameter=goal>
+检索近期邮件并基于内容生成用户画像
+</parameter>
+<parameter=motive>
+已完成两步操作，现在总结用户画像
+</parameter>
+<parameter=steps>
+[]
+</parameter>
+</function>
+</tool_call>"#;
+
+    /// 事故的复现：正文里出现工具调用标签时，标签**不能**落进用户可见的答复，
+    /// 而要被还原成一次真正的工具调用。
+    #[test]
+    fn text_form_tool_call_is_parsed_not_shown() {
+        let (sink, buffer) = sink();
+        let mut state = TurnState::default();
+        apply_openai(
+            &mut state,
+            &openai_event(&format!(
+                r#"{{"content":{}}}"#,
+                serde_json::to_string(INCIDENT_ANSWER).unwrap()
+            )),
+            &sink,
+        )
+        .unwrap();
+        let tail = state.scanner.flush();
+        if !tail.is_empty() {
+            state.text.push_str(&tail);
+        }
+        let turn = state.finish().unwrap();
+
+        // 用户看到的正文里不能有标签。
+        assert!(
+            !turn.text.contains("tool_call"),
+            "工具调用标签漏进了正文：{}",
+            turn.text
+        );
+        assert!(
+            !buffer.lock().unwrap().contains("tool_call"),
+            "工具调用标签漏进了流式增量"
+        );
+        // 正文只剩那句过程性叙述（750 字 → 61 字）。
+        assert!(
+            turn.text
+                .contains("从搜索结果看，你的邮件涉及较多校园招聘信息"),
+            "叙述要留下：{}",
+            turn.text
+        );
+        assert!(
+            turn.text.chars().count() <= 80,
+            "剥完只剩叙述，不该有别的东西：{}",
+            turn.text
+        );
+
+        // 而它必须变成两次真正的工具调用。
+        assert_eq!(turn.tool_calls.len(), 2);
+        let call = &turn.tool_calls[0];
+        assert_eq!(call.name, AiToolName::PlanUpdate);
+        assert!(call.parse_ok);
+        assert_eq!(call.arguments["goal"], "检索近期邮件并基于内容生成用户画像");
+        assert_eq!(call.arguments["motive"], "已完成第二步：读取代表性邮件正文");
+        let steps = call.arguments["steps"].as_array().expect("steps 应是数组");
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0]["id"], 1);
+        assert_eq!(steps[0]["status"], "done");
+        assert_eq!(turn.tool_calls[1].name, AiToolName::PlanSubmit);
+    }
+
+    /// 标签是**分片**到达的：`<` 与 `tool_call>` 落在两个 delta 里也得认出来。
+    #[test]
+    fn text_form_tool_call_survives_chunked_deltas() {
+        let (sink, buffer) = sink();
+        let mut state = TurnState::default();
+        let full = INCIDENT_ANSWER;
+        // 每次只喂 7 个**字符**：标签、参数名、结束标签全都会被切开。
+        // （按字符切，不能按字节切——正文里有中文。）
+        let chars: Vec<char> = full.chars().collect();
+        let mut at = 0;
+        while at < chars.len() {
+            let end = (at + 7).min(chars.len());
+            let piece: String = chars[at..end].iter().collect();
+            at = end;
+            apply_openai(
+                &mut state,
+                &openai_event(&format!(
+                    r#"{{"content":{}}}"#,
+                    serde_json::to_string(&piece).unwrap()
+                )),
+                &sink,
+            )
+            .unwrap();
+        }
+        let tail = state.scanner.flush();
+        if !tail.is_empty() {
+            state.text.push_str(&tail);
+        }
+        let turn = state.finish().unwrap();
+        assert!(
+            !turn.text.contains("tool_call"),
+            "分片到达时标签也不该漏进正文：{}",
+            turn.text
+        );
+        assert!(
+            !buffer.lock().unwrap().contains("tool_call"),
+            "分片到达时标签漏进了流式增量"
+        );
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_calls[0].name, AiToolName::PlanUpdate);
+        assert_eq!(turn.tool_calls[1].name, AiToolName::PlanSubmit);
+    }
+
+    /// 标签里夹零宽字符（模型把结构化调用「写出来」时的常见花样）也要认。
+    #[test]
+    fn text_form_tool_call_tolerates_zero_width_chars() {
+        let (sink, _) = sink();
+        let mut state = TurnState::default();
+        // 显式拼出零宽字符：源码里直接写它太容易被人手的编辑器悄悄吃掉。
+        let text = "<\u{200B}tool_call>\n<function=plan_submit>\n\
+                    <parameter=goal>\n看看我的邮件\n</parameter>\n</function>\n</\u{200B}tool_call>";
+        apply_openai(
+            &mut state,
+            &openai_event(&format!(
+                r#"{{"content":{}}}"#,
+                serde_json::to_string(&text).unwrap()
+            )),
+            &sink,
+        )
+        .unwrap();
+        let turn = state.finish().unwrap();
+        assert_eq!(turn.text, "");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, AiToolName::PlanSubmit);
+        assert_eq!(turn.tool_calls[0].arguments["goal"], "看看我的邮件");
+    }
+
+    /// 没收到结束标签的残缺标签不是正文：宁可少一句，也不能让 XML 落到用户眼前。
+    #[test]
+    fn unfinished_text_tool_call_is_dropped() {
+        let (sink, buffer) = sink();
+        let mut state = TurnState::default();
+        apply_openai(
+            &mut state,
+            &openai_event(r#"{"content":"<tool_call>\n<function=plan_update>"}"#),
+            &sink,
+        )
+        .unwrap();
+        let tail = state.scanner.flush();
+        if !tail.is_empty() {
+            state.text.push_str(&tail);
+        }
+        let turn = state.finish().unwrap();
+        assert_eq!(turn.text, "", "残缺标签必须被丢掉");
+        assert!(!buffer.lock().unwrap().contains("tool_call"));
+        assert!(turn.tool_calls.is_empty());
+    }
+
+    /// 正文里提到「tool_call」这个词（而不是真的在调工具）不能被误伤。
+    #[test]
+    fn prose_mentioning_tool_call_survives() {
+        let (sink, _) = sink();
+        let mut state = TurnState::default();
+        let text = "模型可以用 tool_call 这个形式发起调用，我也可以。";
+        apply_openai(
+            &mut state,
+            &openai_event(&format!(
+                r#"{{"content":{}}}"#,
+                serde_json::to_string(text).unwrap()
+            )),
+            &sink,
+        )
+        .unwrap();
+        let turn = state.finish().unwrap();
+        assert_eq!(turn.text, text);
+        assert!(turn.tool_calls.is_empty());
+    }
+
+    /// 结构化调用与文本形态调用同时出现时，两条都要认出来。
+    #[test]
+    fn structured_and_text_form_calls_coexist() {
+        let (sink, _) = sink();
+        let mut state = TurnState::default();
+        apply_openai(
+            &mut state,
+            &SseEvent {
+                name: None,
+                data: r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"email_search","arguments":"{\"query\":\"周报\"}"}}]}}]}"#.into(),
+            },
+            &sink,
+        )
+        .unwrap();
+        apply_openai(
+            &mut state,
+            &openai_event(&format!(
+                r#"{{"content":{}}}"#,
+                serde_json::to_string(INCIDENT_ANSWER).unwrap()
+            )),
+            &sink,
+        )
+        .unwrap();
+        let turn = state.finish().unwrap();
+        assert_eq!(turn.tool_calls.len(), 3);
+        assert_eq!(turn.tool_calls[0].name, AiToolName::EmailSearch);
+        assert_eq!(turn.tool_calls[1].name, AiToolName::PlanUpdate);
+        assert_eq!(turn.tool_calls[2].name, AiToolName::PlanSubmit);
+        assert!(!turn.text.contains("tool_call"));
     }
 }

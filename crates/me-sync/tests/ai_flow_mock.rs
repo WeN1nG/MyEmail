@@ -144,6 +144,8 @@ struct MockAiProvider {
     targets: Mutex<Vec<(String, String)>>,
     /// 每轮请求里**用户消息**的文本（用于验证引擎给模型说了什么）。
     message_bodies: Mutex<Vec<String>>,
+    /// 每轮请求的**系统提示**（用于验证阶段化的补充真的发出去了）。
+    systems: Mutex<Vec<String>>,
 }
 
 impl MockAiProvider {
@@ -155,6 +157,7 @@ impl MockAiProvider {
             message_counts: Mutex::new(Vec::new()),
             targets: Mutex::new(Vec::new()),
             message_bodies: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
         })
     }
 }
@@ -201,6 +204,9 @@ impl AiProvider for MockAiProvider {
             .join("\n");
         if let Ok(mut bodies) = self.message_bodies.lock() {
             bodies.push(body);
+        }
+        if let Ok(mut systems) = self.systems.lock() {
+            systems.push(request.system.clone());
         }
         let turn = self.script.lock().expect("script").pop_front();
         Box::pin(async move {
@@ -597,7 +603,24 @@ async fn tool_round_writes_entity_and_feeds_result_back() {
         .iter()
         .find(|message| message.role == me_core::ai::AiRole::Assistant)
         .expect("助手消息");
-    assert_eq!(assistant.content, "记住了。");
+    // 模型只说了「记住了。」就收尾，没按规范写 `[结果]` 段落。
+    // 规范（系统提示第 9 条）要求「本轮调用过工具时，回复最后必须以 [结果]
+    // 段落收尾」，所以引擎按清单与回执补一段四行段落。
+    assert!(
+        assistant.content.starts_with("记住了。"),
+        "模型自己的答复要保留：{}",
+        assistant.content
+    );
+    assert!(
+        assistant.content.contains("[结果]\n状态："),
+        "引擎要补上 [结果] 段落：{}",
+        assistant.content
+    );
+    assert!(
+        assistant.content.contains("做了什么：记录记忆"),
+        "[结果] 要说清做了什么：{}",
+        assistant.content
+    );
     assert_eq!(assistant.tool_trace.len(), 1);
     assert_eq!(assistant.tool_trace[0].tool, AiToolName::MemoryUpsert);
 }
@@ -2876,6 +2899,184 @@ async fn the_original_incident_now_produces_a_visible_answer() {
         message.error.is_some(),
         "要记录为什么不正常：{:?}",
         message.error
+    );
+}
+
+/// 2026-11-07 的第二次事故：收尾阶段模型仍想调工具。
+///
+/// 收尾阶段引擎**不下发任何工具**，模型却仍把 `plan_update` 写了进来——
+/// 这次它写在了正文里（协议层会把它还原成一次真正的调用）。
+///
+/// 引擎不能执行它：执行了也只会得到一句「这个阶段不需要工具」，白烧一轮。
+/// 正确做法是再问一次「直接给答复」，然后把用户的答复收下来。
+#[tokio::test]
+async fn final_phase_tool_call_is_not_executed_but_asked_for_the_answer() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        // 1) 计划期：交一份清单。
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        // 2) 执行期：检索邮件。这步做完，清单就空了 → 进入收尾阶段。
+        Turn::with_tool(tool_call(
+            "search",
+            AiToolName::EmailSearch,
+            json!({ "motive": "按时间窗查最近邮件", "days": 7 }),
+        )),
+        // 3) 收尾阶段：模型仍想调 plan_update（事故现场）。
+        Turn::with_tool(tool_call(
+            "final_phase_update",
+            AiToolName::PlanUpdate,
+            json!({
+                "motive": "这一步做完了",
+                "steps": [{
+                    "id": 1, "title": "检索近 7 天的邮件",
+                    "status": "done", "evidence": "检索到 2 封"
+                }]
+            }),
+        )),
+        // 4) 引擎追问「直接给答复」，模型这次真的回答了。
+        Turn::text(
+            "近 7 天共 2 封投递提醒。\n\n[结果]\n状态：已完成\n做了什么：检索了近 7 天的邮件\n关键信息：共 2 封\n未完成：无",
+        ),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看我的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut completed = false;
+    while std::time::Instant::now() < deadline && !completed {
+        let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        else {
+            continue;
+        };
+        if matches!(event, Event::AiMessageCompleted { .. }) {
+            completed = true;
+        }
+    }
+    assert!(completed, "这一轮应该正常收尾");
+
+    let message = last_assistant_message(&store, conversation);
+    // 1) 收尾阶段那次 plan_update **没有被执行**。
+    assert!(
+        !message
+            .tool_trace
+            .iter()
+            .any(|trace| trace.call_id == "final_phase_update"),
+        "收尾阶段的工具调用不该被执行：{:?}",
+        message.tool_trace
+    );
+    // 2) 引擎追问了一次「直接给答复」，模型随后给出了答复。
+    let bodies = provider.message_bodies.lock().unwrap().clone();
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("现在是收尾阶段，不需要再调用工具")),
+        "引擎要追问一次：{bodies:?}"
+    );
+    // 3) 收尾阶段的系统提示里明说了「不许调工具」。
+    let systems = provider.systems.lock().unwrap().clone();
+    assert!(
+        systems
+            .iter()
+            .any(|system| system.contains("现在处于收尾阶段：不要调用任何工具")),
+        "收尾阶段的系统提示要说明不许调工具：{systems:?}"
+    );
+    // 4) 用户的答复被收下来了，而且带着 [结果] 段落。
+    assert!(
+        message.content.contains("近 7 天共 2 封投递提醒"),
+        "答复要保留：{}",
+        message.content
+    );
+    assert!(
+        message.content.contains("[结果]"),
+        "答复要带 [结果] 段落：{}",
+        message.content
+    );
+}
+
+/// 收尾阶段模型连续两次都想调工具：引擎只追问一次，之后直接收场。
+///
+/// 每次追问都是一次模型往返，而请求密度顶上去会撞限流线——
+/// 2026-11-07 的事故就是这么把整轮对话拖垮的。
+#[tokio::test]
+async fn final_phase_tool_call_is_nagged_only_once() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "search",
+            AiToolName::EmailSearch,
+            json!({ "motive": "按时间窗查最近邮件", "days": 7 }),
+        )),
+        Turn::with_tool(tool_call(
+            "final_1",
+            AiToolName::PlanUpdate,
+            json!({
+                "motive": "做完了",
+                "steps": [{
+                    "id": 1, "title": "检索近 7 天的邮件",
+                    "status": "done", "evidence": "检索到 2 封"
+                }]
+            }),
+        )),
+        Turn::with_tool(tool_call(
+            "final_2",
+            AiToolName::PlanUpdate,
+            json!({
+                "motive": "还是做完了",
+                "steps": [{
+                    "id": 1, "title": "检索近 7 天的邮件",
+                    "status": "done", "evidence": "检索到 2 封"
+                }]
+            }),
+        )),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看我的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut completed = false;
+    while std::time::Instant::now() < deadline && !completed {
+        let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        else {
+            continue;
+        };
+        if matches!(event, Event::AiMessageCompleted { .. }) {
+            completed = true;
+        }
+    }
+    assert!(completed, "这一轮应该正常收尾");
+
+    let bodies = provider.message_bodies.lock().unwrap().clone();
+    let nudges = bodies
+        .iter()
+        .filter(|body| body.contains("现在是收尾阶段，不需要再调用工具"))
+        .count();
+    assert_eq!(nudges, 1, "只追问一次：{bodies:?}");
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(
+        !message
+            .tool_trace
+            .iter()
+            .any(|trace| trace.call_id == "final_1" || trace.call_id == "final_2"),
+        "收尾阶段的工具调用不该被执行：{:?}",
+        message.tool_trace
     );
 }
 

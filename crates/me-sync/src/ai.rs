@@ -67,6 +67,12 @@ const MAX_REPLAN_REJECTIONS: u32 = 2;
 /// 已经表明的意图合成一份最简计划继续往下走。清单不完美总比整轮失败好。
 const MAX_PLAN_SUBMIT_REJECTIONS: u32 = 2;
 
+/// 收尾阶段模型仍想调工具时，最多追问几次「直接给答复」。
+///
+/// 只给一次：再问就是同一句话，而每一次追问都是一次模型往返——
+/// 请求密度顶上去会撞限流线（2026-11-07 的事故就是这么收场的）。
+const MAX_FINAL_TOOL_NUDGES: u32 = 1;
+
 /// 每个阶段的时间上限（秒）。
 ///
 /// 阶段预算是**上界**：正常路径远小于它，超了也只是提前收尾，
@@ -1397,6 +1403,8 @@ where
         let mut last_request_at: Option<Instant> = None;
         // `plan_submit` 连续被参数校验拒收的次数；超限后引擎自己合成计划。
         let mut plan_submit_rejections = 0u32;
+        // 收尾/自检阶段模型仍想调工具的次数；超限后不再追问，直接收场。
+        let mut final_tool_nudges = 0u32;
 
         // 两套工具集：PLAN 阶段只有 `plan_submit` / `answer_directly`，
         // 物理上取消了模型「边想边查」的可能——想查就必须先说要查什么。
@@ -1414,6 +1422,8 @@ where
             .cloned()
             .collect();
         request.tools = plan_tools.clone();
+        // 基础系统提示：每轮按阶段追加一句「这一轮该做什么」。
+        let base_system = request.system.clone();
         // 上一轮有没做完的清单 → **第一次请求就**告诉模型可以接着做。
         //
         // 必须在请求发出前注入，而不是等模型回答之后再补：模型可能第一轮就
@@ -1491,6 +1501,15 @@ where
                 Phase::Replan => replan_tools.clone(),
                 // REFLECT / FINAL 不给工具：前者只要一段 JSON，后者只要一段答复。
                 Phase::Reflect | Phase::Final => Vec::new(),
+            };
+            // 系统提示按阶段补一句：这一轮不许调工具 / 只许交计划。
+            //
+            // 2026-11-07 的事故：收尾阶段模型仍按系统提示第 10 条去调
+            // `plan_update`，而这一阶段根本没有下发工具——它只好把调用写成
+            // 正文里的一段标签，用户看到的是一坨 XML。
+            request.system = match phase_system_suffix(phase) {
+                Some(suffix) => format!("{base_system}\n\n{suffix}"),
+                None => base_system.clone(),
             };
 
             // 两次模型请求之间的最小间隔。
@@ -1770,6 +1789,36 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 acc.next_segment();
             }
 
+            // 自检 / 收尾阶段模型还想调工具：这两个阶段**没有下发任何工具**，
+            // 它却仍然把调用写了出来（有时填在 `tool_calls` 里，有时写成正文
+            // 里的标签）。2026-11-07 的事故就是这么收场的：模型在收尾阶段想调
+            // `plan_update`，于是把调用写成了正文里的一段 XML，用户看到的是
+            // 一坨标签，真正的答案（它已经写进思考区）一个字都没显示。
+            //
+            // 这里**不执行**这类调用：执行了也只会得到一句「这个阶段不需要
+            // 工具」，白烧一轮请求。正确做法是再问一次「直接给答复」。
+            if matches!(phase, Phase::Reflect | Phase::Final) && !turn.tool_calls.is_empty() {
+                final_tool_nudges += 1;
+                // 把这一轮模型说的话原样带回上下文，但**不带**工具调用：
+                // 带上就等于告诉服务端「我调了工具」，而实际并没有调。
+                request
+                    .messages
+                    .push(me_core::ai::AiWireMessage::Assistant {
+                        content: turn.text.clone(),
+                        tool_calls: Vec::new(),
+                    });
+                if final_tool_nudges <= MAX_FINAL_TOOL_NUDGES {
+                    request.messages.push(me_core::ai::AiWireMessage::User {
+                        content: "现在是收尾阶段，不需要再调用工具。请直接把最终答复写给用户，\
+                        并按 [结果] 格式收尾。"
+                            .to_string(),
+                    });
+                    continue;
+                }
+                // 催了还调：不再纠缠，把这一轮的正文当答复收场。
+                break;
+            }
+
             let mut results: Vec<AiToolResult> = Vec::new();
             for call in &turn.tool_calls {
                 // 动机在**执行前**就要发出去：界面靠它解释「为什么现在调这个工具」。
@@ -1807,9 +1856,15 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     continue;
                 }
 
-                // 防御性拦截：PLAN 阶段根本没下发业务工具，模型仍可能凭历史记忆去调。
-                // 这里拒绝**不消耗**预算（没有产生 IO），并告诉它现在该做什么。
-                if phase == Phase::Plan && !call.name.is_bookkeeping() {
+                // 防御性拦截：**这一阶段没下发的工具**一律不执行。
+                //
+                // 模型凭历史记忆去调（或者把调用写成了正文里的标签被还原回来）
+                // 都会走到这里。这里拒绝**不消耗**预算（没有产生 IO），
+                // 并告诉它现在该做什么。
+                //
+                // 2026-11-07 的事故：`plan_submit` 在执行期没下发，但它一旦被执行
+                // 就等于绕过了「重列不超过 2 次」的上限。
+                if !phase_allows(phase, call.name) {
                     self.emit(Event::AiToolStarted {
                         conversation,
                         call_id: call.id.clone(),
@@ -1822,10 +1877,8 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         call,
                         motive,
                         motive_source,
-                        "现在还在**制定计划**阶段，不能执行工具。请先调用 plan_submit 把要做的事\
-写成 1–8 步（每步写清 tool / args / expect），我会在计划阶段就帮你校验参数；\
-若确实不需要任何工具，请调用 answer_directly 并说明理由。",
-                        "计划阶段不能执行工具",
+                        &phase_rejection_hint(phase, call.name),
+                        phase_rejection_summary(phase, call.name),
                     );
                     self.emit(Event::AiToolCompleted {
                         conversation,
@@ -2367,6 +2420,19 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
             error_text = Some("模型未输出正文，已用执行回执兜底".to_string());
         }
 
+        // 兜底之二：模型给了正文，却没按规范写 `[结果]` 段落。
+        //
+        // 规范要求「本轮调用过工具时，回复最后必须以 [结果] 段落收尾」。
+        // 模型不总是照做——2026-11-07 的事故里它把调用写成了正文里的一段 XML，
+        // 整条回复既没有画像也没有结果段落。
+        //
+        // 这里按**引擎记下的事实**（清单状态 + 工具回执）合成一段四行段落：
+        // 只陈述做了什么、拿到了什么、还差什么，不替模型下结论。
+        if status == AiMessageStatus::Complete && executed_calls > 0 && !has_result_block(&content)
+        {
+            content.push_str(&synthesized_result_block(plan.as_ref(), &traces));
+        }
+
         let usage = *usage.lock().unwrap_or_else(|e| e.into_inner());
         let error_for_db = error_text.clone();
         // 清单必须是**最终态**再落库：取消时只把「进行中」的步标跳过，
@@ -2541,6 +2607,96 @@ enum Phase {
     Final,
 }
 
+/// 阶段化的系统提示补充：把「这一轮该做什么」明说出来。
+///
+/// 2026-11-07 的事故：系统提示第 10 条要求「每完成一步就调用一次 plan_update」，
+/// 而收尾阶段引擎**不下发任何工具**。模型于是把 `plan_update` 写进了正文——
+/// 用户看到的是一坨 XML 标签，真正的答案（它已经写进思考区）一个字都没显示。
+///
+/// 阶段化的补充把「这一轮不许调工具」说清楚，比让模型自己推断可靠得多。
+fn phase_system_suffix(phase: Phase) -> Option<&'static str> {
+    match phase {
+        Phase::Plan | Phase::Execute => None,
+        Phase::Replan => {
+            Some("现在处于重列阶段：只调用 plan_submit 提交一份新的计划，不要做别的。")
+        }
+        Phase::Reflect => Some("现在处于自检阶段：不要调用任何工具，只输出那段 JSON 自检结论。"),
+        Phase::Final => Some(
+            "现在处于收尾阶段：不要调用任何工具（plan_submit / plan_update / answer_directly \
+             也不行）。直接用自然语言把最终答复写给用户；本轮调用过工具时，最后按 [结果] \
+             格式收尾。",
+        ),
+    }
+}
+
+/// 这个阶段允许执行哪些工具。
+///
+/// 工具集随阶段变化：**这一阶段没下发的工具就不该被调用**。
+///
+/// 模型凭历史记忆调一个「这一阶段没有」的工具，引擎不执行它，只回一句
+/// 「现在该做什么」——执行了只会得到一句「工具已关闭」，白烧一轮。
+///
+/// 2026-11-07 的事故：`plan_submit` 在 EXECUTE 阶段没下发，但它一旦被执行就等于
+/// 绕过了「重列不超过 2 次」的上限；收尾阶段更是完全不该有工具。
+fn phase_allows(phase: Phase, tool: AiToolName) -> bool {
+    match phase {
+        // 计划期只认清单类工具：业务工具一次都别想调。
+        // `plan_update` 也在其中——模型有时用旧接口直接交一份完整清单。
+        Phase::Plan => tool.is_bookkeeping(),
+        // 执行期不许建新计划：建计划只属于计划期与重列期。
+        Phase::Execute => !matches!(tool, AiToolName::PlanSubmit | AiToolName::AnswerDirectly),
+        // 重列期只认 `plan_submit`。
+        Phase::Replan => tool == AiToolName::PlanSubmit,
+        // 自检与收尾不给工具。
+        Phase::Reflect | Phase::Final => false,
+    }
+}
+
+/// 阶段拦截时回给模型的提示：说清**现在该做什么**，而不是只说「不行」。
+///
+/// 只说「不行」的话，模型多半会换个说法再调一次——每一次都是一次模型往返，
+/// 而请求密度顶上去会撞限流线。
+fn phase_rejection_hint(phase: Phase, tool: AiToolName) -> String {
+    match phase {
+        Phase::Plan => "现在还在**制定计划**阶段，不能执行工具。请先调用 plan_submit 把要做的事\
+写成 1–8 步（每步写清 tool / args / expect），我会在计划阶段就帮你校验参数；\
+若确实不需要任何工具，请调用 answer_directly 并说明理由。"
+            .to_string(),
+        Phase::Execute => match tool {
+            AiToolName::PlanSubmit => {
+                "执行阶段不能新建计划：计划已经在执行了。请继续按清单调用工具，\
+或者用 plan_update 更新清单某一步的状态。"
+                    .to_string()
+            }
+            _ => "执行阶段不需要再声明「这次不需要工具」：请继续按清单调用工具，\
+或者直接给出结论。"
+                .to_string(),
+        },
+        Phase::Replan => "现在处于**重列**阶段，只能调用 plan_submit 提交一份新的计划，\
+不要执行其他工具。"
+            .to_string(),
+        Phase::Reflect | Phase::Final => {
+            "现在是收尾阶段，不需要调用工具。请直接给出答复。".to_string()
+        }
+    }
+}
+
+/// 阶段拦截时给用户看的那一句摘要。
+///
+/// 按阶段分开写：用户看到「计划阶段不能执行工具」能立刻明白是流程问题，
+/// 而笼统的「工具不可用」会让人以为是权限或工具坏了。
+fn phase_rejection_summary(phase: Phase, tool: AiToolName) -> &'static str {
+    match phase {
+        Phase::Plan => "计划阶段不能执行工具",
+        Phase::Execute => match tool {
+            AiToolName::PlanSubmit => "执行阶段不能新建计划",
+            _ => "执行阶段不需要这个工具",
+        },
+        Phase::Replan => "重列阶段只能提交计划",
+        Phase::Reflect | Phase::Final => "收尾阶段不能调用工具",
+    }
+}
+
 /// REFLECT 判定「要重列」时带过来的三样东西。
 ///
 /// 为什么不把它们塞进 `plan_submit` 的参数：那是模型每次都要写的协议字段，
@@ -2665,6 +2821,91 @@ fn fallback_answer(plan: Option<&me_core::ai_plan::Plan>, traces: &[AiToolTrace]
         "\n你可以：① 让我先同步最近的邮件；② 换一个更具体的说法（例如「这周未读的邮件」）。",
     );
     out
+}
+
+/// 正文里有没有 `[结果]` 段落。
+///
+/// 判据与界面一致：只认**独占一行**的 `[结果]`。
+/// 写在句子里的「[结果]」不算——那多半是模型在解释格式，不是真的写了段落。
+fn has_result_block(content: &str) -> bool {
+    content.lines().any(|line| line.trim() == "[结果]")
+}
+
+/// 按清单与回执合成一段 `[结果]` 段落。
+///
+/// 只陈述**引擎记下的事实**：
+/// - 「做了什么」= 真正执行成功过的工具；
+/// - 「关键信息」= 清单每一步的回执（引擎事实优先，模型复述的覆盖不了它）；
+/// - 「未完成」= 清单里没做完或失败的步。
+///
+/// 不替模型下结论：状态只说「已完成 / 部分完成」，不评价答案好坏。
+fn synthesized_result_block(
+    plan: Option<&me_core::ai_plan::Plan>,
+    traces: &[AiToolTrace],
+) -> String {
+    let mut done: Vec<String> = Vec::new();
+    let mut key: Vec<String> = Vec::new();
+    let mut todo: Vec<String> = Vec::new();
+    let mut all_done = true;
+
+    for trace in traces {
+        match trace.status {
+            AiToolStatus::Ok => {
+                let summary = trace.summary.trim();
+                done.push(if summary.is_empty() {
+                    trace.tool.label().to_string()
+                } else {
+                    format!("{}（{}）", trace.tool.label(), summary)
+                });
+            }
+            AiToolStatus::Error => {
+                all_done = false;
+                todo.push(format!("{}（失败）", trace.tool.label()));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(plan) = plan {
+        for step in &plan.steps {
+            let title = step.title.trim();
+            if let Some(evidence) = step
+                .evidence
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                key.push(format!("{title}：{evidence}"));
+            }
+            if !matches!(step.status, me_core::ai_plan::PlanStatus::Done) {
+                all_done = false;
+                todo.push(format!("{title}（{}）", step.status.label()));
+            }
+        }
+    }
+    if done.is_empty() {
+        all_done = false;
+    }
+
+    let status = if all_done {
+        "已完成"
+    } else {
+        "部分完成"
+    };
+    let join = |items: Vec<String>| -> String {
+        if items.is_empty() {
+            "无".to_string()
+        } else {
+            me_core::ai::truncate_chars(&items.join("；"), 200)
+        }
+    };
+
+    format!(
+        "\n\n[结果]\n状态：{status}\n做了什么：{}\n关键信息：{}\n未完成：{}\n",
+        join(done),
+        join(key),
+        join(todo)
+    )
 }
 
 /// 收尾时把清单改成最终态。
