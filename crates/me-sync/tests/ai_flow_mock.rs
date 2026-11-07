@@ -642,11 +642,11 @@ async fn disabled_tools_are_removed_from_the_request() {
     .await;
 
     let counts = provider.tool_counts.lock().unwrap().clone();
-    // 14 个工具里关掉「天气」（两个）与「创建日程」（一个）之后剩下的数量。
+    // 16 个工具里关掉「天气」（两个）与「创建日程」（一个）之后剩下的数量。
     assert_eq!(
         counts,
-        vec![11],
-        "关掉天气（两个工具）与创建日程后只应剩十一个工具"
+        vec![13],
+        "关掉天气（两个工具）与创建日程后只应剩十三个工具"
     );
 }
 

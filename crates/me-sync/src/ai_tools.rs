@@ -16,7 +16,9 @@ use me_core::ai::{
     AiToolStatus, AiToolTrace, MAX_BODY_CHARS, MAX_TOOL_RESULT_CHARS, MotiveSource, NewAiEntity,
     tool_motive, truncate_chars,
 };
-use me_core::ai_plan::{Capability, Plan, PlanStatus, PlanStep, validate_plan};
+use me_core::ai_plan::{
+    Capability, OnEmpty, Plan, PlanStatus, PlanStep, StepKind, validate_plan, validate_plan_v2,
+};
 use me_core::calendar::{CalendarEventDraft, CalendarSeries};
 use me_core::model::{FolderId, MessageId, MessageSummary, now_unix};
 use me_core::music::{MusicAction, MusicOp};
@@ -60,12 +62,9 @@ pub(crate) struct ToolBudget {
 /// `serde_json::Value` 的对象在未启用 `preserve_order` 时是 `BTreeMap`，
 /// 键天然有序，所以同一份参数永远得到同一个字符串。
 fn attempt_fingerprint(call: &AiToolCall) -> String {
-    let mut value = call.arguments.clone();
-    if let Some(object) = value.as_object_mut() {
-        object.remove("motive");
-        object.remove("step_id");
-    }
-    format!("{}:{value}", call.name.as_str())
+    // 指纹实现放在 `me-core`：计划期的「历史失败指纹」与执行期的「同参数熔断」
+    // 必须是同一个函数，否则两处判断会对不上。
+    me_core::ai::call_fingerprint(call.name, Some(&call.arguments))
 }
 
 impl ToolBudget {
@@ -111,8 +110,19 @@ pub(crate) fn intercepted_result(
             duration_ms: 0,
             motive,
             motive_source,
+            step_id: call_step_id(call),
+            attempt: None,
         },
     }
+}
+
+/// 模型在参数里声明的步骤号。非法值按「没写」处理——绑定失败不该拒绝执行。
+fn call_step_id(call: &AiToolCall) -> Option<u8> {
+    call.arguments
+        .get("step_id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .filter(|value| *value >= 1)
 }
 
 const CALENDAR_LIMIT: u32 = 5;
@@ -378,6 +388,10 @@ where
                 // 清单是纯内存操作，没有 IO，不套超时；也不占工具次数预算
                 // （由调用方用 `is_bookkeeping()` 判定）。
                 AiToolName::PlanUpdate => self.tool_plan_update(call, plan),
+                // 建计划同样纯内存。校验放在这里（而不是引擎里）：模型收到的
+                // `is_error` 就是它需要的「哪一步哪里不对」，改完重交即可。
+                AiToolName::PlanSubmit => self.tool_plan_submit(call, &budget.permissions, plan),
+                AiToolName::AnswerDirectly => Self::tool_answer_directly(call),
             }
         };
 
@@ -396,6 +410,8 @@ where
                     duration_ms,
                     motive: motive.clone(),
                     motive_source,
+                    step_id: call_step_id(call),
+                    attempt: None,
                 },
             },
             Err(err) => {
@@ -418,6 +434,8 @@ where
                         duration_ms,
                         motive: motive.clone(),
                         motive_source,
+                        step_id: call_step_id(call),
+                        attempt: None,
                     },
                 }
             }
@@ -1305,6 +1323,76 @@ days / folder / unread_only / flagged_only",
     }
 
     // -----------------------------------------------------------------------
+    // plan_submit / answer_directly（PLAN 阶段）
+    // -----------------------------------------------------------------------
+
+    /// 收到一份**新**计划。校验失败时清单保持不变，模型会收到可行动的错误文案。
+    ///
+    /// 允许的工具集合来自本次请求的权限快照：模型不能把一个用户关掉的能力
+    /// 写进计划——那会在执行期变成一条「工具已关闭」的错误，白烧一轮。
+    fn tool_plan_submit(
+        &self,
+        call: &AiToolCall,
+        permissions: &AiToolPermissions,
+        plan: &mut Option<Plan>,
+    ) -> Result<(String, String), CoreError> {
+        if !call.parse_ok {
+            return Err(CoreError::validation("参数不是合法 JSON"));
+        }
+        let args = &call.arguments;
+        let goal = arg_str(args, "goal", 120)
+            .ok_or_else(|| CoreError::validation("缺少 goal：一句话说清这次要做出什么成果"))?;
+        let raw_steps = args
+            .get("steps")
+            .and_then(Value::as_array)
+            .ok_or_else(|| CoreError::validation("缺少 steps（计划步骤数组）"))?;
+
+        let mut steps = Vec::with_capacity(raw_steps.len());
+        for item in raw_steps {
+            steps.push(plan_step_v2_from_json(item)?);
+        }
+
+        let now = now_unix();
+        let draft = Plan {
+            goal,
+            steps,
+            created_at: now,
+            updated_at: now,
+            ..Plan::default()
+        };
+        let allowed: Vec<AiToolName> = me_core::ai::TOOL_SPECS
+            .iter()
+            .filter(|spec| !spec.name.is_bookkeeping() && permissions.enabled(spec.name))
+            .map(|spec| spec.name)
+            .collect();
+        let next = validate_plan_v2(None, &draft, &allowed)?;
+        let summary = next.summary_line();
+        *plan = Some(next.clone());
+
+        Ok((
+            format!(
+                "计划已收到（{} 步）。现在逐步执行：每完成一步就用 plan_update 把该步标成 \
+done/failed/skipped 并写一句 evidence（拿到了什么）。{summary}",
+                next.steps.len()
+            ),
+            summary,
+        ))
+    }
+
+    /// 显式豁免：模型声明「这次不需要工具」。
+    fn tool_answer_directly(call: &AiToolCall) -> Result<(String, String), CoreError> {
+        if !call.parse_ok {
+            return Err(CoreError::validation("参数不是合法 JSON"));
+        }
+        let reason = arg_str(&call.arguments, "reason", 200)
+            .ok_or_else(|| CoreError::validation("缺少 reason：说明为什么这次不需要工具"))?;
+        Ok((
+            "已确认：本次不需要工具，请直接回答用户。".to_string(),
+            format!("直接回答：{reason}"),
+        ))
+    }
+
+    // -----------------------------------------------------------------------
     // plan_update
     // -----------------------------------------------------------------------
 
@@ -1338,6 +1426,7 @@ days / folder / unread_only / flagged_only",
             steps,
             created_at: plan.as_ref().map(|item| item.created_at).unwrap_or(now),
             updated_at: now,
+            ..Plan::default()
         };
         let next = validate_plan(plan.as_ref(), &draft)?;
         let summary = next.summary_line();
@@ -1394,13 +1483,95 @@ fn plan_step_from_json(value: &Value) -> Result<PlanStep, CoreError> {
         .filter(|text| !text.is_empty())
         .map(str::to_string);
 
-    Ok(PlanStep {
-        id,
-        capability,
-        title: title.to_string(),
-        status,
-        evidence,
-    })
+    let mut step = PlanStep::new(id, title, capability, status);
+    step.evidence = evidence;
+    Ok(step)
+}
+
+/// 把 `plan_submit` 的一个 step 对象转成 v2 的领域类型。
+///
+/// 与 [`plan_step_from_json`] 分开写：那个只接受 id/status/evidence（`plan_update`
+/// 的契约），这个要接受 kind/tool/args/expect/on_empty。混用一个函数会让
+/// `plan_update` 不小心也能改工具与参数——那等于绕过了「重列才换方案」的约束。
+fn plan_step_v2_from_json(value: &Value) -> Result<PlanStep, CoreError> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CoreError::validation("每一步都需要数字 id（1–8）"))?;
+    let id = u8::try_from(id).map_err(|_| CoreError::validation("步骤编号必须在 1–8 之间"))?;
+
+    let title = value
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| CoreError::validation(format!("第 {id} 步缺少 title")))?;
+
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(StepKind::parse)
+        .ok_or_else(|| {
+            CoreError::validation(format!(
+                "第 {id} 步的 kind 只能是 tool / reason / ask（收到 {:?}）",
+                value.get("kind")
+            ))
+        })?;
+
+    let capability = value
+        .get("capability")
+        .and_then(Value::as_str)
+        .and_then(Capability::parse)
+        .ok_or_else(|| {
+            CoreError::validation(format!(
+                "第 {id} 步的 capability 只能是 mail / weather / calendar / music"
+            ))
+        })?;
+
+    let tool = match value.get("tool").and_then(Value::as_str) {
+        Some(name) if !name.trim().is_empty() => {
+            let name = name.trim();
+            Some(AiToolName::parse(name).ok_or_else(|| {
+                CoreError::validation(format!(
+                    "第 {id} 步的 tool「{name}」不是已知工具：可用的是 email_search / mail_read / \
+weather_get / weather_locations / calendar_list / calendar_create / calendar_update / \
+calendar_delete / memory_upsert / music_search / music_play / music_state / music_control"
+                ))
+            })?)
+        }
+        _ => None,
+    };
+
+    let args = match value.get("args") {
+        Some(Value::Null) | None => None,
+        Some(object @ Value::Object(_)) => Some(object.clone()),
+        Some(_) => {
+            return Err(CoreError::validation(format!(
+                "第 {id} 步的 args 必须是对象，例如 {{\"unread_only\": true}}"
+            )));
+        }
+    };
+
+    let expect = value
+        .get("expect")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+
+    let on_empty = value
+        .get("on_empty")
+        .and_then(Value::as_str)
+        .and_then(OnEmpty::parse)
+        .unwrap_or_default();
+
+    let mut step = PlanStep::new(id, title, capability, PlanStatus::Pending);
+    step.kind = kind;
+    step.tool = tool;
+    step.args = args;
+    step.expect = expect;
+    step.on_empty = on_empty;
+    Ok(step)
 }
 
 fn location_matches(location: &me_core::WeatherLocation, name: &str) -> bool {

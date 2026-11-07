@@ -1610,6 +1610,8 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                     duration_ms,
                     motive,
                     motive_source,
+                    step_id: None,
+                    attempt: None,
                 });
             }
             Event::AiToolEmailResults {

@@ -62,14 +62,17 @@ pub const MAX_MODEL_NAME_CHARS: usize = 40;
 
 /// 每轮工具结果总字符上限。
 pub const MAX_TOOL_RESULT_CHARS: usize = 24_000;
-/// 一条用户消息最多几轮模型调用。
+/// 一条用户消息最多几轮模型调用（**全局**，不随阶段/重列重置）。
 ///
-/// 从 4 提到 6：一份 3 步清单至少要「建清单 → 逐步执行 → 收尾」三轮，
-/// 4 轮里只要有一轮空转就撞墙。清单工具不计入次数，但**计入轮次**，
-/// 所以轮次才是清单化的真实瓶颈。
-pub const MAX_TOOL_ROUNDS: u32 = 6;
-/// 一条用户消息最多几次工具调用（`plan_update` 不计）。
-pub const MAX_TOOL_CALLS: u32 = 12;
+/// 24 = PLAN 1–2 + EXECUTE 12 + REFLECT 2 + REPLAN/EXECUTE 4 + FINAL 2。
+/// 一次「20 轮还在跑」的对话对用户来说已经不可接受了，所以轮次和时间都要封顶。
+pub const MAX_TOOL_ROUNDS: u32 = 24;
+/// 一条用户消息最多几次**真实执行**的工具调用（bookkeeping 与熔断拦截不计）。
+///
+/// 24 = 8 步 × 3 次最坏情况。只统计真正产生 IO 的调用：
+/// 被首轮白名单拒绝的、被指纹熔断拦下的都不消耗预算，否则 6 次同参数报错
+/// 就能吃掉四分之一预算，模型还没来得及改参数就撞墙。
+pub const MAX_TOOL_CALLS: u32 = 24;
 
 /// 实体上下文最多条数与总字符。
 pub const MAX_ENTITY_CONTEXT: usize = 12;
@@ -575,6 +578,11 @@ pub enum AiToolName {
     MusicControl,
     /// 维护任务清单。不是「干活」的工具，是让模型把计划写下来的工具。
     PlanUpdate,
+    /// **建**计划（只有 PLAN 阶段下发）。EXECUTE 阶段不下发它：
+    /// 能新建计划就等于绕过了「重列不超过 2 次」的上限。
+    PlanSubmit,
+    /// 显式的豁免通道：把「这件事不需要清单」从隐式行为变成一条可审计的记录。
+    AnswerDirectly,
 }
 
 impl AiToolName {
@@ -594,6 +602,8 @@ impl AiToolName {
             AiToolName::MusicState => "music_state",
             AiToolName::MusicControl => "music_control",
             AiToolName::PlanUpdate => "plan_update",
+            AiToolName::PlanSubmit => "plan_submit",
+            AiToolName::AnswerDirectly => "answer_directly",
         }
     }
 
@@ -613,6 +623,8 @@ impl AiToolName {
             "music_state" => Some(AiToolName::MusicState),
             "music_control" => Some(AiToolName::MusicControl),
             "plan_update" => Some(AiToolName::PlanUpdate),
+            "plan_submit" => Some(AiToolName::PlanSubmit),
+            "answer_directly" => Some(AiToolName::AnswerDirectly),
             _ => None,
         }
     }
@@ -634,6 +646,8 @@ impl AiToolName {
             AiToolName::MusicState => "查看播放",
             AiToolName::MusicControl => "控制播放",
             AiToolName::PlanUpdate => "更新清单",
+            AiToolName::PlanSubmit => "提交计划",
+            AiToolName::AnswerDirectly => "直接回答",
         }
     }
 
@@ -657,13 +671,18 @@ impl AiToolName {
                 | AiToolName::MusicSearch
                 | AiToolName::MusicState
                 | AiToolName::PlanUpdate
+                | AiToolName::PlanSubmit
+                | AiToolName::AnswerDirectly
         )
     }
 
     /// 是不是「不产出业务结果」的工具：`plan_update` 只改清单，
     /// 不该占用用户可见的工具调用次数预算。
     pub fn is_bookkeeping(self) -> bool {
-        matches!(self, AiToolName::PlanUpdate)
+        matches!(
+            self,
+            AiToolName::PlanUpdate | AiToolName::PlanSubmit | AiToolName::AnswerDirectly
+        )
     }
 }
 
@@ -765,6 +784,12 @@ pub struct AiToolTrace {
     pub motive: Option<String>,
     #[serde(default)]
     pub motive_source: MotiveSource,
+    /// 这次调用绑定的是计划里的第几步（模型没写 `step_id` 时为 `None`）。
+    #[serde(default)]
+    pub step_id: Option<u8>,
+    /// 这是该步的第几次尝试（引擎在执行后回填）。
+    #[serde(default)]
+    pub attempt: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -828,7 +853,7 @@ pub struct AiContextRequest {
     pub selection: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiMessage {
     pub id: AiMessageId,
     pub conversation: AiConversationId,
@@ -1313,7 +1338,7 @@ impl AiToolPermissions {
             | AiToolName::MusicState
             | AiToolName::MusicControl => self.music,
             // 清单是引擎机制，不归用户开关管：关掉它模型就没法把多步需求说清楚。
-            AiToolName::PlanUpdate => true,
+            AiToolName::PlanUpdate | AiToolName::PlanSubmit | AiToolName::AnswerDirectly => true,
         }
     }
 }
@@ -1825,19 +1850,19 @@ unread_only / flagged_only / days 任意一个即可（只给时间窗或只给�
         },
         AiToolSpec {
             name: AiToolName::PlanUpdate,
-            description: "维护本轮的任务清单。只有需要 **2 步以上**或跨模块（邮件/天气/日历/音乐）\n的需求才建清单；一句话能答完的事情**不要**建。建好后每完成一步就调用一次，把该步改成\ndone/failed/skipped 并写一句 evidence（拿到了什么）。可以只传改动过的步骤，没提到的步骤\n保持原状态。",
+            description: "更新清单里某几步的状态与回执。每完成一步就调用一次，把该步改成\ndone/failed/skipped，并在 evidence 里写一句「拿到了什么」（不超过 120 字，不要贴原文）。\n只能改状态与 evidence，不能新增步骤、不能改标题——要换方案请重新走一轮计划。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "goal": {"type": "string", "maxLength": 120, "description": "这次要完成什么（首次必填）"},
+                    "goal": {"type": "string", "maxLength": 120, "description": "这次要完成什么（可省略，沿用原目标）"},
                     "steps": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": 6,
+                        "maxItems": 8,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "id": {"type": "integer", "minimum": 1, "maximum": 6},
+                                "id": {"type": "integer", "minimum": 1, "maximum": 8},
                                 "capability": {
                                     "type": "string",
                                     "enum": ["mail", "weather", "calendar", "music"]
@@ -1855,6 +1880,85 @@ unread_only / flagged_only / days 任意一个即可（只给时间窗或只给�
                     }
                 },
                 "required": ["steps"],
+                "additionalProperties": false
+            }),
+        },
+        AiToolSpec {
+            name: AiToolName::PlanSubmit,
+            description: "在动手之前，把这次要做的事写成任务清单（1–8 步）。\n**任何需要查数据或做动作的请求，都必须先调用它**：先把「我打算怎么做」写清楚给用户看，\n再开始执行。每一步要写：做什么（title）、类型（kind）、调哪个工具（tool）、\n传什么参数（args）、拿到什么才算成功（expect）。\n纯闲聊、纯知识问答、复述用户的话，才用 answer_directly 跳过。\n期望结果（expect）是给用户对账用的：写清了，用户才能在第一屏就发现你理解错了。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "minLength": 2,
+                        "maxLength": 120,
+                        "description": "一句话复述用户要的成果，必须可验收（例：找出值得优先处理的邮件并说明理由）"
+                    },
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "integer", "minimum": 1, "maximum": 8},
+                                "title": {
+                                    "type": "string",
+                                    "maxLength": 40,
+                                    "description": "这一步做什么，写具体的动作与对象（例：检索星标邮件）"
+                                },
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["tool", "reason", "ask"],
+                                    "description": "tool=调工具；reason=推理归纳；ask=需要用户补充信息（只能放最后一步）"
+                                },
+                                "capability": {
+                                    "type": "string",
+                                    "enum": ["mail", "weather", "calendar", "music"]
+                                },
+                                "tool": {
+                                    "type": "string",
+                                    "description": "kind=tool 时必填，如 email_search / mail_read / calendar_list"
+                                },
+                                "args": {
+                                    "type": "object",
+                                    "description": "调工具的参数。可以引用前面步骤的结果：{{\"message_id\": \"{{step.2.messages.0.message_id}}\"}}"
+                                },
+                                "expect": {
+                                    "type": "string",
+                                    "maxLength": 120,
+                                    "description": "拿到什么才算这一步成功（例：列出星标邮件，0 封也要说明）"
+                                },
+                                "on_empty": {
+                                    "type": "string",
+                                    "enum": ["narrow", "ask", "accept"],
+                                    "description": "0 命中时怎么办：narrow=缩小条件再来（默认）；ask=问用户；accept=接受空结果继续"
+                                }
+                            },
+                            "required": ["id", "title", "kind", "capability", "expect"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["goal", "steps"],
+                "additionalProperties": false
+            }),
+        },
+        AiToolSpec {
+            name: AiToolName::AnswerDirectly,
+            description: "声明「这次不需要清单」，并说明理由。只有**完全不需要工具**时才能用：\n纯闲聊、纯知识问答、复述用户的话、用户在问「你能做什么」。\n只要需要查邮件/日程/天气/曲库，就必须用 plan_submit，不能用本工具。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "minLength": 4,
+                        "maxLength": 200,
+                        "description": "为什么不需要工具与清单（例：用户在问怎么设置签名，属于纯知识问答）"
+                    }
+                },
+                "required": ["reason"],
                 "additionalProperties": false
             }),
         },
@@ -1901,6 +2005,69 @@ pub fn tool_specs(permissions: &AiToolPermissions) -> Vec<AiToolSpec> {
         .filter(|spec| permissions.enabled(spec.name))
         .cloned()
         .collect()
+}
+
+/// PLAN 阶段下发的工具：**只有** `plan_submit` 与 `answer_directly`。
+///
+/// 这是「强制清单」唯一真正可靠的实现方式：模型物理上没有 `email_search` 可调，
+/// 它想查邮件就必须先说要查什么。**不经 [`AiToolPermissions`] 过滤**——
+/// 它们是引擎机制，不是用户可以关掉的能力。
+pub fn plan_phase_tool_specs() -> Vec<AiToolSpec> {
+    TOOL_SPECS
+        .iter()
+        .filter(|spec| {
+            matches!(
+                spec.name,
+                AiToolName::PlanSubmit | AiToolName::AnswerDirectly
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// EXECUTE / REFLECT / FINAL 阶段下发的工具：能力工具 + `plan_update`。
+///
+/// **不含** `plan_submit` / `answer_directly`：能新建计划就等于绕过了
+/// 「重列不超过 2 次」的上限；已经开始执行了也不需要豁免通道。
+pub fn execute_phase_tool_specs(permissions: &AiToolPermissions) -> Vec<AiToolSpec> {
+    TOOL_SPECS
+        .iter()
+        .filter(|spec| {
+            !matches!(
+                spec.name,
+                AiToolName::PlanSubmit | AiToolName::AnswerDirectly
+            ) && permissions.enabled(spec.name)
+        })
+        .cloned()
+        .collect()
+}
+
+/// 一次工具调用的**业务参数**指纹。
+///
+/// 剔除 `motive` 与 `step_id`：模型「换个说法重发同一份参数」时
+/// `motive` 会变、语义不变，那正是要拦下的情况。
+pub fn call_fingerprint(tool: AiToolName, args: Option<&Value>) -> String {
+    let mut value = args.cloned().unwrap_or_else(|| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.remove("motive");
+        object.remove("step_id");
+    }
+    format!("{}:{value}", tool.as_str())
+}
+
+/// 该工具参数表里的键名（不含运行时注入的 `motive`）。
+///
+/// 计划期用它拦「参数名拼错 / 用了不存在的参数」。
+pub fn tool_argument_names(tool: AiToolName) -> Option<Vec<String>> {
+    let spec = TOOL_SPECS.iter().find(|spec| spec.name == tool)?;
+    let props = spec.input_schema.get("properties")?.as_object()?;
+    Some(
+        props
+            .keys()
+            .filter(|key| key.as_str() != "motive")
+            .cloned()
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2252,6 +2419,8 @@ mod tests {
                     | AiToolName::MusicSearch
                     | AiToolName::MusicState
                     | AiToolName::PlanUpdate
+                    | AiToolName::PlanSubmit
+                    | AiToolName::AnswerDirectly
             );
             assert_eq!(
                 spec.name.is_replay_safe(),
@@ -2296,8 +2465,12 @@ mod tests {
             memory: false,
         };
         let specs = tool_specs(&all_off);
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].name, AiToolName::PlanUpdate);
+        // 三个引擎机制工具不受开关控制：没有它们模型既写不下计划、也说不了「不需要计划」。
+        assert_eq!(specs.len(), 3);
+        let names: Vec<AiToolName> = specs.iter().map(|s| s.name).collect();
+        assert!(names.contains(&AiToolName::PlanUpdate));
+        assert!(names.contains(&AiToolName::PlanSubmit));
+        assert!(names.contains(&AiToolName::AnswerDirectly));
     }
 
     #[test]

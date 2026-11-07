@@ -135,6 +135,8 @@ fn messages_keep_chronological_order_and_round_trip_json() {
         duration_ms: 42,
         motive: Some("用户要查上周的报价单".to_string()),
         motive_source: MotiveSource::Model,
+        step_id: None,
+        attempt: None,
     };
     writable
         .finish_assistant_message(
@@ -236,6 +238,8 @@ fn unknown_tool_names_in_trace_are_dropped_not_fatal() {
         duration_ms: 20000,
         motive: None,
         motive_source: MotiveSource::Default,
+        step_id: None,
+        attempt: None,
     };
     writable
         .finish_assistant_message(
@@ -667,23 +671,13 @@ fn plan_round_trips_through_the_message_row() {
         id: "p_1760000000".to_string(),
         goal: "找出本周报价单并确认周五会议".to_string(),
         steps: vec![
-            PlanStep {
-                id: 1,
-                capability: Capability::Mail,
-                title: "检索报价单".to_string(),
-                status: PlanStatus::Done,
-                evidence: Some("命中 2 封".to_string()),
-            },
-            PlanStep {
-                id: 2,
-                capability: Capability::Calendar,
-                title: "查周五 15:00".to_string(),
-                status: PlanStatus::Pending,
-                evidence: None,
-            },
+            PlanStep::new(1, "检索报价单", Capability::Mail, PlanStatus::Done)
+                .with_evidence("命中 2 封"),
+            PlanStep::new(2, "查周五 15:00", Capability::Calendar, PlanStatus::Pending),
         ],
         created_at: 1_760_000_000,
         updated_at: 1_760_000_010,
+        ..Plan::default()
     };
     writable
         .finish_assistant_message(

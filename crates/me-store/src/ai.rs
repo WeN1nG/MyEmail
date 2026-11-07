@@ -111,6 +111,11 @@ struct ToolTraceRow {
     motive: Option<String>,
     #[serde(default)]
     motive_source: String,
+    /// v2 起才有：这次调用绑定第几步、第几次尝试。老行读成 `None`。
+    #[serde(default)]
+    step_id: Option<u8>,
+    #[serde(default)]
+    attempt: Option<u8>,
 }
 
 impl ToolTraceRow {
@@ -123,6 +128,8 @@ impl ToolTraceRow {
             duration_ms: trace.duration_ms,
             motive: trace.motive.clone(),
             motive_source: trace.motive_source.as_str().to_string(),
+            step_id: trace.step_id,
+            attempt: trace.attempt,
         }
     }
 
@@ -137,6 +144,8 @@ impl ToolTraceRow {
             // 未知来源按「模型说的」处理：老数据没有这个字段，而它的 motive 本来就是
             // 模型写的；真缺失时 motive 也是 None，界面不会误显示成默认值。
             motive_source: MotiveSource::parse(&self.motive_source).unwrap_or_default(),
+            step_id: self.step_id,
+            attempt: self.attempt,
         })
     }
 }
@@ -1020,23 +1029,13 @@ mod tests {
             id: "p_1".to_string(),
             goal: "跑两步".to_string(),
             steps: vec![
-                PlanStep {
-                    id: 1,
-                    capability: Capability::Mail,
-                    title: "第一步".to_string(),
-                    status: PlanStatus::Done,
-                    evidence: Some("已完成".to_string()),
-                },
-                PlanStep {
-                    id: 2,
-                    capability: Capability::Weather,
-                    title: "第二步".to_string(),
-                    status: PlanStatus::Running,
-                    evidence: None,
-                },
+                PlanStep::new(1, "第一步", Capability::Mail, PlanStatus::Done)
+                    .with_evidence("已完成"),
+                PlanStep::new(2, "第二步", Capability::Weather, PlanStatus::Running),
             ],
             created_at: 1,
             updated_at: 1,
+            ..Plan::default()
         };
         writable
             .finish_assistant_message(
