@@ -46,6 +46,13 @@ pub enum Capability {
     Weather,
     Calendar,
     Music,
+    /// 不属于任何特定能力：推理归纳（`kind=reason`）、向用户提问（`kind=ask`）。
+    ///
+    /// 这两类步骤不调工具，硬让模型填一个领域只会让它瞎猜——
+    /// 2026-11-07 的事故里，模型为了一步 `reason` 连续改了 4 次
+    /// `capability`（试过省略、试过空串、试过改成 tool 步），白白烧掉
+    /// 4 次工具往返。推理步骤本来就没有「属于哪个工具模块」的概念。
+    General,
 }
 
 impl Capability {
@@ -55,6 +62,7 @@ impl Capability {
             Capability::Weather => "weather",
             Capability::Calendar => "calendar",
             Capability::Music => "music",
+            Capability::General => "general",
         }
     }
 
@@ -64,6 +72,7 @@ impl Capability {
             "weather" => Some(Capability::Weather),
             "calendar" => Some(Capability::Calendar),
             "music" => Some(Capability::Music),
+            "general" => Some(Capability::General),
             _ => None,
         }
     }
@@ -74,6 +83,7 @@ impl Capability {
             Capability::Weather => "天气",
             Capability::Calendar => "日历",
             Capability::Music => "音乐",
+            Capability::General => "通用",
         }
     }
 }
@@ -176,6 +186,11 @@ impl StepKind {
             StepKind::Reason => "推理",
             StepKind::Ask => "待确认",
         }
+    }
+
+    /// 是否是「要调工具」的步骤。只有工具步需要 `capability`。
+    pub fn is_tool(self) -> bool {
+        matches!(self, StepKind::Tool)
     }
 }
 
@@ -1504,7 +1519,10 @@ pub fn validate_plan(prev: Option<&Plan>, next: &Plan) -> Result<Plan, CoreError
                         step.id, old.title
                     )));
                 }
-                if old.capability != step.capability {
+                // `General` 意味着「模型没写 / 写不出来」，不是「要改成通用」。
+                // 拿它跟旧步的具体领域一比就会误判成「改能力」，把正常的
+                // 状态回填挡在门外——所以这里放行，合并时沿用旧步的值。
+                if step.capability != Capability::General && old.capability != step.capability {
                     return Err(CoreError::validation(format!(
                         "第 {} 步的所属能力不能修改（原为 {}）",
                         step.id,
@@ -1530,7 +1548,18 @@ pub fn validate_plan(prev: Option<&Plan>, next: &Plan) -> Result<Plan, CoreError
                 let mut merged = old;
                 merged.title = title;
                 merged.status = step.status;
-                if evidence.is_some() {
+                // **引擎记过事实的步骤，evidence 不能被模型复述覆盖。**
+                //
+                // 2026-11-07 的事故：email_search 实际返回 20 封，引擎把
+                // 「检索到 20 封」写进了这一步的 evidence；模型随后调
+                // `plan_update` 写「已检索近7天邮件样本，拿到 50 封邮件摘要
+                // 列表」，把真实回执盖掉了。清单是给用户对账的，对不上账的
+                // 回执比没有回执更糟。
+                //
+                // 判定用「attempts > 0 且已有 evidence」：attempts 只由引擎的
+                // `record_attempts` 递增，模型改不了。模型在自己跑工具之前
+                // 写的复述照常采纳——那一步引擎还没碰过。
+                if evidence.is_some() && !(merged.attempts > 0 && merged.evidence.is_some()) {
                     merged.evidence = evidence;
                 }
                 merged
@@ -3203,5 +3232,62 @@ mod tests {
         assert_eq!(plan.steps[0].kind, StepKind::Tool);
         assert_eq!(plan.steps[0].attempts, 0);
         assert!(!plan.is_executable());
+    }
+
+    /// 引擎记过事实后，模型复述的 evidence 不能覆盖它。
+    ///
+    /// 2026-11-07 的事故：email_search 实际返回 20 封，引擎把「检索到 20 封」
+    /// 写进步骤；模型随后调 `plan_update` 写「拿到 50 封邮件摘要列表」，
+    /// 把真实回执盖掉。清单是给用户对账的，对不上账的回执比没有更糟。
+    #[test]
+    fn engine_recorded_evidence_survives_a_model_restatement() {
+        let mut first = step(1, "检索邮件", PlanStatus::Pending);
+        first.tool = Some(crate::ai::AiToolName::EmailSearch);
+        let plan = validate_plan(None, &draft("找邮件", vec![first])).expect("应当通过");
+
+        // 引擎跑完工具：attempts 递增，evidence 是工具的真实回执。
+        let mut engine_plan = plan.clone();
+        engine_plan.record_attempts(
+            1,
+            1,
+            AttemptOutcome::Done {
+                evidence: "检索到 20 封".to_string(),
+            },
+        );
+        assert_eq!(
+            engine_plan.steps[0].evidence.as_deref(),
+            Some("检索到 20 封")
+        );
+
+        // 模型随后回填：说「拿到 50 封」。
+        let mut model_step = step(1, "检索邮件", PlanStatus::Done);
+        model_step.tool = Some(crate::ai::AiToolName::EmailSearch);
+        model_step.evidence = Some("已检索近7天邮件样本，拿到50封邮件摘要列表".to_string());
+        let merged = validate_plan(Some(&engine_plan), &draft("找邮件", vec![model_step]))
+            .expect("应当通过");
+
+        assert_eq!(
+            merged.steps[0].evidence.as_deref(),
+            Some("检索到 20 封"),
+            "引擎记下的真实回执不能被模型的复述覆盖"
+        );
+    }
+
+    /// 但模型在引擎跑工具**之前**写的复述要照常采纳——
+    /// 那一步引擎还没碰过，模型说的是它自己的计划。
+    #[test]
+    fn model_evidence_before_any_tool_run_is_kept() {
+        let mut first = step(1, "检索邮件", PlanStatus::Pending);
+        first.tool = Some(crate::ai::AiToolName::EmailSearch);
+        let plan = validate_plan(None, &draft("找邮件", vec![first])).expect("应当通过");
+        assert_eq!(plan.steps[0].attempts, 0);
+
+        let mut model_step = step(1, "检索邮件", PlanStatus::Running);
+        model_step.tool = Some(crate::ai::AiToolName::EmailSearch);
+        model_step.evidence = Some("准备开始检索".to_string());
+        let merged =
+            validate_plan(Some(&plan), &draft("找邮件", vec![model_step])).expect("应当通过");
+
+        assert_eq!(merged.steps[0].evidence.as_deref(), Some("准备开始检索"));
     }
 }

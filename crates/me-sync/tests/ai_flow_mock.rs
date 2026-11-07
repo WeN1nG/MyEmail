@@ -3283,3 +3283,146 @@ async fn email_cards_ride_along_with_the_persisted_trace() {
         "命中理由也要带上：{trace:?}"
     );
 }
+
+/// 失败的清单类调用（plan_submit）必须留下痕迹。
+///
+/// 2026-11-07 的事故：模型为了一份清单连续改了 4 次 capability 参数，
+/// 4 次工具往返全废在参数上——而 plan_submit 是 bookkeeping 工具，
+/// 失败时既不发事件也不进 trace，用户界面上一个字都看不到。
+///
+/// 成功的 plan_submit 仍然不显示（清单条本身就是它的展示位）。
+#[tokio::test]
+async fn failed_plan_submit_is_visible_in_the_trace() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        // 第一份清单：第 2 步的 tool 写错 → 参数校验失败。
+        Turn::with_tool(AiToolCall {
+            id: "bad_plan".to_string(),
+            name: AiToolName::PlanSubmit,
+            parse_ok: true,
+            arguments: json!({
+                "motive": "先建个清单",
+                "goal": "查看邮件",
+                "steps": [
+                    {
+                        "id": 1,
+                        "title": "检索近 7 天邮件",
+                        "kind": "tool",
+                        "capability": "mail",
+                        "tool": "email_search",
+                        "args": {"days": 7},
+                        "expect": "拿到邮件列表"
+                    },
+                    {
+                        "id": 2,
+                        "title": "归纳成一段结论",
+                        "kind": "tool",
+                        "capability": "mail",
+                        "tool": "not_a_real_tool",
+                        "expect": "给出一段可读的归纳"
+                    }
+                ]
+            }),
+        }),
+        // 第二份清单：参数正确 → 成功。
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查最近的邮件", "days": 7 }),
+        )),
+        Turn::text("近 7 天没有新的邮件。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看我的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let submits: Vec<_> = message
+        .tool_trace
+        .iter()
+        .filter(|trace| trace.tool == AiToolName::PlanSubmit)
+        .collect();
+    assert!(
+        !submits.is_empty(),
+        "失败的 plan_submit 必须出现在 trace 里，用户才知道模型试了几次：{:?}",
+        message.tool_trace
+    );
+    assert!(
+        submits
+            .iter()
+            .any(|trace| trace.status == me_core::ai::AiToolStatus::Error),
+        "失败的 plan_submit 状态应为 error：{submits:?}"
+    );
+}
+
+/// 纯按时间窗检索时，卡片的命中理由要有区分度。
+///
+/// 2026-11-07 的事故：模型用 `days:7` 检索，20 张卡片的理由全是同一句
+/// 「匹配筛选条件」——用户看不出任何区别，也无法判断模型有没有理解错。
+#[tokio::test]
+async fn time_window_search_gives_cards_a_readable_reason() {
+    let (_dir, store) = open();
+    let now = me_core::now_unix();
+    seed_mail(
+        &store,
+        &[
+            ("近的那封", "a@example.com", now - 3600, 0b100),
+            ("远的那封", "b@example.com", now - 86400 * 3, 0b000),
+        ],
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "看最近的邮件", "days": 7 }),
+        )),
+        Turn::text("近 7 天有 2 封。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看最近的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let trace = message
+        .tool_trace
+        .iter()
+        .find(|trace| trace.tool == AiToolName::EmailSearch)
+        .expect("要有 email_search 的 trace");
+    assert!(!trace.cards.is_empty(), "应当有卡片：{trace:?}");
+    for card in &trace.cards {
+        assert!(
+            card.reason.contains("7 天") || card.reason.contains("近"),
+            "时间窗检索的理由要能看出是按时间筛的：{:?}",
+            card.reason
+        );
+        assert_ne!(
+            card.reason, "匹配筛选条件",
+            "不能退回无信息量的兜底文案：{:?}",
+            card.reason
+        );
+    }
+}

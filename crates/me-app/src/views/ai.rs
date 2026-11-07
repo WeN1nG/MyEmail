@@ -215,8 +215,8 @@ pub struct AiPageState {
     /// 表单校验失败的原因（保存前在本地拦一次，不依赖后端回包）。
     pub form_error: Option<String>,
 
-    /// 已解析的 Markdown 缓存：`(message, 长度, blocks)`。
-    blocks_cache: Option<(AiMessageId, usize, Vec<Block>)>,
+    /// 已解析的 Markdown 缓存（见 [`BlocksCache`]）。
+    blocks_cache: Option<BlocksCache>,
     pub loading: bool,
 }
 
@@ -486,9 +486,13 @@ pub fn sidebar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::
 ///
 /// 设置不占用主区——它是独立弹窗（`settings_modal`），否则点开设置后对话就被顶掉了，
 /// 关掉设置还得再来一次「切页回 AI」才能看到记录。
-/// 已解析的 Markdown 缓存：`(message, 长度, blocks)`。
-type BlocksCache = (AiMessageId, usize, Vec<Block>);
-
+/// 已解析的 Markdown 缓存。
+///
+/// `(消息 id, 正文长度, 尾部长度, 正文块, 尾部块)`。
+///
+/// **两段**而不是一段：`[结果]` 段落之后可能还有正文（模型把 `[结果]` 放在
+/// 回复开头时，真正的答案就在后面）。两段各自缓存，否则每帧都要重解析。
+type BlocksCache = (AiMessageId, usize, usize, Vec<Block>, Vec<Block>);
 /// 渲染时需要的可变位。
 ///
 /// **刻意不含 `&mut UiState`**：`TurnView` 从消息借用，若 ctx 也借 state
@@ -917,12 +921,17 @@ fn show_tools(
                     (Some(id), _) => format!("第 {id} 步 · "),
                     _ => String::new(),
                 };
+                // 耗时为 0 说明这次调用**根本没跑**（被同参数熔断拦下，
+                // 或阶段校验拒绝）——显示「0 ms」会让人以为是瞬间完成的。
+                let duration = match trace.duration_ms {
+                    0 => String::new(),
+                    ms => format!(" · {ms} ms"),
+                };
                 ui.label(
                     RichText::new(format!(
-                        "{mark} {step}{} · {} · {} ms",
+                        "{mark} {step}{} · {}{duration}",
                         trace.tool.label(),
                         trace.summary,
-                        trace.duration_ms
                     ))
                     .small(),
                 );
@@ -1024,23 +1033,31 @@ fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
         );
     } else {
         // 先切出 `[结果]` 段落，再按 Markdown 渲染叙述部分。
-        let (body, result) = match split_result_block(&message.content) {
-            Some((body, block)) => (body, Some(block)),
-            None => (message.content.as_str(), None),
+        //
+        // `tail` 是四行字段之后的剩余正文。模型把 `[结果]` 放在回复**开头**时
+        // （规范要求它收尾，但模型不总照做），用户要的答案就在 tail 里——
+        // 它必须被渲染出来，否则整条回复只剩一个空结果框。
+        let split = split_result_block(&message.content);
+        let (body, tail, result) = match &split {
+            Some(split) => (split.body, split.tail, Some(&split.block)),
+            None => (message.content.as_str(), "", None),
         };
         let cache_hit = matches!(
             ctx.blocks_cache.as_ref(),
-            Some((id, len, _)) if *id == message.id && *len == body.len()
+            Some((id, body_len, tail_len, _, _))
+                if *id == message.id && *body_len == body.len() && *tail_len == tail.len()
         );
         if !cache_hit {
-            let blocks = markdown_to_blocks(body);
-            *ctx.blocks_cache = Some((message.id, body.len(), blocks));
+            let body_blocks = markdown_to_blocks(body);
+            let tail_blocks = markdown_to_blocks(tail);
+            *ctx.blocks_cache =
+                Some((message.id, body.len(), tail.len(), body_blocks, tail_blocks));
         }
-        if let Some((_, _, blocks)) = ctx.blocks_cache.as_ref() {
-            show_with_images(ui, blocks, None);
+        if let Some((_, _, _, body_blocks, _)) = ctx.blocks_cache.as_ref() {
+            show_with_images(ui, body_blocks, None);
         }
         match result {
-            Some(block) => show_result_block(ui, &block),
+            Some(block) => show_result_block(ui, block),
             // 模型漏写 [结果] 时用本轮工具回执兜底：只给事实，不假装有结论。
             None if message.status == AiMessageStatus::Complete
                 && !message.tool_trace.is_empty() =>
@@ -1048,6 +1065,13 @@ fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
                 show_result_fallback(ui, &message.tool_trace);
             }
             None => {}
+        }
+        // 结果块之后的正文接在结果块下面，保持原文顺序。
+        if !tail.is_empty()
+            && let Some((_, _, _, _, tail_blocks)) = ctx.blocks_cache.as_ref()
+        {
+            ui.add_space(6.0);
+            show_with_images(ui, tail_blocks, None);
         }
     }
     if message.status == AiMessageStatus::Failed {
@@ -1308,15 +1332,34 @@ struct ResultBlock {
     todo: String,
 }
 
+/// `[结果]` 的切分结果。
+struct ResultSplit<'a> {
+    /// `[结果]` 之前的叙述部分。
+    body: &'a str,
+    /// 解析出来的四个字段。
+    block: ResultBlock,
+    /// 四行字段**之后**剩下的正文。
+    ///
+    /// 规范要求 `[结果]` 段落**收尾**，但模型不总是照做——它有时把 `[结果]`
+    /// 放在回复开头，真正的答案跟在四行字段后面。这部分不是可有可无的
+    /// 装饰，它就是用户要看的内容，丢掉等于整段回复只剩一个空壳。
+    tail: &'a str,
+}
+
+/// `[结果]` 的四个字段名。用来定位「字段区」的结束位置。
+const RESULT_FIELDS: [&str; 4] = ["状态：", "做了什么：", "关键信息：", "未完成："];
+
 /// 把回复切成「叙述」与「`[结果]` 段落」。
 ///
-/// 三条判定规则（都有对应单测）：
+/// 四条判定规则（都有对应单测）：
 /// 1. 只认**独占一行**的 `[结果]`，两侧空白允许；
 /// 2. 跳过 fenced code 区间——用户在聊 Markdown 时，示例里的 `[结果]` 不是真段落；
-/// 3. 四行字段一个都解析不出来时返回 `None`，整段当正文，绝不吞掉内容。
+/// 3. 四行字段一个都解析不出来时返回 `None`，整段当正文，绝不吞掉内容；
+/// 4. 四行字段**之后**的剩余内容单独返回（`tail`），不能丢——模型把
+///    `[结果]` 放在开头时，真正的答案就在那里。
 ///
 /// 流式期间可能出现 `[结`、`[结果` 这类半截，它们不满足「整行等于」，自然被当正文。
-fn split_result_block(content: &str) -> Option<(&str, ResultBlock)> {
+fn split_result_block(content: &str) -> Option<ResultSplit<'_>> {
     let mut in_code = false;
     let mut marker: Option<(usize, usize)> = None;
     let mut offset = 0usize;
@@ -1334,22 +1377,44 @@ fn split_result_block(content: &str) -> Option<(&str, ResultBlock)> {
 
     let body = content[..start].trim_end();
     let tail = content[end..].trim_start_matches(['\n', '\r']);
-    let (mut status, mut done, mut key, mut todo) = (None, None, None, None);
-    for line in tail.lines() {
-        let line = line.trim();
-        if let Some(value) = line.strip_prefix("状态：") {
-            status = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("做了什么：") {
-            done = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("关键信息：") {
-            key = Some(value.trim().to_string());
-        } else if let Some(value) = line.strip_prefix("未完成：") {
-            todo = Some(value.trim().to_string());
+
+    // 只在**开头的字段区**里找这四行：字段区之后的内容是正文，
+    // 不该再被当成字段解析（否则正文里的「状态：」会把结果块撑变形）。
+    let mut status = None;
+    let mut done = None;
+    let mut key = None;
+    let mut todo = None;
+    let mut content_start = None;
+    let mut offset = 0usize;
+    for line in tail.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some(prefix) = RESULT_FIELDS
+            .iter()
+            .find(|prefix| trimmed.starts_with(**prefix))
+        {
+            let value = trimmed[prefix.len()..].trim().to_string();
+            match *prefix {
+                "状态：" => status = Some(value),
+                "做了什么：" => done = Some(value),
+                "关键信息：" => key = Some(value),
+                _ => todo = Some(value),
+            }
+        } else if !trimmed.is_empty() {
+            // 第一个既不是字段也不是空行的行 = 正文从这里开始。
+            content_start = Some(offset);
+            break;
         }
+        offset += line.len();
     }
     if status.is_none() && done.is_none() && key.is_none() && todo.is_none() {
         return None;
     }
+    // 四行字段之后的剩余正文。模型把 `[结果]` 放在回复开头时，
+    // 用户要看的答案就在这里——它必须被返回，不能丢。
+    let rest = match content_start {
+        Some(at) => tail[at..].trim_start_matches(['\n', '\r']),
+        None => "",
+    };
     let dash = "—".to_string();
     // 空值也补「—」：流式到 `状态：` 就断掉时，不能渲染成一个空白标签。
     let fill = |value: Option<String>| {
@@ -1357,15 +1422,16 @@ fn split_result_block(content: &str) -> Option<(&str, ResultBlock)> {
             .filter(|text| !text.is_empty())
             .unwrap_or_else(|| dash.clone())
     };
-    Some((
+    Some(ResultSplit {
         body,
-        ResultBlock {
+        block: ResultBlock {
             status: fill(status),
             done: fill(done),
             key: fill(key),
             todo: fill(todo),
         },
-    ))
+        tail: rest,
+    })
 }
 
 fn show_result_block(ui: &mut egui::Ui, block: &ResultBlock) {
@@ -2361,12 +2427,13 @@ mod tests {
     #[test]
     fn result_block_is_split_off_the_narrative() {
         let content = "已找到 2 封，最新一封是 11-04。\n\n[结果]\n状态：已完成\n做了什么：检索了本周邮件\n关键信息：2 封命中\n未完成：无";
-        let (body, block) = split_result_block(content).expect("应当切出结果段");
-        assert_eq!(body, "已找到 2 封，最新一封是 11-04。");
-        assert_eq!(block.status, "已完成");
-        assert_eq!(block.done, "检索了本周邮件");
-        assert_eq!(block.key, "2 封命中");
-        assert_eq!(block.todo, "无");
+        let split = split_result_block(content).expect("应当切出结果段");
+        assert_eq!(split.body, "已找到 2 封，最新一封是 11-04。");
+        assert_eq!(split.block.status, "已完成");
+        assert_eq!(split.block.done, "检索了本周邮件");
+        assert_eq!(split.block.key, "2 封命中");
+        assert_eq!(split.block.todo, "无");
+        assert_eq!(split.tail, "", "结果段收尾时后面没有正文");
     }
 
     #[test]
@@ -2378,9 +2445,12 @@ mod tests {
             "已找到 2 封\n[结果]\n状态：",
         ] {
             match split_result_block(content) {
-                Some((body, block)) => {
-                    assert!(content.contains(body) || body.is_empty());
-                    assert!(!block.status.is_empty(), "缺字段要填空值而不是丢掉整段");
+                Some(split) => {
+                    assert!(content.contains(split.body) || split.body.is_empty());
+                    assert!(
+                        !split.block.status.is_empty(),
+                        "缺字段要填空值而不是丢掉整段"
+                    );
                 }
                 None => assert!(!content.contains("状态：")),
             }
@@ -2405,10 +2475,75 @@ mod tests {
     #[test]
     fn result_block_fills_missing_fields_with_dash() {
         let content = "正文\n[结果]\n状态：部分完成";
-        let (_, block) = split_result_block(content).expect("有状态就够");
-        assert_eq!(block.done, "—");
-        assert_eq!(block.key, "—");
-        assert_eq!(block.todo, "—");
+        let split = split_result_block(content).expect("有状态就够");
+        assert_eq!(split.block.done, "—");
+        assert_eq!(split.block.key, "—");
+        assert_eq!(split.block.todo, "—");
+    }
+
+    /// 复现 2026-11-07 的真实事故：模型把 `[结果]` 放在**开头**，
+    /// 真正的答案（503 字画像）跟在四行字段之后。
+    ///
+    /// 旧实现只把 `[结果]` 之前的内容当正文，tail 整段被丢弃——
+    /// 用户看到的只剩一个空结果框，真正的答案一个字都不显示。
+    #[test]
+    fn result_marker_at_head_does_not_swallow_the_answer() {
+        let content = "\n\n\n[结果]\n状态：已完成\n做了什么：检索了20封\n关键信息：画像\n未完成：无\n\n---\n\n## 用户画像：文宁\n\n### 基础信息\n- 姓名：文宁";
+        let split = split_result_block(content).expect("应当切出结果段");
+        assert_eq!(split.block.status, "已完成");
+        assert_eq!(split.body, "", "[结果] 在开头时前面没有正文");
+        assert!(
+            split.tail.contains("## 用户画像：文宁"),
+            "四行字段之后的正文不能丢：{:?}",
+            split.tail
+        );
+        assert!(split.tail.contains("姓名：文宁"));
+    }
+
+    /// 端到端：模型把 `[结果]` 放在开头时，用户在界面上必须看得到画像。
+    ///
+    /// 这是 2026-11-07 的真实事故——流式期间能看见（纯文本直出），
+    /// 流结束重载后画像消失，用户以为内容出 bug。
+    #[test]
+    fn answer_with_result_at_head_still_shows_the_profile() {
+        let mut state = ready();
+        let mut message = assistant_message(
+            40,
+            "\n\n\n[结果]\n状态：已完成\n做了什么：检索了近7天的20封邮件样本进行分析\n\
+             关键信息：基于2026年11月2日-7日的邮件，识别出以下画像特征\n未完成：无\n\n---\n\n\
+             ## 用户画像：文宁\n\n### 基础信息\n- **姓名**：文宁",
+        );
+        message.status = AiMessageStatus::Complete;
+        state.ai.messages.push(message);
+
+        let texts = main_texts(&mut state);
+        assert!(
+            texts.iter().any(|t| t.contains("用户画像")),
+            "画像标题没显示：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("文宁")),
+            "画像内容没显示：{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("检索了近7天的20封邮件样本")),
+            "结果块不该丢：{texts:?}"
+        );
+    }
+
+    /// 四行字段之后的正文若自身含有「状态：」之类，不该被当成字段解析。
+    #[test]
+    fn fields_after_the_block_are_not_reparsed() {
+        let content = "[结果]\n状态：已完成\n\n正文里的状态：随便写\n";
+        let split = split_result_block(content).expect("应当切出结果段");
+        assert_eq!(split.block.status, "已完成");
+        assert!(
+            split.tail.contains("状态：随便写"),
+            "字段区之后的内容是正文：{:?}",
+            split.tail
+        );
     }
 
     // ---- 清单条 v2 ----

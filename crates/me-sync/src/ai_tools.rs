@@ -651,7 +651,14 @@ where
             }
         };
 
-        let duration_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        // 耗时向上取整到毫秒：`as_millis()` 是**向下**截断，本地 SQLite 查询
+        // 常常不到 1ms，截断后恒为 0——界面上就成了一排「0 ms」，看不出任何信息。
+        // 向上取整后，「跑过但很快」显示 1ms，「没跑过」（被拦下的调用）仍是 0。
+        let duration_ms = started
+            .elapsed()
+            .as_micros()
+            .div_ceil(1000)
+            .min(u32::MAX as u128) as u32;
         match outcome {
             Ok((content, summary)) => AiToolResult {
                 call_id: call.id.clone(),
@@ -736,6 +743,11 @@ where
         let reason_text = arg_str(args, "query", 200);
         let reason_subject = arg_str(args, "subject", 200);
         let reason_from = arg_str(args, "from", 320);
+        // 时间范围这类条件没有「命中」可言，但它**确实**是筛选依据。
+        // 不告诉用户，20 张卡片就全是同一句「匹配筛选条件」，毫无信息量。
+        let reason_window = arg_u32(args, "days")
+            .map(|days| format!("近 {days} 天"))
+            .or_else(|| arg_str(args, "after", 40).map(|after| format!("{after} 之后")));
         let outcome = self.search_mail(query, 20).await?;
         let messages = outcome.messages;
         let folder_names = self.folder_names().await;
@@ -749,6 +761,7 @@ where
                     reason_subject.as_deref(),
                     reason_from.as_deref(),
                     reason_text.as_deref(),
+                    reason_window.as_deref(),
                 ),
             })
             .collect();
@@ -1862,18 +1875,16 @@ fn plan_step_from_json(value: &Value) -> Result<PlanStep, CoreError> {
     let id = value
         .get("id")
         .and_then(Value::as_u64)
-        .ok_or_else(|| CoreError::validation("每一步都需要数字 id（1–6）"))?;
-    let id = u8::try_from(id).map_err(|_| CoreError::validation("步骤编号必须在 1–6 之间"))?;
+        .ok_or_else(|| CoreError::validation("每一步都需要数字 id（1–8）"))?;
+    let id = u8::try_from(id).map_err(|_| CoreError::validation("步骤编号必须在 1–8 之间"))?;
 
+    // 缺失或非法都记成 `general`：合并时若旧步有具体领域，会沿用旧步的，
+    // 所以模型在 `plan_update` 里不写 capability 也不会被拒。
     let capability = value
         .get("capability")
         .and_then(Value::as_str)
         .and_then(Capability::parse)
-        .ok_or_else(|| {
-            CoreError::validation(format!(
-                "第 {id} 步的 capability 只能是 mail / weather / calendar / music"
-            ))
-        })?;
+        .unwrap_or(Capability::General);
 
     let title = value
         .get("title")
@@ -1934,15 +1945,21 @@ fn plan_step_v2_from_json(value: &Value) -> Result<PlanStep, CoreError> {
             ))
         })?;
 
-    let capability = value
-        .get("capability")
-        .and_then(Value::as_str)
-        .and_then(Capability::parse)
-        .ok_or_else(|| {
-            CoreError::validation(format!(
-                "第 {id} 步的 capability 只能是 mail / weather / calendar / music"
-            ))
-        })?;
+    // `capability` 只在工具步有意义——推理步（kind=reason）与提问步（kind=ask）
+    // 不调任何工具，硬要求它填一个领域只会逼模型瞎猜。
+    //
+    // 2026-11-07 的事故：模型为了一步 reason 连续改了 4 次 capability
+    // （试过省略、试过空串、试过整步改成 tool），4 次工具往返全废在参数上。
+    // 这里对非工具步放宽：缺失或非法都记成 `general`。
+    let capability = match value.get("capability").and_then(Value::as_str) {
+        Some(text) => Capability::parse(text.trim()).unwrap_or(Capability::General),
+        None => Capability::General,
+    };
+    if kind.is_tool() && capability == Capability::General {
+        return Err(CoreError::validation(format!(
+            "第 {id} 步是工具步，必须写 capability：mail / weather / calendar / music"
+        )));
+    }
 
     let tool = match value.get("tool").and_then(Value::as_str) {
         Some(name) if !name.trim().is_empty() => {
@@ -2006,11 +2023,16 @@ fn location_matches(location: &me_core::WeatherLocation, name: &str) -> bool {
 ///
 /// 只依据已经下发的筛选条件反推，不额外调模型——卡片上那句「主题命中」必须是
 /// 真实原因，编一句解释比不解释更糟。
+///
+/// `window` 是时间范围类的条件（「近 7 天」）。它没有「命中」语义，
+/// 但确实是筛选依据——不显示的话，纯按时间查出来的卡片会全部挂着同一句
+/// 「匹配筛选条件」，用户看不出任何区别。
 fn card_reason(
     message: &MessageSummary,
     subject: Option<&str>,
     from: Option<&str>,
     text: Option<&str>,
+    window: Option<&str>,
 ) -> String {
     let contains =
         |haystack: &str, needle: &str| haystack.to_lowercase().contains(&needle.to_lowercase());
@@ -2039,6 +2061,9 @@ fn card_reason(
             return format!("正文片段命中「{word}」");
         }
         return format!("匹配「{word}」");
+    }
+    if let Some(window) = window {
+        return format!("{window}内");
     }
     "匹配筛选条件".to_string()
 }
@@ -2263,5 +2288,73 @@ mod tests {
             budget.mail_read, 2,
             "重试前要退回配额，否则第二次就撞上「已读 3 次」"
         );
+    }
+
+    /// 复现 2026-11-07 的事故：模型为了一步 `kind=reason`，连续 4 次改
+    /// `capability`（省略 / 空串 / 改成 tool 步），4 次工具往返全废在参数上。
+    ///
+    /// 推理步不调工具，本来就没有「属于哪个能力模块」的概念——
+    /// 不该逼模型猜。
+    #[test]
+    fn reason_step_does_not_need_capability() {
+        let value = serde_json::json!({
+            "id": 2,
+            "title": "归纳成一段结论",
+            "kind": "reason",
+            "expect": "给出一段可读的归纳",
+        });
+        let step = plan_step_v2_from_json(&value).expect("推理步不该被 capability 卡住");
+        assert_eq!(step.capability, Capability::General);
+        assert_eq!(step.kind.as_str(), "reason");
+        assert!(step.tool.is_none(), "推理步不能带 tool");
+    }
+
+    /// 推理步填了非法 capability 也放行，不报错。
+    #[test]
+    fn reason_step_with_garbage_capability_is_tolerated() {
+        let value = serde_json::json!({
+            "id": 2,
+            "title": "归纳成一段结论",
+            "kind": "reason",
+            "capability": "nonexistent",
+            "expect": "给出一段可读的归纳",
+        });
+        let step = plan_step_v2_from_json(&value).expect("不该报错");
+        assert_eq!(step.capability, Capability::General);
+    }
+
+    /// 工具步**仍然**必须写 capability：它是「这一步要调哪个模块的工具」的依据，
+    /// 放宽到推理步就够了，工具步不能一起放。
+    #[test]
+    fn tool_step_still_requires_capability() {
+        let value = serde_json::json!({
+            "id": 1,
+            "title": "检索近 7 天邮件",
+            "kind": "tool",
+            "tool": "email_search",
+            "args": {"days": 7},
+            "expect": "拿到邮件列表",
+        });
+        let err = plan_step_v2_from_json(&value).expect_err("工具步缺 capability 应报错");
+        assert!(
+            err.user_message().contains("capability"),
+            "错误信息要点名 capability：{}",
+            err.user_message()
+        );
+    }
+
+    /// `plan_update` 的契约里 capability 也不该是必填：模型只回传
+    /// id/title/status 就能标记一步完成。
+    #[test]
+    fn plan_update_step_without_capability_is_tolerated() {
+        let value = serde_json::json!({
+            "id": 1,
+            "title": "检索近 7 天邮件",
+            "status": "done",
+            "evidence": "拿到 20 封",
+        });
+        let step = plan_step_from_json(&value).expect("不该报错");
+        assert_eq!(step.capability, Capability::General);
+        assert_eq!(step.status.as_str(), "done");
     }
 }

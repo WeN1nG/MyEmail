@@ -1474,11 +1474,14 @@ pub const SYSTEM_PROMPT: &str = "\
 下面四行依次是 `状态：已完成|部分完成|未完成`、`做了什么：…`、`关键信息：…`、`未完成：…`。\
 「做了什么」只能写真正执行过的工具对应的动作；纯闲聊、纯知识问答不写这一段。
 10. 需求里只要含有「查数据」或「做动作」的成分（查邮件、看日程、查天气、放音乐），\
-就先调用 plan_update 建一份清单（1–6 步）再动手：每步写清要做什么、要不要调工具、\
-期望拿到什么结果，然后按清单执行；每完成一步就调用一次 plan_update 把该步标成 \
+就先调用 plan_submit 建一份清单（1–8 步）再动手：每步写清要做什么（title）、类型（kind）、\
+要不要调工具（tool）、传什么参数（args）、期望拿到什么结果（expect）；\
+然后按清单执行；每完成一步就调用一次 plan_update 把该步标成 \
 done/failed/skipped 并写一句 evidence。只有完全不需要工具时才不建清单（纯闲聊、\
 纯知识问答、复述用户的话）。清单是给用户对账的，不是给模型做笔记的——\
-用户应该能在第一步就看出你有没有理解错。
+用户应该能在第一步就看出你有没有理解错。\
+**plan_submit 建清单、plan_update 改状态，两个工具不要混用**：\
+plan_submit 只在动手之前调一次，plan_update 只在每步完成后调。
 11. 需要正文细节时才用 mail_read，用 email_search 结果里的 message_id 指定；同一封邮件一次回复里最多读 3 次。正文未缓存时工具会明确告诉你「未缓存」，此时让用户先打开这封邮件，不要反复重试，也不要根据主题猜正文内容。
 12. 音乐只能操作本地曲库：先 music_search 看到曲名再 music_play；用户说「放首歌」而没指定曲名时，先查状态，多首命中就把候选列出来让用户选，不要自己挑。播放/暂停/切歌/停止用 music_control。\
 13. **用户的定性需求由你自己翻译成判据，引擎不会替你决定。**\
@@ -2011,7 +2014,9 @@ unread_only / flagged_only / days 任意一个即可（只给时间窗或只给�
                                 "id": {"type": "integer", "minimum": 1, "maximum": 8},
                                 "capability": {
                                     "type": "string",
-                                    "enum": ["mail", "weather", "calendar", "music"]
+                                    "enum": ["mail", "weather", "calendar", "music", "general"],
+                                    "description": "这一步属于哪个能力模块。工具步必填；\
+推理步（kind=reason）与提问步（kind=ask）可以不填，填 general 也行"
                                 },
                                 "title": {"type": "string", "maxLength": 40},
                                 "status": {
@@ -2020,7 +2025,7 @@ unread_only / flagged_only / days 任意一个即可（只给时间窗或只给�
                                 },
                                 "evidence": {"type": "string", "maxLength": 120}
                             },
-                            "required": ["id", "capability", "title", "status"],
+                            "required": ["id", "title", "status"],
                             "additionalProperties": false
                         }
                     }
@@ -2061,7 +2066,9 @@ unread_only / flagged_only / days 任意一个即可（只给时间窗或只给�
                                 },
                                 "capability": {
                                     "type": "string",
-                                    "enum": ["mail", "weather", "calendar", "music"]
+                                    "enum": ["mail", "weather", "calendar", "music", "general"],
+                                    "description": "这一步属于哪个能力模块。工具步必填；\
+推理步（kind=reason）与提问步（kind=ask）可以不填，填 general 也行"
                                 },
                                 "tool": {
                                     "type": "string",
@@ -2357,8 +2364,59 @@ mod tests {
             "不能再用「不要建清单」豁免：那正是模型跳过清单的依据"
         );
         assert!(
+            SYSTEM_PROMPT.contains("plan_submit"),
+            "建清单必须写 plan_submit：PLAN 阶段只下发 plan_submit / answer_directly"
+        );
+        assert!(
             SYSTEM_PROMPT.contains("plan_update"),
-            "P0 阶段仍以 plan_update 为主"
+            "改状态仍然要用 plan_update"
+        );
+    }
+
+    /// 提示词里提到的工具名必须**真实存在于工具清单里**。
+    ///
+    /// 2026-11-07 的事故：规则 10 让模型「先调用 plan_update 建清单」，
+    /// 但 PLAN 阶段下发的只有 `plan_submit` / `answer_directly`。
+    /// 模型照着提示词去调 `plan_update`，第一轮必然失败——
+    /// 它只能自己摸索，把 8 次工具往返里的 6 次浪费在重试参数上。
+    ///
+    /// 这条断言把「提示词提到的工具名」与「工具清单」绑在一起，
+    /// 以后新增/改名工具时，提示词里写错会立刻被测出来。
+    #[test]
+    fn every_tool_named_in_the_prompt_exists() {
+        let known: Vec<&str> = TOOL_SPECS.iter().map(|spec| spec.name.as_str()).collect();
+        for mentioned in [
+            "plan_submit",
+            "plan_update",
+            "answer_directly",
+            "email_search",
+            "mail_read",
+            "calendar_create",
+            "calendar_update",
+            "calendar_delete",
+            "weather_get",
+            "music_search",
+            "music_play",
+            "music_control",
+            "memory_upsert",
+        ] {
+            assert!(
+                known.contains(&mentioned),
+                "提示词提到的 {mentioned} 不在工具清单里：{known:?}"
+            );
+        }
+    }
+
+    /// 提示词里的步数上限必须与 `MAX_PLAN_STEPS` 一致。
+    ///
+    /// 旧文案写「1–6 步」，schema 写「1–8 步」，常量是 8——三处不一致。
+    /// 模型按 6 步理解上限，就不敢拆超过 6 步的计划。
+    #[test]
+    fn prompt_step_limit_matches_the_constant() {
+        use crate::ai_plan::MAX_PLAN_STEPS;
+        assert!(
+            SYSTEM_PROMPT.contains(&format!("1–{} 步", MAX_PLAN_STEPS)),
+            "提示词的步数上限要与 MAX_PLAN_STEPS（{MAX_PLAN_STEPS}）一致"
         );
     }
 

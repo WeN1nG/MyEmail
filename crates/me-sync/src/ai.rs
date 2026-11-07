@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use me_core::ai::{
     AiChatRequest, AiContextRef, AiContextRequest, AiConversationId, AiCredential, AiDelta,
     AiDeltaSink, AiEntity, AiMessageId, AiMessageStatus, AiModel, AiProvider, AiProviderConfig,
-    AiProviderKind, AiRole, AiToolName, AiToolResult, AiToolTrace, ChatBuildInput,
+    AiProviderKind, AiRole, AiToolName, AiToolResult, AiToolStatus, AiToolTrace, ChatBuildInput,
     DEFAULT_MAX_INPUT_CHARS, MAX_TOOL_CALLS, MAX_TOOL_ROUNDS, MAX_USER_INPUT_CHARS, NewAiEntity,
     NewAiMessage, build_chat_request, find_model, next_model_id, resolve_model, tool_specs,
     validate_model,
@@ -1829,7 +1829,7 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 if let (Some(id), Some(current)) = (bound, plan.as_mut()) {
                     current.begin_step(id);
                 }
-                // 清单类工具不进行为条：清单条本身就是它的展示位，
+                // 清单类工具成功时不进行为条：清单条本身就是它的展示位，
                 // 再在活动条里刷一条「更新清单」只会把真正的工具调用挤下去。
                 let visible = !call.name.is_bookkeeping();
                 if visible {
@@ -1993,7 +1993,19 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     .step_id
                     .and_then(|id| plan.as_ref().and_then(|current| current.step(id)))
                     .map(|step| step.attempts);
-                if visible {
+                // 清单类工具成功时不显示，但**失败必须显示**。
+                //
+                // 2026-11-07 的事故：模型为了一份清单连续改了 4 次参数
+                // （capability 省略 / 空串 / 改成 tool 步），4 次工具往返全废在
+                // 参数上——而这些失败在界面上一个字都没显示。用户只看到最后
+                // 成功的那一次，完全不知道模型挣扎了多久、错在哪。
+                //
+                // 失败的清单类调用同样发 Started：活动条是「先 Started 再
+                // Completed」成对的，少了 Started 会让 UI 的实时工具条目
+                // 悬着不消。
+                let failed = result.is_error || result.trace.status == AiToolStatus::Error;
+                let show = visible || failed;
+                if show {
                     self.emit(Event::AiToolCompleted {
                         conversation,
                         call_id: result.call_id.clone(),
@@ -2026,7 +2038,9 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     })
                     .await;
                 }
-                if visible {
+                // 落库的 trace 同理：失败的清单类调用要留下痕迹，
+                // 成功的不要（否则活动区会被「更新清单」刷满）。
+                if show {
                     traces.push(trace);
                 }
                 results.push(result);
