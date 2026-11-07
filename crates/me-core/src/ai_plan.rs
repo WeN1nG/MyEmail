@@ -223,6 +223,8 @@ pub enum StepFailure {
     Transient { detail: String },
     /// 权限未开启或被执行期拒绝
     Denied { tool: String },
+    /// 有副作用的工具失败：永不自动重试。
+    Write { tool: String },
     /// 结果不满足 expect（reflect 判定，不是工具报错）
     ExpectMiss { expect: String, got: String },
     /// 依赖的前序步骤失败
@@ -239,6 +241,7 @@ impl StepFailure {
             StepFailure::RepeatedCall { .. } => "同样的参数连续失败，已停止重试".to_string(),
             StepFailure::Transient { detail } => format!("工具/网络错误：{detail}"),
             StepFailure::Denied { tool } => format!("没有开启「{tool}」权限"),
+            StepFailure::Write { tool } => format!("「{tool}」执行失败（有副作用，已停止重试）"),
             StepFailure::ExpectMiss { expect, got } => {
                 format!("结果不符合预期（期望：{expect}；实际：{got}）")
             }
@@ -257,7 +260,7 @@ impl StepFailure {
             StepFailure::RepeatedCall { fingerprint } => {
                 *fingerprint = cut(fingerprint.clone());
             }
-            StepFailure::Denied { tool } => {
+            StepFailure::Denied { tool } | StepFailure::Write { tool } => {
                 *tool = cut(tool.clone());
             }
             StepFailure::ExpectMiss { expect, got } => {
@@ -630,6 +633,77 @@ impl Plan {
             .any(|s| matches!(s.status, PlanStatus::Failed | PlanStatus::Skipped))
     }
 
+    /// 这一步还剩几次机会。
+    ///
+    /// 引擎自动重试也要占这个预算，所以重试次数不能超过它。
+    pub fn remaining_attempts(&self, id: u8) -> u8 {
+        self.step(id)
+            .map(|step| MAX_STEP_ATTEMPTS.saturating_sub(step.attempts))
+            .unwrap_or(0)
+    }
+
+    /// 按 `on_empty` 处理一次「0 命中」，返回下一步该怎么走。
+    ///
+    /// 0 命中不是成功也不是失败，是**计划需要修正**的信号：
+    /// - [`OnEmpty::Narrow`]：条件放宽一档再来（默认）；
+    /// - [`OnEmpty::Ask`]：停下来问用户；
+    /// - [`OnEmpty::Accept`]：接受空结果，继续下一步。
+    pub fn apply_empty(&mut self, id: u8, evidence: &str, tries: u8) -> EmptyAction {
+        let Some(step) = self.steps.iter_mut().find(|s| s.id == id) else {
+            return EmptyAction::Accept;
+        };
+        step.attempts = step.attempts.saturating_add(tries.max(1));
+        step.evidence = Some(truncate_chars(evidence, MAX_STEP_EVIDENCE_CHARS));
+        if step.status == PlanStatus::Pending {
+            step.status = PlanStatus::Running;
+        }
+        match step.on_empty {
+            OnEmpty::Accept => {
+                // 接受空结果：这一步就算做完了（回执写明「0 命中」）。
+                step.status = PlanStatus::Done;
+                EmptyAction::Accept
+            }
+            OnEmpty::Ask => EmptyAction::Ask,
+            OnEmpty::Narrow => {
+                // 走到这里说明**放宽已经用尽**（引擎试过每一档，或机会用完）。
+                //
+                // 这一步仍然算**完成**：0 命中是一个合法的业务结果
+                // （确实没有这样的邮件），不是「工具坏了」。
+                // 把它算成失败会让 REFLECT 白跑一轮，还会让用户看到红色叉号——
+                // 而实际上「最近 30 天没有这样的邮件」就是正确答案。
+                step.status = PlanStatus::Done;
+                step.evidence = Some(truncate_chars(
+                    &format!("{evidence}（条件已放宽到底，仍无结果）"),
+                    MAX_STEP_EVIDENCE_CHARS,
+                ));
+                EmptyAction::Accept
+            }
+        }
+    }
+
+    /// 把一步的参数换掉（引擎放宽条件时用）。
+    ///
+    /// 放宽后的参数会写回清单：用户看到的是**真实执行过**的条件，
+    /// 而不是模型最初写的那份。
+    ///
+    /// 同时把「条件被放宽过」写进回执：步骤标题是模型写的、引擎不能改，
+    /// 标题与实际条件脱节时，回执是唯一能让用户对得上账的地方。
+    pub fn set_step_args(&mut self, id: u8, args: serde_json::Value, note: &str) -> bool {
+        match self.steps.iter_mut().find(|step| step.id == id) {
+            Some(step) => {
+                // 清单里存的是**业务参数**：`motive` 是给模型看的说明，
+                // 留在清单里会出现在参数摘要上，干扰用户对账。
+                let mut map = args.as_object().cloned().unwrap_or_default();
+                map.remove("motive");
+                map.remove("step_id");
+                step.args = Some(serde_json::Value::Object(map));
+                step.evidence = Some(truncate_chars(note, MAX_STEP_EVIDENCE_CHARS));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// 第一个还没结束的工具步——绑定兜底用（模型没给 `step_id` 时）。
     pub fn next_tool_step(&self) -> Option<u8> {
         self.steps
@@ -640,6 +714,10 @@ impl Plan {
 
     pub fn step(&self, id: u8) -> Option<&PlanStep> {
         self.steps.iter().find(|step| step.id == id)
+    }
+
+    pub fn step_mut(&mut self, id: u8) -> Option<&mut PlanStep> {
+        self.steps.iter_mut().find(|step| step.id == id)
     }
 
     /// 把**进行中**的步标成跳过。取消时用它：没开始的步保持 `pending`，
@@ -698,10 +776,18 @@ impl Plan {
     /// 返回该步的最新状态：`Done` / `Failed`（用尽） / `Running`（还可以再来一次）。
     /// 把「还能不能再试」的判断留在引擎侧，模型不需要理解次数。
     pub fn record_attempt(&mut self, id: u8, outcome: AttemptOutcome) -> PlanStatus {
+        self.record_attempts(id, 1, outcome)
+    }
+
+    /// 记 `tries` 次尝试（引擎自动重试时一次模型调用对应多次物理尝试）。
+    ///
+    /// 物理尝试与模型调用**共用**同一个次数预算：一步总共 3 次机会，
+    /// 引擎重试用掉的次数也要算，否则「3 次机会」会被引擎的重试悄悄放大。
+    pub fn record_attempts(&mut self, id: u8, tries: u8, outcome: AttemptOutcome) -> PlanStatus {
         let Some(step) = self.steps.iter_mut().find(|s| s.id == id) else {
             return PlanStatus::Failed;
         };
-        step.attempts = step.attempts.saturating_add(1);
+        step.attempts = step.attempts.saturating_add(tries.max(1));
         match outcome {
             AttemptOutcome::Done { evidence } => {
                 step.status = PlanStatus::Done;
@@ -977,6 +1063,61 @@ pub fn reconcile(check: &SelfCheck, plan: &Plan) -> Verdict {
         Verdict::Done if any_failure => Verdict::Partial,
         other => other,
     }
+}
+
+/// 「0 命中」之后引擎该怎么走。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyAction {
+    /// 放宽条件再来一次。
+    Narrow,
+    /// 停下来问用户要更多信息。
+    Ask,
+    /// 接受空结果，继续下一步。
+    Accept,
+    /// 放宽的机会用尽，如实判失败。
+    GiveUp,
+}
+
+/// 把一步的检索条件**放宽一档**。
+///
+/// 0 命中时不该原样重试（结果不会变），也不该让模型瞎猜换个什么词。
+/// 放宽的顺序是「先去掉最严格的限定」：
+/// 1. 星标（`flagged_only`）——用户自己标的，本轮可能还没标；
+/// 2. 主题关键词（`subject`）——比全文更窄；
+/// 3. 时间窗（`after` / `days`）——拉长到 30 天。
+///
+/// 返回 `None` 表示没有可放宽的条件了（该步到此为止）。
+///
+/// `motive` 与 `step_id` 原样保留：它们不参与检索，但重试时要靠 `step_id`
+/// 绑回清单里的那一步，丢了就绑不上了。
+pub fn relax_args(args: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut map = args.as_object()?.clone();
+    // 1) 先丢星标
+    if map.remove("flagged_only").is_some() {
+        return Some(serde_json::Value::Object(map));
+    }
+    // 2) 再丢主题关键词
+    if map.remove("subject").is_some() {
+        return Some(serde_json::Value::Object(map));
+    }
+    // 3) 最后拉长时间窗：扩到 30 天，**不整段丢掉**。
+    //
+    // 丢掉时间窗等于把「最近 7 天的未读」变成「所有未读」——那是换了一个问题，
+    // 不是放宽了同一个问题。用户要的是最近的消息，不是全部消息。
+    if let Some(days) = map.get("days").and_then(serde_json::Value::as_u64) {
+        if days < 30 {
+            map.insert("days".to_string(), serde_json::Value::from(30));
+            return Some(serde_json::Value::Object(map));
+        }
+        return None;
+    }
+    if map.get("after").is_some() {
+        map.remove("after");
+        map.insert("days".to_string(), serde_json::Value::from(30));
+        return Some(serde_json::Value::Object(map));
+    }
+    // 没有可放宽的了。
+    None
 }
 
 /// 一次执行的归类结果。引擎用它推进步骤状态，不用自己数 attempts。
@@ -2332,6 +2473,172 @@ mod tests {
             "一次没执行要如实标跳过"
         );
         assert_eq!(plan.open_steps(), 0, "不能留永远转圈的步");
+    }
+
+    // ---- 放宽阶梯 ----
+
+    #[test]
+    fn relax_drops_the_strictest_condition_first() {
+        // 星标最先被去掉：它是最容易「用户还没标」而空掉的条件。
+        let first = relax_args(&json!({
+            "flagged_only": true,
+            "subject": "预算",
+            "days": 7,
+            "unread_only": true
+        }))
+        .expect("有可放宽的");
+        assert!(first.get("flagged_only").is_none(), "{first}");
+        assert_eq!(first.get("subject").unwrap(), "预算", "{first}");
+        assert_eq!(first.get("days").unwrap(), 7, "{first}");
+
+        // 然后是主题关键词。
+        let second = relax_args(&first).expect("还有可放宽的");
+        assert!(second.get("subject").is_none(), "{second}");
+        assert_eq!(second.get("days").unwrap(), 7, "{second}");
+
+        // 最后拉长时间窗到 30 天，**不整段丢掉**。
+        let third = relax_args(&second).expect("还有可放宽的");
+        assert_eq!(third.get("days").unwrap(), 30, "{third}");
+        assert!(
+            third.get("unread_only").is_some(),
+            "其它条件要保留：{third}"
+        );
+    }
+
+    #[test]
+    fn relax_stops_when_nothing_is_left_to_relax() {
+        // 时间窗已经 30 天：再放宽就等于「所有邮件」，那是换了一个问题。
+        assert!(relax_args(&json!({ "days": 30, "unread_only": true })).is_none());
+        // 只有布尔条件、没有可放宽的限定。
+        assert!(relax_args(&json!({ "unread_only": true })).is_none());
+    }
+
+    #[test]
+    fn relax_keeps_motive_and_step_id() {
+        // 这两个不参与检索，但重试时要靠 `step_id` 绑回清单里的那一步。
+        let relaxed = relax_args(&json!({
+            "motive": "查邮件",
+            "step_id": 2,
+            "flagged_only": true
+        }))
+        .expect("可放宽");
+        assert!(relaxed.get("flagged_only").is_none(), "{relaxed}");
+        assert_eq!(relaxed.get("motive").unwrap(), "查邮件", "{relaxed}");
+        assert_eq!(relaxed.get("step_id").unwrap(), 2, "{relaxed}");
+    }
+
+    // ---- on_empty ----
+
+    #[test]
+    fn empty_result_is_not_a_failure() {
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "目标",
+                vec![tool_step(
+                    1,
+                    "检索",
+                    AiToolName::EmailSearch,
+                    json!({ "days": 7 }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+        // 放宽已经用尽：仍然算完成，只是回执写明「没有结果」。
+        let action = plan.apply_empty(1, "未找到", 3);
+        assert_eq!(action, EmptyAction::Accept);
+        assert_eq!(plan.steps[0].status, PlanStatus::Done);
+        assert!(
+            plan.steps[0]
+                .evidence
+                .as_deref()
+                .is_some_and(|text| text.contains("放宽")),
+            "{:?}",
+            plan.steps[0].evidence
+        );
+        assert!(
+            plan.steps[0].failure.is_none(),
+            "0 命中不是失败：{:?}",
+            plan.steps[0].failure
+        );
+    }
+
+    #[test]
+    fn on_empty_ask_stops_for_the_user() {
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "目标",
+                vec![tool_step(
+                    1,
+                    "检索",
+                    AiToolName::EmailSearch,
+                    json!({ "days": 7 }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+        plan.steps[0].on_empty = OnEmpty::Ask;
+        let action = plan.apply_empty(1, "未找到", 1);
+        assert_eq!(action, EmptyAction::Ask);
+        assert_eq!(
+            plan.steps[0].status,
+            PlanStatus::Running,
+            "等用户回答时这一步还没结束"
+        );
+    }
+
+    #[test]
+    fn on_empty_accept_finishes_the_step() {
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "目标",
+                vec![tool_step(
+                    1,
+                    "检索",
+                    AiToolName::EmailSearch,
+                    json!({ "days": 7 }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+        plan.steps[0].on_empty = OnEmpty::Accept;
+        let action = plan.apply_empty(1, "未找到", 1);
+        assert_eq!(action, EmptyAction::Accept);
+        assert_eq!(plan.steps[0].status, PlanStatus::Done);
+        assert_eq!(plan.steps[0].attempts, 1);
+    }
+
+    #[test]
+    fn attempts_count_every_physical_try() {
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "目标",
+                vec![tool_step(
+                    1,
+                    "检索",
+                    AiToolName::EmailSearch,
+                    json!({ "days": 7 }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+        // 一次模型调用 + 一次放宽重试 = 两次物理尝试。
+        plan.record_attempts(
+            1,
+            2,
+            AttemptOutcome::Done {
+                evidence: "命中 1 封".to_string(),
+            },
+        );
+        assert_eq!(plan.steps[0].attempts, 2);
+        assert_eq!(plan.steps[0].status, PlanStatus::Done);
     }
 
     #[test]

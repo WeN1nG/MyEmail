@@ -55,6 +55,35 @@ const MAX_SELFCHECK_RETRIES: u32 = 1;
 /// 这里管的是「模型交不出合格的第二份计划」。
 const MAX_REPLAN_REJECTIONS: u32 = 2;
 
+/// 每个阶段的时间上限（秒）。
+///
+/// 阶段预算是**上界**：正常路径远小于它，超了也只是提前收尾，
+/// 不会让结果变错。它的作用是「不让某个阶段把整轮的时间吃光」——
+/// 比如模型在 REFLECT 阶段反复自说自话，EXECUTE 的时间就没了。
+const PHASE_BUDGET: [(Phase, u64); 5] = [
+    (Phase::Plan, 60),
+    (Phase::Execute, 300),
+    (Phase::Reflect, 45),
+    (Phase::Replan, 120),
+    (Phase::Final, 45),
+];
+
+/// 一个阶段的时间上限。
+fn phase_budget(phase: Phase) -> Duration {
+    let seconds = PHASE_BUDGET
+        .iter()
+        .find(|(candidate, _)| *candidate == phase)
+        .map(|(_, seconds)| *seconds)
+        .unwrap_or(120);
+    Duration::from_secs(seconds)
+}
+
+/// 引擎自动重试的退避间隔。
+///
+/// 第一次重试等 300ms，第二次等 900ms：网络抖动通常一秒内就恢复，
+/// 等太久用户会以为卡死了。
+const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(300), Duration::from_millis(900)];
+
 /// 调用过工具却一个字没说时，最多催它写正文几次。
 ///
 /// 只给一次：再催就是逼它编内容。第二次仍然空白就走引擎兜底摘要。
@@ -1173,6 +1202,11 @@ where
         let mut plan_rounds = 0u32;
         let mut answered_directly = false;
         let mut reflect_retries = 0u32;
+        // 阶段计时：切换阶段时重置，超预算就提前收尾。
+        let mut phase_started = Instant::now();
+        let mut phase_at_start = phase;
+        // 这一步声明了「需要用户补充」：本轮停下来等用户回答。
+        let mut awaiting_user = false;
         let mut replan_rejections = 0u32;
         // 重列需要的三样东西：旧清单、诊断、改法。都来自 REFLECT 的输出，
         // 而 `plan_submit` 的契约里没有这些字段（不新加参数，改由引擎带过来）。
@@ -1214,6 +1248,42 @@ where
                 error_text = Some("回复超时（工具循环总时长超过 600 秒）".to_string());
                 retryable = true;
                 break;
+            }
+
+            // 阶段变了就重置计时：每个阶段各有一份预算。
+            if phase != phase_at_start {
+                phase_at_start = phase;
+                phase_started = Instant::now();
+            }
+            // 阶段预算：超了就提前收尾，不让某个阶段把整轮时间吃光。
+            if phase_started.elapsed() > phase_budget(phase) {
+                match phase {
+                    Phase::Plan => {
+                        // 计划期超时：按「模型不配合」处理，合成单步清单继续。
+                        if plan.is_none() && !answered_directly {
+                            plan = Some(synthetic_plan());
+                            error_text =
+                                Some("模型未在计划阶段内提交计划，已按单步处理".to_string());
+                        }
+                        phase = Phase::Execute;
+                        phase_started = Instant::now();
+                    }
+                    Phase::Final => {
+                        // 已经在收尾了：不能再催一次，否则会反复催同一句话。
+                        // 直接结束这一轮，让兜底摘要接手。
+                        break;
+                    }
+                    _ => {
+                        phase = Phase::Final;
+                        phase_started = Instant::now();
+                        request.messages.push(me_core::ai::AiWireMessage::User {
+                            content: "时间预算已用完。请按 [结果] 格式给出当前能给出的最好结果，\
+把没做到的写进「未完成」。"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                }
             }
 
             request.tools = match phase {
@@ -1290,6 +1360,17 @@ where
                                 phase = Phase::Replan;
                                 continue;
                             }
+                            // 自检结论落库前先发事件：界面能立刻看到
+                            // 「AI 自己认为这轮做完了吗」。
+                            self.emit(Event::AiPlanSelfCheck {
+                                conversation,
+                                message,
+                                verdict,
+                                failed_step: check.failed_step,
+                                diagnosis: check.diagnosis,
+                                reason: check.reason.clone(),
+                            })
+                            .await;
                             let note = if rounds_left {
                                 "请按 [结果] 格式给出最终答复，把没做到的写进「未完成」。"
                             } else {
@@ -1532,31 +1613,130 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     .await;
                 }
                 let plan_before = plan.clone();
-                let result = tokio::select! {
-                    biased;
-                    _ = token.cancelled() => {
-                        status = AiMessageStatus::Cancelled;
-                        break 'rounds;
+                // 引擎在同一轮里自己重试，不把重试甩给模型。
+                //
+                // 两类重试：
+                // 1. 临时故障（网络抖动、超时）→ **同参数**重试，退避 300ms → 900ms；
+                // 2. 0 命中且 `on_empty = narrow` → **放宽条件**重试。
+                //
+                // 参数错误、权限错误、写操作失败一律不重试：参数不变结果就不会变，
+                // 而写操作重试一次可能就真的做两遍。
+                let quota_before = budget.quota_snapshot();
+                // 本步剩余的机会次数（引擎重试与模型调用共用）。
+                let mut tries_left = bound
+                    .and_then(|id| {
+                        plan.as_ref()
+                            .and_then(|current| current.step(id))
+                            .map(|step| step.attempts)
+                    })
+                    .map(|used| {
+                        me_core::ai_plan::MAX_STEP_ATTEMPTS
+                            .saturating_sub(used)
+                            .max(1) as usize
+                    })
+                    .unwrap_or(me_core::ai_plan::MAX_STEP_ATTEMPTS as usize);
+                let mut retry_no = 0usize;
+                // 物理尝试次数（临时重试 + 放宽重试都算）：这一步真正花掉的次数。
+                let mut physical_tries = 0u8;
+                // 放宽后用来重试的参数：`None` 表示还在用原来的参数。
+                let mut relaxed_args: Option<serde_json::Value> = None;
+                let result = loop {
+                    tries_left = tries_left.saturating_sub(1);
+                    physical_tries = physical_tries.saturating_add(1);
+                    // 重试时用放宽后的参数构造一次新的调用。
+                    let attempt_call = match relaxed_args.as_ref() {
+                        Some(args) => {
+                            let mut clone = call.clone();
+                            clone.arguments = args.clone();
+                            clone
+                        }
+                        None => call.clone(),
+                    };
+                    let attempt = tokio::select! {
+                        biased;
+                        _ = token.cancelled() => {
+                            status = AiMessageStatus::Cancelled;
+                            break 'rounds;
+                        }
+                        result = self.execute_ai_tool(conversation, &attempt_call, &mut budget, &mut plan) => result,
+                    };
+                    let transient = attempt
+                        .failure
+                        .is_some_and(|failure| failure.is_auto_retryable())
+                        && !call.name.has_side_effect()
+                        && retry_no < RETRY_BACKOFF.len()
+                        && tries_left > 0;
+                    if transient {
+                        retry_no += 1;
+                        // 重试是**同一次逻辑调用**：配额退回去，
+                        // 否则第二次就会撞上「本次消息已查询过天气」这类限额错误，
+                        // 把真正的网络故障盖掉。
+                        budget.restore_quota(quota_before);
+                        tokio::time::sleep(RETRY_BACKOFF[retry_no - 1]).await;
+                        continue;
                     }
-                    result = self.execute_ai_tool(conversation, call, &mut budget, &mut plan) => result,
+                    // 0 命中：按 `on_empty` 决定是放宽重试、问用户，还是接受。
+                    let empty = !attempt.is_error
+                        && crate::ai_tools::is_empty_result(&attempt.trace.summary);
+                    if empty && tries_left > 0 {
+                        // 放宽基于**这次实际调用的参数**，不是计划里声明的那份：
+                        // 两者可以不同（模型在计划里写 `days:7`，执行时加了
+                        // `unread_only`），按声明放宽会把多出来的条件丢掉。
+                        let next = me_core::ai_plan::relax_args(&attempt_call.arguments);
+                        if let Some(args) = next {
+                            // 放宽后的参数写回清单：用户看到的是**真正跑过**的条件。
+                            let note = format!(
+                                "0 命中，条件已放宽为 {} 后重试",
+                                args.as_object()
+                                    .map(|map| {
+                                        map.iter()
+                                            .map(|(key, value)| format!("{key}={value}"))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default()
+                            );
+                            if let (Some(id), Some(current)) = (bound, plan.as_mut()) {
+                                current.set_step_args(id, args.clone(), &note);
+                            }
+                            relaxed_args = Some(args);
+                            continue;
+                        }
+                    }
+                    break attempt;
                 };
                 if let Some(id) = bound
                     && let Some(current) = plan.as_mut()
                 {
-                    let outcome = if result.is_error {
-                        me_core::ai_plan::AttemptOutcome::Failed(crate::ai_tools::classify_failure(
-                            &result.trace.summary,
-                        ))
-                    } else if crate::ai_tools::is_empty_result(&result.trace.summary) {
-                        me_core::ai_plan::AttemptOutcome::Empty {
-                            evidence: result.trace.summary.clone(),
+                    let empty =
+                        !result.is_error && crate::ai_tools::is_empty_result(&result.trace.summary);
+                    if empty {
+                        // 0 命中不是成功也不是失败：按 `on_empty` 决定这一步的终态。
+                        let action = current.apply_empty(id, &result.trace.summary, physical_tries);
+                        if action == me_core::ai_plan::EmptyAction::Ask {
+                            // 需要用户补充：这一轮就停在这里等用户回答。
+                            awaiting_user = true;
                         }
                     } else {
-                        me_core::ai_plan::AttemptOutcome::Done {
-                            evidence: result.trace.summary.clone(),
-                        }
-                    };
-                    current.record_attempt(id, outcome);
+                        let outcome = if result.is_error {
+                            me_core::ai_plan::AttemptOutcome::Failed(
+                                crate::ai_tools::classify_failure(
+                                    call.name,
+                                    result
+                                        .failure
+                                        .unwrap_or(me_core::ai::ToolFailure::InvalidArgs),
+                                    &result.trace.summary,
+                                ),
+                            )
+                        } else {
+                            me_core::ai_plan::AttemptOutcome::Done {
+                                evidence: result.trace.summary.clone(),
+                            }
+                        };
+                        // 引擎重试也是「尝试」：一次模型调用可能对应多次物理尝试，
+                        // 都要算进这一步的机会预算里。
+                        current.record_attempts(id, physical_tries, outcome);
+                    }
                     // 被引用步失败 → 依赖它的步自动跳过，别拿空参数再撞一次。
                     current.skip_dependents();
                 }
@@ -1593,6 +1773,23 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     .step_id
                     .and_then(|id| plan.as_ref().and_then(|current| current.step(id)))
                     .map(|step| step.attempts);
+                // 每一步的尝试都发一次事件：清单条靠它显示「第 2/3 次」角标。
+                // 这条事件是**可丢**的（丢一次只是少一个角标）。
+                if let Some(id) = bound
+                    && let Some(step) = plan.as_ref().and_then(|current| current.step(id))
+                {
+                    self.emit(Event::AiPlanStepAttempt {
+                        conversation,
+                        message,
+                        step_id: id,
+                        attempt: step.attempts,
+                        max_attempts: me_core::ai_plan::MAX_STEP_ATTEMPTS,
+                        tool: step.tool,
+                        args_digest: step.args_digest(),
+                        error: step.failure.as_ref().map(|failure| failure.human()),
+                    })
+                    .await;
+                }
                 if visible {
                     traces.push(trace);
                 }
@@ -1679,6 +1876,29 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                                     plan: current.clone(),
                                 })
                                 .await;
+                                // 重列记录：界面据此显示「第 N 次计划」与上一轮的问题。
+                                if let Some(record) = current.replans.last() {
+                                    let failed_step_titles = record
+                                        .failed_steps
+                                        .iter()
+                                        .filter_map(|id| {
+                                            current
+                                                .steps
+                                                .iter()
+                                                .find(|step| step.id == *id)
+                                                .map(|step| step.title.clone())
+                                        })
+                                        .collect();
+                                    self.emit(Event::AiPlanReplanned {
+                                        conversation,
+                                        message,
+                                        round: record.round,
+                                        diagnosis: record.diagnosis,
+                                        changes: record.changes.clone(),
+                                        failed_step_titles,
+                                    })
+                                    .await;
+                                }
                                 phase = Phase::Execute;
                                 request.messages.push(me_core::ai::AiWireMessage::User {
                                     content: format!(
@@ -1724,6 +1944,15 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         });
                     }
                 }
+            }
+
+            // 这一步要求用户补充信息：整轮停下来，把问题交给用户。
+            if awaiting_user {
+                phase = Phase::Final;
+                request.messages.push(me_core::ai::AiWireMessage::User {
+                    content: "有一步检索不到结果且该步声明了「需要用户补充」。请直接向用户说明需要什么信息（例如该用哪个邮箱、要看哪个时间范围），并停下来等用户回答，不要继续执行后面的步骤。"
+                        .to_string(),
+                });
             }
 
             // 计划跑完了 → 先自检（只为「有失败步」的情况），再写答复。
@@ -1791,6 +2020,26 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
         // 清单必须是**最终态**再落库：取消时只把「进行中」的步标跳过，
         // 还没开始的步保持 pending（用户可能接着说「继续」）。
         let plan_for_db = finalize_plan(plan, status);
+        // 收尾结论：有清单才算（模型声明「不需要工具」的对话没有清单）。
+        if let Some(current) = plan_for_db.as_ref() {
+            let (done, total) = current.progress();
+            let verdict = if current.any_failed() {
+                me_core::ai_plan::Verdict::Partial
+            } else if done == total {
+                me_core::ai_plan::Verdict::Done
+            } else {
+                me_core::ai_plan::Verdict::Partial
+            };
+            self.emit(Event::AiPlanFinished {
+                conversation,
+                message,
+                verdict,
+                done,
+                total,
+                replans: current.replans.len(),
+            })
+            .await;
+        }
         let result = self
             .db(move |s| {
                 s.finish_assistant_message(

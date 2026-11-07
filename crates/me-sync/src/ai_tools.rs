@@ -67,12 +67,50 @@ fn attempt_fingerprint(call: &AiToolCall) -> String {
     me_core::ai::call_fingerprint(call.name, Some(&call.arguments))
 }
 
+/// 工具配额的一次快照。
+///
+/// 引擎自动重试**同一次逻辑调用**时不该重复计费：天气查询一次回复只允许一次，
+/// 邮件正文一次回复最多读三封——重试如果是重新计一次，就会把「重试」变成
+/// 「撞限额」，而限额错误会把真正的失败原因盖掉。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToolQuota {
+    weather: u32,
+    calendar: u32,
+    calendar_read: u32,
+    mail_read: u32,
+    memory: u32,
+}
+
 impl ToolBudget {
     /// 记下这次不可重试的失败。同一指纹只留第一条错误，后面重复的没有新信息。
     pub(crate) fn remember_failure(&mut self, call: &AiToolCall, error: &str) {
         self.failed
             .entry(attempt_fingerprint(call))
             .or_insert_with(|| truncate_chars(error, 120));
+    }
+
+    /// 当前的工具配额快照。
+    pub(crate) fn quota_snapshot(&self) -> ToolQuota {
+        ToolQuota {
+            weather: self.weather,
+            calendar: self.calendar,
+            calendar_read: self.calendar_read,
+            mail_read: self.mail_read,
+            memory: self.memory,
+        }
+    }
+
+    /// 把配额退回到某次快照。
+    ///
+    /// 只在**引擎自动重试**前调用：重试的是同一次逻辑调用，
+    /// 配额已经付过一次了。少了这一步，「天气重试」第二次就会拿到
+    /// 「本次消息已查询过天气」，把真正的网络错误盖掉。
+    pub(crate) fn restore_quota(&mut self, snapshot: ToolQuota) {
+        self.weather = snapshot.weather;
+        self.calendar = snapshot.calendar;
+        self.calendar_read = snapshot.calendar_read;
+        self.mail_read = snapshot.mail_read;
+        self.memory = snapshot.memory;
     }
 
     /// 本轮所有「不可重试失败」的调用指纹。
@@ -110,6 +148,7 @@ pub(crate) fn intercepted_result(
 原样重发不会得到不同结果。"
         ),
         is_error: true,
+        failure: Some(me_core::ai::ToolFailure::InvalidArgs),
         trace: AiToolTrace {
             call_id: call.id.clone(),
             tool: call.name,
@@ -149,6 +188,7 @@ pub(crate) fn phase_rejected_result(
         tool: call.name,
         content: hint.to_string(),
         is_error: true,
+        failure: Some(me_core::ai::ToolFailure::Denied),
         trace: AiToolTrace {
             call_id: call.id.clone(),
             tool: call.name,
@@ -217,24 +257,50 @@ fn step_id_from_text(text: &str) -> Option<u8> {
 /// 引擎这里只有一句 `summary`（`CoreError` 已经在 `execute_ai_tool` 里被转成
 /// 工具结果了），所以靠文案判定。分错类的代价可控：`InvalidArgs` 与 `Transient`
 /// 都只是标在步上给人看，真正的刹车是靠指纹熔断（那一步与文案无关）。
-pub(crate) fn classify_failure(summary: &str) -> me_core::ai_plan::StepFailure {
+pub(crate) fn classify_failure(
+    tool: me_core::ai::AiToolName,
+    failure: me_core::ai::ToolFailure,
+    summary: &str,
+) -> me_core::ai_plan::StepFailure {
+    use me_core::ai::ToolFailure;
     use me_core::ai_plan::StepFailure;
-    if summary.contains("已关闭") || summary.contains("没有开启") {
-        StepFailure::Denied {
-            tool: summary.to_string(),
-        }
-    } else if summary.contains("参数")
-        || summary.contains("至少需要")
-        || summary.contains("只能")
-        || summary.contains("缺少")
-    {
-        StepFailure::InvalidArgs {
+    match failure {
+        ToolFailure::InvalidArgs => StepFailure::InvalidArgs {
             detail: summary.to_string(),
-        }
-    } else {
-        StepFailure::Transient {
+        },
+        ToolFailure::Transient => StepFailure::Transient {
             detail: summary.to_string(),
-        }
+        },
+        ToolFailure::Denied => StepFailure::Denied {
+            tool: tool.label().to_string(),
+        },
+        ToolFailure::Write => StepFailure::Write {
+            tool: tool.label().to_string(),
+        },
+    }
+}
+
+/// 把 `CoreError` 归到「改了参数有没有用」这一档。
+///
+/// 分档依据**不是**错误文案，而是错误的来源：
+/// - 网络抖动 / 超时 → 原样重试有用；
+/// - 参数校验失败 → 必须改参数；
+/// - 工具没开 / 次数超限 → 什么办法都没用。
+fn classify_tool_failure(
+    tool: me_core::ai::AiToolName,
+    err: &CoreError,
+) -> me_core::ai::ToolFailure {
+    use me_core::ai::ToolFailure;
+    // 有副作用的工具优先：写操作失败时**绝不**自动重试，
+    // 哪怕根因是网络抖动——重试一次可能就真的建了两个日程。
+    if tool.has_side_effect() {
+        return ToolFailure::Write;
+    }
+    match err {
+        CoreError::Validation { .. } => ToolFailure::InvalidArgs,
+        CoreError::Limit { .. } => ToolFailure::Denied,
+        _ if err.is_retryable() => ToolFailure::Transient,
+        _ => ToolFailure::InvalidArgs,
     }
 }
 
@@ -277,7 +343,9 @@ where
 {
     match tokio::time::timeout(limit, fut).await {
         Ok(result) => result,
-        Err(_) => Err(CoreError::validation(format!(
+        // 超时是**临时故障**：原样再试一次通常就成了。
+        // 不能用 `validation`——那会让 AI 层把它当成「参数不对」而不重试。
+        Err(_) => Err(CoreError::timeout(format!(
             "{label}超时（{} 秒），可稍后重试",
             limit.as_secs()
         ))),
@@ -525,6 +593,7 @@ where
                 tool: call.name,
                 content: truncate_chars(&content, MAX_TOOL_RESULT_CHARS),
                 is_error: false,
+                failure: None,
                 trace: AiToolTrace {
                     call_id: call.id.clone(),
                     tool: call.name,
@@ -549,6 +618,7 @@ where
                     tool: call.name,
                     content: format!("工具执行失败：{message}"),
                     is_error: true,
+                    failure: Some(classify_tool_failure(call.name, &err)),
                     trace: AiToolTrace {
                         call_id: call.id.clone(),
                         tool: call.name,
@@ -1903,5 +1973,72 @@ mod tests {
         let message = result.expect_err("必须超时").user_message();
         assert!(message.contains("邮件检索"), "要说明哪个工具：{message}");
         assert!(message.contains("超时"), "要说明是超时：{message}");
+    }
+
+    /// 超时是**临时故障**：原样重试有用，所以它必须可重试。
+    ///
+    /// 之前超时走的是 `validation`，AI 层把它当成「参数不对」而不重试——
+    /// 网络抖一下就要让模型重新想一遍参数，这是浪费。
+    #[tokio::test]
+    async fn timeout_is_retryable() {
+        let err = with_timeout(Duration::from_millis(10), "天气查询", async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(("不该到这里".to_string(), String::new()))
+        })
+        .await
+        .expect_err("必须超时");
+
+        assert!(err.is_retryable(), "超时必须可重试：{err:?}");
+        let failure = classify_tool_failure(me_core::ai::AiToolName::WeatherGet, &err);
+        assert_eq!(
+            failure,
+            me_core::ai::ToolFailure::Transient,
+            "超时归到临时故障"
+        );
+    }
+
+    /// 参数错误不可重试：参数不变，结果就不会变。
+    #[test]
+    fn invalid_args_are_not_retryable() {
+        let err = CoreError::validation("至少需要一个检索条件");
+        let failure = classify_tool_failure(me_core::ai::AiToolName::EmailSearch, &err);
+        assert_eq!(failure, me_core::ai::ToolFailure::InvalidArgs);
+        assert!(!failure.is_auto_retryable());
+    }
+
+    /// 写操作失败**永不**自动重试：重试一次可能就真的做两遍。
+    #[test]
+    fn write_failures_are_never_retryable() {
+        // 根因是网络抖动（本来可重试），但工具本身有副作用。
+        let err = CoreError::network(true, "连接中断");
+        let failure = classify_tool_failure(me_core::ai::AiToolName::CalendarCreate, &err);
+        assert_eq!(failure, me_core::ai::ToolFailure::Write);
+        assert!(!failure.is_auto_retryable());
+    }
+
+    /// 权限/限额类错误：改参数与重试都没用。
+    #[test]
+    fn denied_errors_are_not_retryable() {
+        let err = CoreError::limit(me_core::LimitKind::ParseSize);
+        let failure = classify_tool_failure(me_core::ai::AiToolName::MailRead, &err);
+        assert_eq!(failure, me_core::ai::ToolFailure::Denied);
+        assert!(!failure.is_auto_retryable());
+    }
+
+    /// 配额退回：重试是**同一次逻辑调用**，不能重复计费。
+    #[test]
+    fn restoring_the_quota_gives_the_slot_back() {
+        let mut budget = ToolBudget {
+            mail_read: 2,
+            ..ToolBudget::default()
+        };
+        let snapshot = budget.quota_snapshot();
+        budget.mail_read += 1;
+        assert_eq!(budget.mail_read, 3);
+        budget.restore_quota(snapshot);
+        assert_eq!(
+            budget.mail_read, 2,
+            "重试前要退回配额，否则第二次就撞上「已读 3 次」"
+        );
     }
 }

@@ -2199,7 +2199,14 @@ async fn tool_calls_bind_to_plan_steps_and_record_attempts() {
     let message = last_assistant_message(&store, conversation);
     let plan = message.plan.expect("有清单");
     assert_eq!(plan.steps[1].status, me_core::ai_plan::PlanStatus::Done);
-    assert_eq!(plan.steps[1].attempts, 1, "一次执行记一次尝试");
+    // 库是空的 → 0 命中 → 引擎放宽条件（7 天 → 30 天）再试一次。
+    // 放宽那一次也是一次**物理尝试**，所以 attempts 是 2 而不是 1：
+    // 「3 次机会」是真实花掉的次数，不是模型发了几次调用。
+    assert_eq!(
+        plan.steps[1].attempts, 2,
+        "放宽重试也算一次尝试：{:?}",
+        plan.steps[1]
+    );
     assert!(plan.steps[1].evidence.is_some(), "执行回执由引擎写");
     assert_eq!(
         plan.steps[0].status,
@@ -2213,7 +2220,8 @@ async fn tool_calls_bind_to_plan_steps_and_record_attempts() {
         .find(|trace| trace.call_id == "c2")
         .expect("第 2 步的 trace");
     assert_eq!(trace.step_id, Some(2));
-    assert_eq!(trace.attempt, Some(1));
+    // attempt 是「这是这一步的第几次尝试」：放宽重试用掉了一次，所以是 2。
+    assert_eq!(trace.attempt, Some(2));
 }
 
 /// 计划期就把「参数不对」拦下来，并说清缺什么。
@@ -2351,10 +2359,20 @@ async fn failed_step_triggers_reflect_then_replan() {
         me_core::ai_plan::Diagnosis::WrongArgs
     );
     assert_eq!(plan.history.len(), 1, "旧计划要进 history");
+    // 落库的是**真正跑过**的条件：0 命中后引擎把时间窗从 7 天放宽到 30 天再试，
+    // 清单里写的是放宽后的那份（用户看到的是真实执行的条件）。
     assert_eq!(
         plan.steps[0].args,
-        Some(json!({ "unread_only": true, "days": 7 })),
-        "落库的是重列之后的计划"
+        Some(json!({ "unread_only": true, "days": 30 })),
+        "落库的是放宽之后真正跑过的条件"
+    );
+    assert!(
+        plan.steps[0]
+            .evidence
+            .as_deref()
+            .is_some_and(|text| text.contains("放宽")),
+        "回执要说明条件被放宽过：{:?}",
+        plan.steps[0].evidence
     );
 }
 
@@ -2423,4 +2441,106 @@ async fn replan_repeating_a_failed_call_is_dropped() {
         plan.replans
     );
     assert_eq!(plan.steps[0].status, me_core::ai_plan::PlanStatus::Failed);
+}
+
+// ---------------------------------------------------------------------------
+// 引擎级重试与放宽
+// ---------------------------------------------------------------------------
+
+/// 0 命中不是失败：引擎自己放宽条件再试一次，清单里写的是**真正跑过**的条件。
+#[tokio::test]
+async fn empty_result_widens_the_condition_and_retries() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查最近 7 天未读", "unread_only": true, "days": 7 }),
+        )),
+        Turn::text("最近 7 天没有未读邮件。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let plan = message.plan.expect("有清单");
+    let step = &plan.steps[0];
+    assert_eq!(
+        step.status,
+        me_core::ai_plan::PlanStatus::Done,
+        "0 命中是合法结果，不是失败：{step:?}"
+    );
+    assert!(
+        step.failure.is_none(),
+        "0 命中不该记失败：{:?}",
+        step.failure
+    );
+    // 时间窗从 7 天放宽到 30 天。
+    assert_eq!(
+        step.args,
+        Some(json!({ "unread_only": true, "days": 30 })),
+        "清单里写的是真正跑过的条件"
+    );
+    assert!(
+        step.evidence
+            .as_deref()
+            .is_some_and(|text| text.contains("放宽")),
+        "回执要说明条件被放宽过：{:?}",
+        step.evidence
+    );
+    assert_eq!(step.attempts, 2, "放宽那一次也是一次尝试：{step:?}");
+}
+
+/// 四个新事件都要发出去：界面靠它们显示尝试角标、自检结论与重列轮次。
+#[tokio::test]
+async fn plan_events_are_emitted() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查最近 7 天未读", "unread_only": true, "days": 7 }),
+        )),
+        Turn::text("最近 7 天没有未读邮件。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    // 收集所有事件直到消息完成。
+    let mut attempts = 0;
+    let mut finished = false;
+    loop {
+        let event = wait_for(&mut rx, |_| true).await;
+        match &event {
+            Event::AiPlanStepAttempt { .. } => attempts += 1,
+            Event::AiPlanFinished { .. } => finished = true,
+            Event::AiMessageCompleted { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(attempts >= 1, "每次尝试都要发事件");
+    assert!(finished, "收尾要发 AiPlanFinished");
 }

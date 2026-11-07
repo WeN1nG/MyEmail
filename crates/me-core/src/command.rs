@@ -771,6 +771,47 @@ pub enum Event {
         message: crate::ai::AiMessageId,
         plan: crate::ai_plan::Plan,
     },
+    /// 每一步的开始 / 每次重试。
+    ///
+    /// **可丢**：它只影响清单条上「第 2/3 次」这个角标的完整性，
+    /// 最终态由 `AiPlanUpdated` + 落库保证。
+    AiPlanStepAttempt {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        step_id: u8,
+        attempt: u8,
+        max_attempts: u8,
+        tool: Option<crate::ai::AiToolName>,
+        args_digest: Option<String>,
+        error: Option<String>,
+    },
+    /// 自检完成：模型对「这次到底做完没有」的判断（已被引擎按事实裁剪）。
+    AiPlanSelfCheck {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        verdict: crate::ai_plan::Verdict,
+        failed_step: Option<u8>,
+        diagnosis: Option<crate::ai_plan::Diagnosis>,
+        reason: String,
+    },
+    /// 重列完成：换了一份新计划。
+    AiPlanReplanned {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        round: u8,
+        diagnosis: crate::ai_plan::Diagnosis,
+        changes: String,
+        failed_step_titles: Vec<String>,
+    },
+    /// 整轮收尾：清单的最终结论。
+    AiPlanFinished {
+        conversation: crate::ai::AiConversationId,
+        message: crate::ai::AiMessageId,
+        verdict: crate::ai_plan::Verdict,
+        done: usize,
+        total: usize,
+        replans: usize,
+    },
     /// 邮件检索结果只给 id + 命中理由；UI 通过只读接口取摘要，事件里不放正文。
     AiToolEmailResults {
         conversation: crate::ai::AiConversationId,
@@ -865,7 +906,11 @@ impl Event {
     pub fn is_progress(&self) -> bool {
         matches!(
             self,
-            Event::SyncProgress { .. } | Event::IndexProgress { .. } | Event::AiStreamDelta { .. }
+            Event::SyncProgress { .. }
+                | Event::IndexProgress { .. }
+                | Event::AiStreamDelta { .. }
+                // 尝试角标是可丢的：丢一次只是少一个「第 2/3 次」，不影响最终态。
+                | Event::AiPlanStepAttempt { .. }
         )
     }
 

@@ -1587,6 +1587,18 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             } => {
                 self.state.ai.apply_plan(conversation, plan);
             }
+            Event::AiPlanStepAttempt { .. } => {
+                // 尝试角标由清单条自己算（attempts 就在 plan 里），不需要单独处理。
+            }
+            Event::AiPlanSelfCheck { .. } => {
+                // 自检结论落在正文里（引擎裁剪后写进最终答复），这里不重复展示。
+            }
+            Event::AiPlanReplanned { .. } => {
+                // 重列后的清单由随后的 AiPlanUpdated 带过来。
+            }
+            Event::AiPlanFinished { .. } => {
+                // 收尾状态由落库的那条消息承载。
+            }
             Event::AiToolStarted { .. } => {
                 // 工具开始不单独展示：完成事件带摘要，活动条一次成型。
             }

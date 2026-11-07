@@ -2617,6 +2617,8 @@ fn classify_send_error(err: &CoreError) -> SendFailureKind {
             code: None,
             detail: err.user_message(),
         },
+        // 超时算「没发出去」：可以重试，但不属于「被服务器拒绝」。
+        CoreError::Timeout { .. } => SendFailureKind::Timeout,
     }
 }
 

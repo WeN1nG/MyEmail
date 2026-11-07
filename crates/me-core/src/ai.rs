@@ -684,6 +684,23 @@ impl AiToolName {
             AiToolName::PlanUpdate | AiToolName::PlanSubmit | AiToolName::AnswerDirectly
         )
     }
+
+    /// 这个工具**有没有副作用**（改了外部状态）。
+    ///
+    /// 副作用工具**永不自动重试**：写操作重试一次就可能变成「建了两个日程」。
+    /// 这里列的是全集而不是取反——以后新增工具时默认会被当成有副作用，
+    /// 那是失败安全的方向（少重试一次只是慢一点，多重试一次是数据错误）。
+    pub fn has_side_effect(self) -> bool {
+        matches!(
+            self,
+            AiToolName::CalendarCreate
+                | AiToolName::CalendarUpdate
+                | AiToolName::CalendarDelete
+                | AiToolName::MemoryUpsert
+                | AiToolName::MusicPlay
+                | AiToolName::MusicControl
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1279,7 +1296,35 @@ pub struct AiToolResult {
     /// 发给模型的工具结果（已按 [`MAX_TOOL_RESULT_CHARS`] 截断）。
     pub content: String,
     pub is_error: bool,
+    /// 失败原因分类。`None` = 成功。
+    ///
+    /// 引擎靠它决定「要不要自动重试」：只有 [`ToolFailure::Transient`] 才重试，
+    /// 其余类别重试一万次也是同一个结果。
+    pub failure: Option<ToolFailure>,
     pub trace: AiToolTrace,
+}
+
+/// 工具失败的原因分类。
+///
+/// 分类的依据是「改了参数有没有用」，不是「错误长什么样」：
+/// 参数错了要改参数，网络抖了要原样重试，权限关了要用户去开设置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFailure {
+    /// 临时故障（网络抖动、超时）：**原样重试**有用。
+    Transient,
+    /// 参数不合法：必须改参数，重试是空转。
+    InvalidArgs,
+    /// 权限未开 / 已被关闭 / 次数超限：重试与改参数都没用。
+    Denied,
+    /// 有副作用的工具失败：永远不自动重试（重试一次可能就重复执行了）。
+    Write,
+}
+
+impl ToolFailure {
+    /// 引擎能不能自己再试一次。
+    pub fn is_auto_retryable(self) -> bool {
+        matches!(self, ToolFailure::Transient)
+    }
 }
 
 /// 工具级开关。关闭的工具不出现在请求 `tools` 中，模型**无法**调用。
@@ -2435,6 +2480,47 @@ mod tests {
         assert!(!AiToolName::CalendarDelete.is_replay_safe());
         assert!(!AiToolName::MusicPlay.is_replay_safe(), "重放会真的切歌");
         assert!(!AiToolName::MusicControl.is_replay_safe());
+    }
+
+    #[test]
+    fn side_effect_tools_are_never_auto_retried() {
+        // 有副作用的工具：重试一次可能就真的做两遍（建两个日程、切两次歌）。
+        for tool in [
+            AiToolName::CalendarCreate,
+            AiToolName::CalendarUpdate,
+            AiToolName::CalendarDelete,
+            AiToolName::MemoryUpsert,
+            AiToolName::MusicPlay,
+            AiToolName::MusicControl,
+        ] {
+            assert!(
+                tool.has_side_effect(),
+                "{} 必须被标成有副作用",
+                tool.as_str()
+            );
+        }
+        // 只读工具：可以自动重试。
+        for tool in [
+            AiToolName::EmailSearch,
+            AiToolName::MailRead,
+            AiToolName::WeatherGet,
+            AiToolName::CalendarList,
+            AiToolName::MusicSearch,
+        ] {
+            assert!(
+                !tool.has_side_effect(),
+                "{} 是只读的，不该被标成有副作用",
+                tool.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn only_transient_failures_are_auto_retryable() {
+        assert!(ToolFailure::Transient.is_auto_retryable());
+        assert!(!ToolFailure::InvalidArgs.is_auto_retryable());
+        assert!(!ToolFailure::Denied.is_auto_retryable());
+        assert!(!ToolFailure::Write.is_auto_retryable());
     }
 
     #[test]

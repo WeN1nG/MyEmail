@@ -93,6 +93,13 @@ pub enum CoreError {
         detail: String,
         retryable: bool,
     },
+
+    /// 操作超时。**可重试**：临时故障，原样再试一次通常就成了。
+    ///
+    /// 单独成一个变体而不是复用 `Validation`：AI 层要区分「参数不对」
+    /// （改了参数才有用）与「这次没成」（原样重试有用），两者的重试策略相反。
+    #[error("超时: {message}")]
+    Timeout { message: String },
 }
 
 /// AI 错误的用户可见分类。
@@ -224,6 +231,13 @@ impl CoreError {
         CoreError::Cancelled
     }
 
+    /// 构造一个可重试的超时错误。
+    pub fn timeout(message: impl Into<String>) -> Self {
+        CoreError::Timeout {
+            message: message.into(),
+        }
+    }
+
     /// 构造 AI 错误。只有 `Transient` 默认可重试；429 由用户手动重试。
     pub fn ai(
         kind: AiErrorKind,
@@ -255,6 +269,7 @@ impl CoreError {
                     || lower.contains("too many")
                     || lower.contains("bye")
             }
+            CoreError::Timeout { .. } => true,
             CoreError::Auth { .. }
             | CoreError::OAuth { .. }
             | CoreError::Storage { .. }
@@ -289,6 +304,7 @@ impl CoreError {
             }
             CoreError::Storage { .. } => "本地数据库操作失败".to_string(),
             CoreError::Parse { .. } => "邮件内容无法解析".to_string(),
+            CoreError::Timeout { message } => message.clone(),
             CoreError::Validation { message } => message.clone(),
             CoreError::Limit { what } => what.to_string(),
             CoreError::Cancelled => "操作已取消".to_string(),
