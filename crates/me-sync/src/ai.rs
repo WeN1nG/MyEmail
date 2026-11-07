@@ -37,6 +37,10 @@ const STREAM_BUDGET: Duration = Duration::from_secs(300);
 /// 不设上限的后果很具体：6 轮预算会被「催一句 → 模型说好的 → 再催」耗光，
 /// 用户看到的是一条什么都没干成的回复。两次之后就把控制权交回用户。
 const MAX_PLAN_NUDGES: u32 = 2;
+/// 调用过工具却一个字没说时，最多催它写正文几次。
+///
+/// 只给一次：再催就是逼它编内容。第二次仍然空白就走引擎兜底摘要。
+const MAX_BLANK_RETRIES: u32 = 1;
 /// delta 节流：≥50 ms 或 ≥2 KB 发一次。
 const DELTA_INTERVAL: Duration = Duration::from_millis(50);
 const DELTA_BATCH_BYTES: usize = 2048;
@@ -1124,6 +1128,7 @@ where
         // 本轮的清单是**产物**而不是配额，所以放局部变量（不放 `ToolBudget`）。
         let mut plan: Option<me_core::ai_plan::Plan> = None;
         let mut nudges = 0u32;
+        let mut blank_retries = 0u32;
         let mut budget = crate::ai_tools::ToolBudget {
             permissions,
             context_refs,
@@ -1180,6 +1185,20 @@ where
             }
 
             if turn.tool_calls.is_empty() {
+                // 调用过工具却一个字没说：界面会停在一块空白上，用户既不知道做成了什么，
+                // 也不知道为什么没结果。先补一句提醒让它交代，只给一次机会。
+                if blank_retries < MAX_BLANK_RETRIES
+                    && executed_calls > 0
+                    && is_blank_answer(&turn.text)
+                {
+                    blank_retries += 1;
+                    request.messages.push(me_core::ai::AiWireMessage::User {
+                        content: "你还没有把结果告诉用户。请用自然语言说明：找到了什么、\
+没找到什么、下一步建议是什么；本轮调用过工具时按 [结果] 格式收尾。"
+                            .to_string(),
+                    });
+                    continue;
+                }
                 // 清单还开着却停了：模型常常以为「说完计划就算做完了」。
                 // 这里补一条提醒再给它一轮，而不是直接收尾把清单丢在半路。
                 if nudges < MAX_PLAN_NUDGES
@@ -1313,7 +1332,7 @@ where
         }
 
         // 收尾：把最后一段未满 50ms 的增量发出去。
-        let (content, seq_tail) = {
+        let (mut content, seq_tail) = {
             let Ok(mut state) = throttle.lock() else {
                 return;
             };
@@ -1328,6 +1347,16 @@ where
                 delta: seq_tail.1,
             })
             .await;
+        }
+
+        // 兜底：整轮调用过工具却没有任何正文 → 用执行回执拼一段，绝不留白。
+        //
+        // 状态仍是 `complete`：`ai_messages.status` 的 CHECK 只有 streaming/complete/
+        // failed/cancelled 四个值，加 `partial` 需要一次迁移。「没拿到结果」这层语义
+        // 由正文首句与 `error` 字段承担，UI 重载后用户能看懂发生了什么。
+        if status == AiMessageStatus::Complete && executed_calls > 0 && is_blank_answer(&content) {
+            content = fallback_answer(plan.as_ref(), &traces);
+            error_text = Some("模型未输出正文，已用执行回执兜底".to_string());
         }
 
         let usage = *usage.lock().unwrap_or_else(|e| e.into_inner());
@@ -1457,6 +1486,47 @@ where
             .await;
         Ok(saved)
     }
+}
+
+/// 一个可见字符都没有才算「没说话」——那次事故的正文就是 13 个换行。
+///
+/// **不要**提高阈值去判「回答得够不够好」：`记住了。`、`已删除。` 这类短回执是
+/// 完全合法的回答，用字符数卡会误伤它们（而且会把正常回复也塞进兜底摘要）。
+/// 引擎只负责「一个字都没说」这一种情况。
+fn is_blank_answer(text: &str) -> bool {
+    text.chars().all(char::is_whitespace)
+}
+
+/// 模型整轮没写出正文时的兜底：只陈述**已经发生的事实**，不编造结论。
+///
+/// 空白比错误更糟——用户既不知道做成了什么，也不知道为什么没结果。
+fn fallback_answer(plan: Option<&me_core::ai_plan::Plan>, traces: &[AiToolTrace]) -> String {
+    let mut out = String::from("这次没有拿到可用的结果。\n\n");
+    match plan {
+        Some(plan) => {
+            let (done, total) = plan.progress();
+            out.push_str(&format!("计划：完成 {done}/{total} 步\n"));
+            for step in &plan.steps {
+                out.push_str(&format!(
+                    "· {}：{} —— {}\n",
+                    step.title,
+                    step.status.label(),
+                    step.evidence.as_deref().unwrap_or("没有留下回执"),
+                ));
+            }
+        }
+        None if !traces.is_empty() => {
+            out.push_str("执行过的操作：\n");
+            for trace in traces {
+                out.push_str(&format!("· {}：{}\n", trace.tool.label(), trace.summary));
+            }
+        }
+        None => {}
+    }
+    out.push_str(
+        "\n你可以：① 让我先同步最近的邮件；② 换一个更具体的说法（例如「这周未读的邮件」）。",
+    );
+    out
 }
 
 /// 收尾时把清单改成最终态。

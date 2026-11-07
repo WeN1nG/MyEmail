@@ -59,6 +59,19 @@ fn tool_call(id: &str, name: AiToolName, args: serde_json::Value) -> AiToolCall 
     }
 }
 
+/// 读回落库的最后一条助手消息（断言「终止态」用）。
+fn last_assistant_message(store: &Store, conversation: AiConversationId) -> me_core::ai::AiMessage {
+    let writable = store.writable();
+    let messages = writable
+        .list_messages(conversation, None, 20)
+        .expect("list messages");
+    messages
+        .into_iter()
+        .rev()
+        .find(|message| message.role == me_core::ai::AiRole::Assistant)
+        .expect("至少要有一条助手消息")
+}
+
 struct MockAiProvider {
     script: Mutex<VecDeque<Turn>>,
     /// 每轮请求携带的 `tools` 数量（用于验证开关真的收紧了请求）。
@@ -1271,6 +1284,118 @@ async fn changed_args_are_not_blocked_by_the_circuit_breaker() {
         summaries[1].contains("0 命中"),
         "第二次是真的执行了（时间窗合法、库里没有邮件），实际：{}",
         summaries[1]
+    );
+}
+
+/// 调用过工具却整轮没写正文：先催一次，仍然空白就用执行回执兜底，绝不留白。
+///
+/// 那次事故的落库结果是 `content` 为 13 个换行、`status` 却是 `complete`——
+/// 用户看到一块空白，而且没有任何可排查的痕迹。
+#[tokio::test]
+async fn blank_answer_falls_back_to_execution_summary() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "按时间窗查最近邮件", "days": 7 }),
+        )),
+        // 第一次空白：引擎应当催它一次。
+        Turn::text("\n\n\n"),
+        // 第二次仍空白：走兜底，不再催（再催就是逼它编）。
+        Turn::text("\n\n\n"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+
+    commands
+        .send(Command::CreateAiConversation { model: None })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiConversationsChanged)
+    })
+    .await;
+    let conversation = latest_conversation(&store);
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(
+        message.content.contains("这次没有拿到可用的结果"),
+        "兜底摘要必须以「没拿到结果」开头，实际：{}",
+        message.content
+    );
+    assert!(
+        message.content.contains("检索邮件"),
+        "兜底摘要要列出真正执行过的工具，实际：{}",
+        message.content
+    );
+    assert!(
+        message
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("模型未输出正文")),
+        "要留下可排查的痕迹，实际：{:?}",
+        message.error
+    );
+}
+
+/// 正常写出正文时**不能**被兜底覆盖。
+#[tokio::test]
+async fn normal_answer_is_not_replaced_by_fallback() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "按时间窗查最近邮件", "days": 7 }),
+        )),
+        Turn::text("最近 7 天没有新邮件，收件箱是空的。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+
+    commands
+        .send(Command::CreateAiConversation { model: None })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiConversationsChanged)
+    })
+    .await;
+    let conversation = latest_conversation(&store);
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "最近有邮件吗".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(
+        message.content.contains("最近 7 天没有新邮件"),
+        "正常回答必须原样保留，实际：{}",
+        message.content
+    );
+    assert!(
+        message.error.is_none(),
+        "正常回答不该有 error，实际：{:?}",
+        message.error
     );
 }
 
