@@ -17,9 +17,10 @@ use std::time::{Duration, Instant};
 use me_core::ai::{
     AiChatRequest, AiContextRef, AiContextRequest, AiConversationId, AiCredential, AiDelta,
     AiDeltaSink, AiEntity, AiMessageId, AiMessageStatus, AiModel, AiProvider, AiProviderConfig,
-    AiProviderKind, AiRole, AiToolResult, AiToolTrace, ChatBuildInput, DEFAULT_MAX_INPUT_CHARS,
-    MAX_TOOL_CALLS, MAX_TOOL_ROUNDS, MAX_USER_INPUT_CHARS, NewAiEntity, NewAiMessage,
-    build_chat_request, find_model, next_model_id, resolve_model, tool_specs, validate_model,
+    AiProviderKind, AiRole, AiToolName, AiToolResult, AiToolTrace, ChatBuildInput,
+    DEFAULT_MAX_INPUT_CHARS, MAX_TOOL_CALLS, MAX_TOOL_ROUNDS, MAX_USER_INPUT_CHARS, NewAiEntity,
+    NewAiMessage, build_chat_request, find_model, next_model_id, resolve_model, tool_specs,
+    validate_model,
 };
 use me_core::model::{MessageId, now_unix};
 use me_core::port::StorePort;
@@ -37,6 +38,12 @@ const STREAM_BUDGET: Duration = Duration::from_secs(300);
 /// 不设上限的后果很具体：6 轮预算会被「催一句 → 模型说好的 → 再催」耗光，
 /// 用户看到的是一条什么都没干成的回复。两次之后就把控制权交回用户。
 const MAX_PLAN_NUDGES: u32 = 2;
+/// PLAN 阶段最多催几次「提交计划」。
+///
+/// 只给两次（首轮一次 + 空回复一次），第三轮由引擎合成单步计划收场：
+/// 「等模型学会」的设计在生产里一定会变成死循环。
+const MAX_PLAN_ROUNDS: u32 = 2;
+
 /// 调用过工具却一个字没说时，最多催它写正文几次。
 ///
 /// 只给一次：再催就是逼它编内容。第二次仍然空白就走引擎兜底摘要。
@@ -68,6 +75,16 @@ pub(crate) struct AiState {
 
 pub(crate) struct StreamEntry {
     pub token: CancellationToken,
+}
+
+/// 一次流式回复的入参里「不属于请求本身」的那几项。
+///
+/// 打成一个结构体而不是继续加参数：`run_ai_stream` 已经有五个位置参数，
+/// 再加三个就要靠 `#[allow(clippy::too_many_arguments)]` 压警告了。
+struct StreamSetup {
+    permissions: me_core::ai::AiToolPermissions,
+    context_refs: Vec<MessageId>,
+    replay_only: bool,
 }
 
 impl Default for AiState {
@@ -917,8 +934,11 @@ where
                     message,
                     request,
                     token,
-                    permissions,
-                    context_refs,
+                    StreamSetup {
+                        permissions,
+                        context_refs,
+                        replay_only,
+                    },
                 )
                 .await;
             if let Ok(mut state) = service.inner.ai_state.lock() {
@@ -1064,9 +1084,13 @@ where
         message: AiMessageId,
         mut request: AiChatRequest,
         token: CancellationToken,
-        permissions: me_core::ai::AiToolPermissions,
-        context_refs: Vec<MessageId>,
+        setup: StreamSetup,
     ) {
+        let StreamSetup {
+            permissions,
+            context_refs,
+            replay_only,
+        } = setup;
         let started = Instant::now();
         let permit = self
             .inner
@@ -1129,6 +1153,19 @@ where
         let mut plan: Option<me_core::ai_plan::Plan> = None;
         let mut nudges = 0u32;
         let mut blank_retries = 0u32;
+        let mut phase = Phase::Plan;
+        let mut plan_rounds = 0u32;
+        let mut answered_directly = false;
+
+        // 两套工具集：PLAN 阶段只有 `plan_submit` / `answer_directly`，
+        // 物理上取消了模型「边想边查」的可能——想查就必须先说要查什么。
+        let mut plan_tools = me_core::ai::plan_phase_tool_specs();
+        let mut execute_tools = me_core::ai::execute_phase_tool_specs(&permissions);
+        if replay_only {
+            plan_tools.retain(|spec| spec.name.is_replay_safe());
+            execute_tools.retain(|spec| spec.name.is_replay_safe());
+        }
+        request.tools = plan_tools.clone();
         let mut budget = crate::ai_tools::ToolBudget {
             permissions,
             context_refs,
@@ -1145,10 +1182,17 @@ where
             }
             if started.elapsed() > STREAM_BUDGET {
                 status = AiMessageStatus::Failed;
-                error_text = Some("回复超时（工具循环总时长超过 240 秒）".to_string());
+                error_text = Some("回复超时（工具循环总时长超过 600 秒）".to_string());
                 retryable = true;
                 break;
             }
+
+            request.tools = match phase {
+                Phase::Plan => plan_tools.clone(),
+                Phase::Execute => execute_tools.clone(),
+                // FINAL 不给工具：模型必须把话说出来，而不是再发起一轮调用。
+                Phase::Final => Vec::new(),
+            };
 
             let turn = tokio::select! {
                 biased;
@@ -1185,10 +1229,43 @@ where
             }
 
             if turn.tool_calls.is_empty() {
+                if phase == Phase::Plan {
+                    // PLAN 阶段模型直接说了一段话，没有提交计划。
+                    // 只在「这句话看起来是在说『我打算去查…』」时才追问一次；
+                    // 寒暄与纯知识问答直接当最终答复，不逼它编一份计划出来。
+                    if plan_rounds < MAX_PLAN_ROUNDS && promises_action(&turn.text) {
+                        plan_rounds += 1;
+                        request.messages.push(me_core::ai::AiWireMessage::User {
+                            content: "你还没有提交计划。这次请求需要查数据或做动作，请先调用 \
+plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect），我确认后再执行；\
+如果确实不需要任何工具，请调用 answer_directly 并说明理由。"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    if plan_rounds < MAX_PLAN_ROUNDS && is_blank_answer(&turn.text) {
+                        plan_rounds += 1;
+                        request.messages.push(me_core::ai::AiWireMessage::User {
+                            content: "你还没有回答。请先调用 plan_submit 给出计划，\
+或者调用 answer_directly 说明这次为什么不需要工具。"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    // 第二道兜底：已经问过一次、模型仍然只给文本 → 引擎合成单步清单。
+                    // 首轮就不追问（问过不算），所以寒暄与纯问答不会凭空多出一份计划。
+                    if plan_rounds > 0 && plan.is_none() && !answered_directly {
+                        plan = Some(synthetic_plan());
+                        error_text = Some("模型未提交计划，已按单步处理".to_string());
+                    }
+                    // 不像任务、也没计划：这段文本就是答复，直接收尾。
+                    break;
+                }
+
                 // 调用过工具却一个字没说：界面会停在一块空白上，用户既不知道做成了什么，
                 // 也不知道为什么没结果。先补一句提醒让它交代，只给一次机会。
                 if blank_retries < MAX_BLANK_RETRIES
-                    && executed_calls > 0
+                    && (executed_calls > 0 || plan.is_some())
                     && is_blank_answer(&turn.text)
                 {
                     blank_retries += 1;
@@ -1199,9 +1276,18 @@ where
                     });
                     continue;
                 }
-                // 清单还开着却停了：模型常常以为「说完计划就算做完了」。
-                // 这里补一条提醒再给它一轮，而不是直接收尾把清单丢在半路。
-                if nudges < MAX_PLAN_NUDGES
+                // 催过一次还是空白：不再催（再催就是逼它编），交给兜底摘要。
+                if is_blank_answer(&turn.text) {
+                    break;
+                }
+                // 说了一句「我这就去查」然后停手：清单还开着，但一步都没做。
+                // 这是唯一值得催的情形——再给它一轮，而不是直接收尾把清单丢在半路。
+                //
+                // 判据收得很窄（`promises_action`）：模型已经给出实质回答时再催，
+                // 只会让它把好好的答案重写一遍，用户白等一轮。
+                if executed_calls == 0
+                    && promises_action(&turn.text)
+                    && nudges < MAX_PLAN_NUDGES
                     && plan
                         .as_ref()
                         .is_some_and(me_core::ai_plan::Plan::has_open_steps)
@@ -1261,6 +1347,35 @@ where
                     continue;
                 }
 
+                // 防御性拦截：PLAN 阶段根本没下发业务工具，模型仍可能凭历史记忆去调。
+                // 这里拒绝**不消耗**预算（没有产生 IO），并告诉它现在该做什么。
+                if phase == Phase::Plan && !call.name.is_bookkeeping() {
+                    self.emit(Event::AiToolStarted {
+                        conversation,
+                        call_id: call.id.clone(),
+                        tool: call.name,
+                        motive: motive.clone(),
+                        motive_source,
+                    })
+                    .await;
+                    let result =
+                        crate::ai_tools::phase_rejected_result(call, motive, motive_source);
+                    self.emit(Event::AiToolCompleted {
+                        conversation,
+                        call_id: result.call_id.clone(),
+                        tool: result.tool,
+                        status: result.trace.status,
+                        summary: result.trace.summary.clone(),
+                        duration_ms: result.trace.duration_ms,
+                        motive: result.trace.motive.clone(),
+                        motive_source: result.trace.motive_source,
+                    })
+                    .await;
+                    traces.push(result.trace.clone());
+                    results.push(result);
+                    continue;
+                }
+
                 // 清单维护不算「干活」：否则一份 6 步清单光更新状态就要吃掉一半预算。
                 // 轮次仍然受限，所以它不能被用来无限刷。
                 if !call.name.is_bookkeeping() {
@@ -1271,14 +1386,32 @@ where
                     }
                     executed_calls += 1;
                 }
-                self.emit(Event::AiToolStarted {
-                    conversation,
-                    call_id: call.id.clone(),
-                    tool: call.name,
-                    motive: motive.clone(),
-                    motive_source,
-                })
-                .await;
+                // 绑定到清单里的某一步：模型可以显式给 `step_id`，也可以让引擎按
+                // motive / 工具名兜底。绑定失败**不拒绝执行**——报错换不来让它改对。
+                let bound = if phase == Phase::Execute && !call.name.is_bookkeeping() {
+                    plan.as_ref().and_then(|current| {
+                        let id = crate::ai_tools::bind_step(current, call, &motive)?;
+                        Some(id)
+                    })
+                } else {
+                    None
+                };
+                if let (Some(id), Some(current)) = (bound, plan.as_mut()) {
+                    current.begin_step(id);
+                }
+                // 清单类工具不进行为条：清单条本身就是它的展示位，
+                // 再在活动条里刷一条「更新清单」只会把真正的工具调用挤下去。
+                let visible = !call.name.is_bookkeeping();
+                if visible {
+                    self.emit(Event::AiToolStarted {
+                        conversation,
+                        call_id: call.id.clone(),
+                        tool: call.name,
+                        motive: motive.clone(),
+                        motive_source,
+                    })
+                    .await;
+                }
                 let plan_before = plan.clone();
                 let result = tokio::select! {
                     biased;
@@ -1288,6 +1421,29 @@ where
                     }
                     result = self.execute_ai_tool(conversation, call, &mut budget, &mut plan) => result,
                 };
+                if let Some(id) = bound
+                    && let Some(current) = plan.as_mut()
+                {
+                    let outcome = if result.is_error {
+                        me_core::ai_plan::AttemptOutcome::Failed(crate::ai_tools::classify_failure(
+                            &result.trace.summary,
+                        ))
+                    } else if crate::ai_tools::is_empty_result(&result.trace.summary) {
+                        me_core::ai_plan::AttemptOutcome::Empty {
+                            evidence: result.trace.summary.clone(),
+                        }
+                    } else {
+                        me_core::ai_plan::AttemptOutcome::Done {
+                            evidence: result.trace.summary.clone(),
+                        }
+                    };
+                    current.record_attempt(id, outcome);
+                    // 被引用步失败 → 依赖它的步自动跳过，别拿空参数再撞一次。
+                    current.skip_dependents();
+                }
+                if call.name == AiToolName::AnswerDirectly && !result.is_error {
+                    answered_directly = true;
+                }
                 if plan != plan_before
                     && let Some(current) = plan.clone()
                 {
@@ -1298,20 +1454,55 @@ where
                     })
                     .await;
                 }
-                self.emit(Event::AiToolCompleted {
-                    conversation,
-                    call_id: result.call_id.clone(),
-                    tool: result.tool,
-                    status: result.trace.status,
-                    summary: result.trace.summary.clone(),
-                    duration_ms: result.trace.duration_ms,
-                    // 用 trace 里的同一份，保证同一条活动条前后不跳变。
-                    motive: result.trace.motive.clone(),
-                    motive_source: result.trace.motive_source,
-                })
-                .await;
-                traces.push(result.trace.clone());
+                if visible {
+                    self.emit(Event::AiToolCompleted {
+                        conversation,
+                        call_id: result.call_id.clone(),
+                        tool: result.tool,
+                        status: result.trace.status,
+                        summary: result.trace.summary.clone(),
+                        duration_ms: result.trace.duration_ms,
+                        // 用 trace 里的同一份，保证同一条活动条前后不跳变。
+                        motive: result.trace.motive.clone(),
+                        motive_source: result.trace.motive_source,
+                    })
+                    .await;
+                }
+                let mut trace = result.trace.clone();
+                trace.step_id = trace.step_id.or(bound);
+                trace.attempt = trace
+                    .step_id
+                    .and_then(|id| plan.as_ref().and_then(|current| current.step(id)))
+                    .map(|step| step.attempts);
+                if visible {
+                    traces.push(trace);
+                }
                 results.push(result);
+            }
+
+            // 计划到手 → 进入执行阶段，并把「接下来做什么」写清楚。
+            //
+            // 这里只要求「有清单」，不要求 `is_executable()`：模型用旧接口
+            // （`plan_update`）交上来的 v1 清单也算数。它的步骤没有工具与参数，
+            // 清单条只能显示标题与状态——但那是模型的表达质量问题，
+            // 不该让整轮卡在 PLAN 阶段反复催。
+            if phase == Phase::Plan && plan.is_some() {
+                phase = Phase::Execute;
+                if let Some(current) = plan.as_ref() {
+                    request.messages.push(me_core::ai::AiWireMessage::User {
+                        content: format!(
+                            "计划已收到（{} 步）。现在开始执行，工具调用请带上 step_id。{}",
+                            current.steps.len(),
+                            current.summary_line()
+                        ),
+                    });
+                }
+            } else if phase == Phase::Plan && answered_directly {
+                // 模型声明「不需要工具」：不再给工具，逼它把话说出来。
+                phase = Phase::Final;
+                request.messages.push(me_core::ai::AiWireMessage::User {
+                    content: "好，请直接回答用户。".to_string(),
+                });
             }
 
             request
@@ -1354,7 +1545,10 @@ where
         // 状态仍是 `complete`：`ai_messages.status` 的 CHECK 只有 streaming/complete/
         // failed/cancelled 四个值，加 `partial` 需要一次迁移。「没拿到结果」这层语义
         // 由正文首句与 `error` 字段承担，UI 重载后用户能看懂发生了什么。
-        if status == AiMessageStatus::Complete && executed_calls > 0 && is_blank_answer(&content) {
+        if status == AiMessageStatus::Complete
+            && (executed_calls > 0 || plan.is_some())
+            && is_blank_answer(&content)
+        {
             content = fallback_answer(plan.as_ref(), &traces);
             error_text = Some("模型未输出正文，已用执行回执兜底".to_string());
         }
@@ -1488,6 +1682,58 @@ where
     }
 }
 
+/// 一次回复内部的阶段。**工具集随阶段变化**，这是「强制清单」的落地方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// 只能提交计划（`plan_submit`）或声明不需要（`answer_directly`）。
+    Plan,
+    /// 按计划执行：能力工具 + `plan_update`。
+    Execute,
+    /// 收尾：不下发任何工具，模型必须把话说出来。
+    Final,
+}
+
+/// 模型两轮都不提交计划时的兜底：合成一份「直接回答」的单步清单。
+///
+/// 有清单比没有强：界面至少能显示「这一步做了什么」，用户不会面对一块空白，
+/// 事后也能看出「模型没配合」，而不是以为工具全挂了。
+fn synthetic_plan() -> me_core::ai_plan::Plan {
+    let now = now_unix();
+    let mut step = me_core::ai_plan::PlanStep::new(
+        1,
+        "直接回答",
+        me_core::ai_plan::Capability::Mail,
+        me_core::ai_plan::PlanStatus::Running,
+    );
+    step.kind = me_core::ai_plan::StepKind::Reason;
+    step.expect = Some("给出当前能给出的最好答案".to_string());
+    me_core::ai_plan::Plan::v2("按单步直接回答", vec![step], now)
+}
+
+/// 模型是不是在说「我这就去办」——只有这种空头承诺值得追一句。
+///
+/// 判据故意窄：把一段实质回答误判成「还没开始」会白烧一轮，还会让模型
+/// 把刚写好的答案重写一遍。宁可不催，也不要打断一个已经答完的模型。
+fn promises_action(text: &str) -> bool {
+    if is_blank_answer(text) {
+        return false;
+    }
+    [
+        "我先",
+        "我帮",
+        "马上",
+        "稍等",
+        "这就",
+        "接下来",
+        "让我",
+        "我看看",
+        "我去",
+        "我来",
+    ]
+    .iter()
+    .any(|hint| text.contains(hint))
+}
+
 /// 一个可见字符都没有才算「没说话」——那次事故的正文就是 13 个换行。
 ///
 /// **不要**提高阈值去判「回答得够不够好」：`记住了。`、`已删除。` 这类短回执是
@@ -1542,7 +1788,26 @@ fn finalize_plan(
 ) -> Option<me_core::ai_plan::Plan> {
     let current = plan.as_mut()?;
     match status {
-        AiMessageStatus::Complete => {}
+        AiMessageStatus::Complete => {
+            // 清单的所有权在引擎，所以收尾也得由引擎把状态收干净：
+            // 留一个 `running` 在界面上就是永远转圈的圆圈。
+            for step in current.steps.iter_mut() {
+                if step.status != me_core::ai_plan::PlanStatus::Running {
+                    continue;
+                }
+                if step.kind == me_core::ai_plan::StepKind::Reason || step.evidence.is_some() {
+                    // 推理步把答案写在正文里；工具步有回执（含「0 命中」）就是执行过了。
+                    step.status = me_core::ai_plan::PlanStatus::Done;
+                    if step.evidence.is_none() {
+                        step.evidence = Some("已直接回答".to_string());
+                    }
+                } else {
+                    // 一次都没执行过：如实说没做，不要假装完成。
+                    step.status = me_core::ai_plan::PlanStatus::Skipped;
+                    step.evidence = Some("本轮没有执行".to_string());
+                }
+            }
+        }
         AiMessageStatus::Cancelled => {
             current.skip_running("用户停止了生成");
         }

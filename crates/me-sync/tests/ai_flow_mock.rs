@@ -59,6 +59,56 @@ fn tool_call(id: &str, name: AiToolName, args: serde_json::Value) -> AiToolCall 
     }
 }
 
+/// 把一段文本折成一次 `plan_submit`。
+///
+/// PLAN 阶段只下发 `plan_submit` / `answer_directly`，所以任何「直接调业务工具」的
+/// 剧本都必须先交一份计划——这正是这个功能想要的约束，测试也照此写。
+fn plan_submit_for(tools: &[AiToolName]) -> AiToolCall {
+    let steps: Vec<serde_json::Value> = tools
+        .iter()
+        .enumerate()
+        .map(|(index, tool)| {
+            let (capability, args, title) = match tool {
+                AiToolName::EmailSearch => ("mail", json!({ "days": 7 }), "检索近 7 天的邮件"),
+                AiToolName::MailRead => ("mail", json!({ "message_id": 1 }), "读取邮件正文"),
+                AiToolName::MemoryUpsert => (
+                    "mail",
+                    json!({ "kind": "person", "canonical_name": "张三" }),
+                    "记住这个人",
+                ),
+                AiToolName::CalendarList => ("calendar", json!({ "keyword": "复盘" }), "查看日程"),
+                AiToolName::CalendarCreate => (
+                    "calendar",
+                    json!({ "title": "周五复盘", "start": "2026-11-06T15:00:00+08:00" }),
+                    "创建日程",
+                ),
+                AiToolName::CalendarDelete => ("calendar", json!({ "event_id": 1 }), "删除日程"),
+                AiToolName::WeatherGet => ("weather", json!({ "location": "成都" }), "查询天气"),
+                AiToolName::MusicSearch => ("music", json!({ "query": "晴天" }), "搜索曲库"),
+                _ => ("mail", json!({ "query": "报价单" }), "检索邮件"),
+            };
+            json!({
+                "id": index + 1,
+                "title": title,
+                "kind": "tool",
+                "capability": capability,
+                "tool": tool.as_str(),
+                "args": args,
+                "expect": "拿到结果"
+            })
+        })
+        .collect();
+    tool_call(
+        "plan",
+        AiToolName::PlanSubmit,
+        json!({
+            "motive": "先给出计划再执行",
+            "goal": "完成用户这一次的请求",
+            "steps": steps
+        }),
+    )
+}
+
 /// 读回落库的最后一条助手消息（断言「终止态」用）。
 fn last_assistant_message(store: &Store, conversation: AiConversationId) -> me_core::ai::AiMessage {
     let writable = store.writable();
@@ -205,6 +255,19 @@ fn start_service(
 ///
 /// `start_service` 会先 `with_ai_models`，而用例层看到内存里已有档案就直接返回，
 /// 于是 meta 里的脏数据永远不会被读到——测「解析失败」必须绕开那个注入。
+/// 建一个会话并等界面拿到通知——每个用例开头都是这三行。
+async fn new_conversation(
+    commands: &mpsc::UnboundedSender<Command>,
+    rx: &mut mpsc::Receiver<Event>,
+    store: &Store,
+) -> AiConversationId {
+    commands
+        .send(Command::CreateAiConversation { model: None })
+        .expect("send");
+    let _ = wait_for(rx, |event| matches!(event, Event::AiConversationsChanged)).await;
+    latest_conversation(store)
+}
+
 fn start_service_bare(store: &Store) -> (mpsc::UnboundedSender<Command>, mpsc::Receiver<Event>) {
     let (command_tx, command_rx) = mpsc::unbounded_channel::<Command>();
     let (event_tx, event_rx) = mpsc::channel::<Event>(1024);
@@ -356,7 +419,11 @@ async fn tool_round_writes_entity_and_feeds_result_back() {
         }),
         parse_ok: true,
     };
-    let provider = MockAiProvider::new(vec![Turn::with_tool(call), Turn::text("记住了。")]);
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::MemoryUpsert])),
+        Turn::with_tool(call),
+        Turn::text("记住了。"),
+    ]);
     let (commands, mut rx) = start_service(&store, provider.clone(), true);
 
     commands
@@ -418,10 +485,10 @@ async fn tool_round_writes_entity_and_feeds_result_back() {
     assert_eq!(entities[0].canonical_name, "张三");
     assert_eq!(entities[0].aliases, vec!["老张".to_string()]);
 
-    // 第二轮请求里必须能看到工具结果（消息数 > 1）。
+    // 三轮请求：提交计划 → 执行工具 → 收尾。工具结果必须回灌给模型。
     let counts = provider.message_counts.lock().unwrap().clone();
-    assert_eq!(counts.len(), 2, "工具循环应调用两次模型");
-    assert!(counts[1] > counts[0], "工具结果必须回灌给模型");
+    assert_eq!(counts.len(), 3, "工具循环应调用三次模型");
+    assert!(counts[2] > counts[1], "工具结果必须回灌给模型");
 
     let messages = store
         .writable()
@@ -596,7 +663,10 @@ async fn privacy_ack_is_required_before_any_request() {
 #[tokio::test]
 async fn disabled_tools_are_removed_from_the_request() {
     let (_dir, store) = open();
-    let provider = MockAiProvider::new(vec![Turn::text("好的")]);
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::text("好的"),
+    ]);
     let (commands, mut rx) = start_service(&store, provider.clone(), true);
 
     // 工具开关现在是模型档案的一部分，不是全局设置。
@@ -642,11 +712,12 @@ async fn disabled_tools_are_removed_from_the_request() {
     .await;
 
     let counts = provider.tool_counts.lock().unwrap().clone();
-    // 16 个工具里关掉「天气」（两个）与「创建日程」（一个）之后剩下的数量。
+    // 第一轮是 PLAN 阶段（只有 plan_submit / answer_directly）；
+    // 第二轮是执行阶段：16 个工具 - 天气两个 - 创建日程一个 - 两个计划工具 = 11。
     assert_eq!(
         counts,
-        vec![13],
-        "关掉天气（两个工具）与创建日程后只应剩十三个工具"
+        vec![2, 11],
+        "执行阶段应剩十一个业务工具，实际：{counts:?}"
     );
 }
 
@@ -819,7 +890,11 @@ async fn api_key_is_persisted_with_the_rest_of_the_profile() {
 #[tokio::test]
 async fn regenerate_offers_only_replay_safe_tools() {
     let (_dir, store) = open();
-    let provider = MockAiProvider::new(vec![Turn::text("第一次回答"), Turn::text("第二次回答")]);
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::text("第一次回答"),
+        Turn::text("第二次回答"),
+    ]);
     let (commands, mut rx) = start_service(&store, provider.clone(), true);
 
     commands
@@ -852,11 +927,12 @@ async fn regenerate_offers_only_replay_safe_tools() {
     .await;
 
     let names = provider.tool_names.lock().unwrap().clone();
-    assert_eq!(names.len(), 2, "发送一次 + 重新生成一次");
+    // 三轮请求：PLAN（2 个）→ 执行（全部）→ 重新生成（只剩可重放的）。
+    assert_eq!(names.len(), 3, "PLAN + 执行 + 重新生成：{names:?}");
+    let execute = &names[1];
     assert!(
-        names[0].iter().any(|name| name == "calendar_create"),
-        "正常发送要带全部工具：{:?}",
-        names[0]
+        execute.iter().any(|name| name == "calendar_create"),
+        "执行阶段要带全部工具：{execute:?}"
     );
     // 五个有副作用的工具都不可重放：重新生成不能动日历，也不能真的切歌。
     for write_tool in [
@@ -867,22 +943,21 @@ async fn regenerate_offers_only_replay_safe_tools() {
         "music_control",
     ] {
         assert!(
-            names[0].iter().any(|name| name == write_tool),
-            "正常发送要带 {write_tool}：{:?}",
-            names[0]
+            execute.iter().any(|name| name == write_tool),
+            "执行阶段要带 {write_tool}：{execute:?}"
         );
         assert!(
-            !names[1].iter().any(|name| name == write_tool),
+            !names[2].iter().any(|name| name == write_tool),
             "重新生成不得下发 {write_tool}：{:?}",
-            names[1]
+            names[2]
         );
     }
-    assert_eq!(
-        names[1].len(),
-        names[0].len() - 5,
-        "只少这五个有副作用的工具：{:?} vs {:?}",
-        names[0],
-        names[1]
+    assert!(
+        names[2]
+            .iter()
+            .all(|name| name == "plan_submit" || name == "answer_directly"),
+        "重新生成从 PLAN 阶段重来，只该给两个引擎工具：{:?}",
+        names[2]
     );
 }
 
@@ -904,6 +979,8 @@ async fn disabled_tool_is_refused_at_execution_time() {
         parse_ok: true,
     };
     let provider = MockAiProvider::new(vec![
+        // 计划里不能出现被关掉的工具，否则在计划期就被拒了——那测的就不是执行期拦截。
+        Turn::with_tool(plan_submit_for(&[AiToolName::CalendarList])),
         Turn::with_tool(call),
         Turn::text("这个工具被关掉了，没法创建。"),
     ]);
@@ -1040,6 +1117,7 @@ async fn email_search_accepts_time_window_without_keyword() {
         }),
     );
     let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
         Turn::with_tool(call),
         Turn::text("近 7 天没有新的邮件。"),
     ]);
@@ -1098,6 +1176,7 @@ async fn email_search_without_any_condition_lists_them_all() {
         }),
     );
     let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
         Turn::with_tool(call),
         Turn::text("没给检索条件，我不该硬查。"),
     ]);
@@ -1155,6 +1234,7 @@ async fn same_args_after_validation_error_is_not_retried() {
         )
     };
     let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
         Turn::with_tool(call("c1", "查重要邮件")),
         Turn::with_tool(call("c2", "查看重要邮件，未读优先")),
         Turn::with_tool(call("c3", "再查一次")),
@@ -1226,6 +1306,7 @@ async fn same_args_after_validation_error_is_not_retried() {
 async fn changed_args_are_not_blocked_by_the_circuit_breaker() {
     let (_dir, store) = open();
     let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
         // 第一次无条件 → 失败并被记入熔断表。
         Turn::with_tool(tool_call(
             "c1",
@@ -1295,6 +1376,7 @@ async fn changed_args_are_not_blocked_by_the_circuit_breaker() {
 async fn blank_answer_falls_back_to_execution_summary() {
     let (_dir, store) = open();
     let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
         Turn::with_tool(tool_call(
             "c1",
             AiToolName::EmailSearch,
@@ -1336,8 +1418,8 @@ async fn blank_answer_falls_back_to_execution_summary() {
         message.content
     );
     assert!(
-        message.content.contains("检索邮件"),
-        "兜底摘要要列出真正执行过的工具，实际：{}",
+        message.content.contains("检索近 7 天"),
+        "兜底摘要要列出清单里真正执行过的步骤，实际：{}",
         message.content
     );
     assert!(
@@ -1355,6 +1437,7 @@ async fn blank_answer_falls_back_to_execution_summary() {
 async fn normal_answer_is_not_replaced_by_fallback() {
     let (_dir, store) = open();
     let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
         Turn::with_tool(tool_call(
             "c1",
             AiToolName::EmailSearch,
@@ -1487,7 +1570,11 @@ async fn missing_motive_still_executes_once() {
         arguments: json!({ "query": "报价单" }),
         parse_ok: true,
     };
-    let provider = MockAiProvider::new(vec![Turn::with_tool(call), Turn::text("查了，没有结果。")]);
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(call),
+        Turn::text("查了，没有结果。"),
+    ]);
     let (commands, mut rx) = start_service(&store, provider, true);
 
     commands
@@ -1840,6 +1927,7 @@ async fn calendar_delete_requests_confirmation_instead_of_deleting() {
         parse_ok: true,
     };
     let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::CalendarDelete])),
         Turn::with_tool(call),
         Turn::text("已经请你确认删除，确认前这条还在。"),
     ]);
@@ -1886,5 +1974,294 @@ async fn calendar_delete_requests_confirmation_instead_of_deleting() {
     assert!(
         store.writable().get_event(event.id).expect("查").is_some(),
         "用户没确认之前，日程不能被删掉"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PLAN 阶段：强制清单
+// ---------------------------------------------------------------------------
+
+/// 首轮只下发两个工具：模型物理上没有 `email_search` 可调。
+#[tokio::test]
+async fn plan_phase_only_offers_the_two_planning_tools() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::text("查完了。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let names = provider.tool_names.lock().unwrap().clone();
+    assert_eq!(
+        names[0],
+        vec!["plan_submit".to_string(), "answer_directly".to_string()],
+        "首轮不能给模型任何业务工具：{:?}",
+        names[0]
+    );
+    assert!(
+        !names[1].iter().any(|name| name == "plan_submit"),
+        "执行阶段不能再下发 plan_submit，否则重列上限形同虚设：{:?}",
+        names[1]
+    );
+    assert!(
+        names[1].iter().any(|name| name == "email_search"),
+        "执行阶段要能查邮件：{:?}",
+        names[1]
+    );
+}
+
+/// 计划阶段凭历史记忆去调业务工具：拒绝执行，且**不消耗**工具预算。
+#[tokio::test]
+async fn business_tool_is_refused_during_the_plan_phase() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        // 第 1 轮就想直接查——旧行为正是这样，一分钟发了 8 次。
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "先查一下再说", "days": 7 }),
+        )),
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::text("查完了。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let refused = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiToolCompleted { .. })
+    })
+    .await;
+    let Event::AiToolCompleted { summary, .. } = refused else {
+        panic!("期望工具完成事件");
+    };
+    assert_eq!(summary, "计划阶段不能执行工具");
+
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let plan = message.plan.expect("最终应当有一份计划");
+    assert_eq!(plan.version, 2);
+    assert_eq!(plan.steps.len(), 1);
+}
+
+/// 模型两轮都不交计划：引擎合成单步清单收场，绝不留白。
+#[tokio::test]
+async fn model_that_never_submits_gets_a_synthetic_plan() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        // 空头承诺：引擎会追一句「请先提交计划」。
+        Turn::text("我先看看你的邮件。"),
+        // 还是不给计划：轮到引擎收场。
+        Turn::text("我看了一下，没找到重要邮件。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(
+        message.content.contains("没找到重要邮件"),
+        "模型的话要保留：{}",
+        message.content
+    );
+    assert!(
+        message
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("未提交计划")),
+        "要留下可排查的痕迹：{:?}",
+        message.error
+    );
+    let plan = message.plan.expect("引擎兜底要合成一份单步清单");
+    assert_eq!(plan.steps.len(), 1, "兜底清单只有一步");
+    assert_eq!(plan.steps[0].title, "直接回答");
+}
+
+/// 显式豁免：`answer_directly` 之后不再给工具，也不硬凑一份计划。
+#[tokio::test]
+async fn answer_directly_skips_the_plan() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(tool_call(
+            "a1",
+            AiToolName::AnswerDirectly,
+            json!({ "motive": "用户在问怎么设置签名", "reason": "纯知识问答，不需要查数据" }),
+        )),
+        Turn::text("在设置里改签名即可。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "怎么改签名".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let names = provider.tool_names.lock().unwrap().clone();
+    assert!(
+        names[1].is_empty(),
+        "豁免后不该再给任何工具：{:?}",
+        names[1]
+    );
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(message.plan.is_none(), "豁免不该凭空造一份清单");
+    assert!(message.content.contains("签名"));
+    assert!(message.error.is_none());
+}
+
+/// 工具调用要绑到清单里的步：状态与次数由引擎写，不靠模型自觉。
+#[tokio::test]
+async fn tool_calls_bind_to_plan_steps_and_record_attempts() {
+    let (_dir, store) = open();
+    let plan = tool_call(
+        "plan",
+        AiToolName::PlanSubmit,
+        json!({
+            "motive": "分两步查",
+            "goal": "找出值得优先处理的邮件",
+            "steps": [
+                {"id": 1, "title": "检索星标邮件", "kind": "tool", "capability": "mail",
+                 "tool": "email_search", "args": {"flagged_only": true}, "expect": "星标邮件列表"},
+                {"id": 2, "title": "检索近 7 天未读", "kind": "tool", "capability": "mail",
+                 "tool": "email_search", "args": {"unread_only": true, "days": 7},
+                 "expect": "未读邮件列表"}
+            ]
+        }),
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan),
+        // 显式指定第 2 步：引擎要把这一次的结果记到第 2 步上。
+        Turn::with_tool(tool_call(
+            "c2",
+            AiToolName::EmailSearch,
+            json!({ "motive": "执行第 2 步", "step_id": 2, "unread_only": true, "days": 7 }),
+        )),
+        Turn::text("近 7 天有 2 封未读。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let plan = message.plan.expect("有清单");
+    assert_eq!(plan.steps[1].status, me_core::ai_plan::PlanStatus::Done);
+    assert_eq!(plan.steps[1].attempts, 1, "一次执行记一次尝试");
+    assert!(plan.steps[1].evidence.is_some(), "执行回执由引擎写");
+    assert_eq!(
+        plan.steps[0].status,
+        me_core::ai_plan::PlanStatus::Pending,
+        "没被执行的步保持待执行，不能替它圆"
+    );
+
+    let trace = message
+        .tool_trace
+        .iter()
+        .find(|trace| trace.call_id == "c2")
+        .expect("第 2 步的 trace");
+    assert_eq!(trace.step_id, Some(2));
+    assert_eq!(trace.attempt, Some(1));
+}
+
+/// 计划期就把「参数不对」拦下来，并说清缺什么。
+#[tokio::test]
+async fn invalid_plan_is_rejected_at_plan_time() {
+    let (_dir, store) = open();
+    let bad = tool_call(
+        "bad",
+        AiToolName::PlanSubmit,
+        json!({
+            "motive": "先给计划",
+            "goal": "查重要邮件",
+            "steps": [{
+                "id": 1, "title": "检索邮件", "kind": "tool", "capability": "mail",
+                "tool": "email_search",
+                // 只给 limit：旧实现在执行期才报「至少需要一个检索条件」，
+                // 模型看不出缺什么，于是原样重发 6 次。
+                "args": { "limit": 5 },
+                "expect": "列出邮件"
+            }]
+        }),
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(bad),
+        // 改对之后再交一次。
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::text("查完了。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let plan = message.plan.expect("改对之后应当有清单");
+    assert_eq!(
+        plan.steps[0].args,
+        Some(json!({ "days": 7 })),
+        "落库的是**改对之后**的那一份"
     );
 }

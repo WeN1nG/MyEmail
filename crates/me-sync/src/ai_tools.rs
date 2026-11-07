@@ -125,6 +125,122 @@ fn call_step_id(call: &AiToolCall) -> Option<u8> {
         .filter(|value| *value >= 1)
 }
 
+/// PLAN 阶段调了业务工具：不执行，告诉它现在该做什么。
+///
+/// 这是一个**防御层**：PLAN 阶段的请求里根本没下发这些工具，正常模型不会调。
+/// 真调了说明它在凭历史记忆行动，这时候报「参数不对」毫无意义。
+pub(crate) fn phase_rejected_result(
+    call: &AiToolCall,
+    motive: Option<String>,
+    motive_source: MotiveSource,
+) -> AiToolResult {
+    AiToolResult {
+        call_id: call.id.clone(),
+        tool: call.name,
+        content: "现在还在**制定计划**阶段，不能执行工具。请先调用 plan_submit 把要做的事\
+写成 1–8 步（每步写清 tool / args / expect），我会在计划阶段就帮你校验参数；\
+若确实不需要任何工具，请调用 answer_directly 并说明理由。"
+            .to_string(),
+        is_error: true,
+        trace: AiToolTrace {
+            call_id: call.id.clone(),
+            tool: call.name,
+            status: AiToolStatus::Error,
+            summary: "计划阶段不能执行工具".to_string(),
+            duration_ms: 0,
+            motive,
+            motive_source,
+            step_id: None,
+            attempt: None,
+        },
+    }
+}
+
+/// 把一次工具调用绑定到清单里的某一步。
+///
+/// 降级顺序（**绑定失败不拒绝执行**——从 D1 学到的：报错换不来它改对）：
+/// 1. 参数里的 `step_id`，且该步确实是这一步工具；
+/// 2. `motive` 里写的「第 N 步」；
+/// 3. 第一个「同一个工具、还没结束」的步；
+/// 4. 第一个「还没结束」的工具步。
+pub(crate) fn bind_step(plan: &Plan, call: &AiToolCall, motive: &Option<String>) -> Option<u8> {
+    let usable = |id: u8| {
+        plan.step(id)
+            .filter(|step| step.is_tool_step() && !step.status.is_terminal())
+            .filter(|step| step.tool == Some(call.name))
+            .map(|step| step.id)
+    };
+
+    if let Some(id) = call_step_id(call).and_then(usable) {
+        return Some(id);
+    }
+    if let Some(text) = motive.as_deref()
+        && let Some(id) = step_id_from_text(text).and_then(usable)
+    {
+        return Some(id);
+    }
+    plan.steps
+        .iter()
+        .filter(|step| step.is_tool_step() && !step.status.is_terminal())
+        .find(|step| step.tool == Some(call.name))
+        .or_else(|| {
+            plan.steps
+                .iter()
+                .find(|step| step.is_tool_step() && !step.status.is_terminal())
+        })
+        .map(|step| step.id)
+}
+
+/// 从「执行第 2 步」这类文本里取出 `2`。
+fn step_id_from_text(text: &str) -> Option<u8> {
+    let start = text.find('第')? + '第'.len_utf8();
+    let rest = &text[start..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    if !rest[digits.len()..].starts_with('步') {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// 工具错误归类。
+///
+/// 引擎这里只有一句 `summary`（`CoreError` 已经在 `execute_ai_tool` 里被转成
+/// 工具结果了），所以靠文案判定。分错类的代价可控：`InvalidArgs` 与 `Transient`
+/// 都只是标在步上给人看，真正的刹车是靠指纹熔断（那一步与文案无关）。
+pub(crate) fn classify_failure(summary: &str) -> me_core::ai_plan::StepFailure {
+    use me_core::ai_plan::StepFailure;
+    if summary.contains("已关闭") || summary.contains("没有开启") {
+        StepFailure::Denied {
+            tool: summary.to_string(),
+        }
+    } else if summary.contains("参数")
+        || summary.contains("至少需要")
+        || summary.contains("只能")
+        || summary.contains("缺少")
+    {
+        StepFailure::InvalidArgs {
+            detail: summary.to_string(),
+        }
+    } else {
+        StepFailure::Transient {
+            detail: summary.to_string(),
+        }
+    }
+}
+
+/// 这次结果是不是「成功但空」。
+///
+/// 「未找到」不是成功也不是失败，是**计划需要修正**的信号：要按 `on_empty`
+/// 处理，不能标成 done 让后面的步拿着空结果继续跑。
+pub(crate) fn is_empty_result(summary: &str) -> bool {
+    ["未找到", "没有找到", "0 命中", "没有匹配", "暂无"]
+        .iter()
+        .any(|hint| summary.contains(hint))
+}
+
 const CALENDAR_LIMIT: u32 = 5;
 const CALENDAR_READ_LIMIT: u32 = 5;
 const MEMORY_LIMIT: u32 = 5;
