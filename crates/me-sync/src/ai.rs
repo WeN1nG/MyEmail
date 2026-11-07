@@ -11,6 +11,7 @@
 //! 3. 工具调用与最终回复**不是同一事务**：日历/记忆写入立即提交，回复失败也不回滚。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -162,11 +163,14 @@ impl AiState {
     }
 }
 
-/// 流式文本的节流器：`pending` 是待发送增量，`total` 是完整回复。
+/// 流式文本的节流器：`pending` 是待发送增量，`total` 是完整回复（落库用）。
+///
+/// **不持有 seq**：一个回复可能有两条通道（思考 / 回答），每条一个实例，
+/// 各自从 0 计数会撞号，UI 的「有没有整段丢掉」判断就失效了。
+/// 序号由 sink 外层的共享计数器统一分配。
 struct DeltaThrottle {
     pending: String,
     total: String,
-    seq: u64,
     last: Instant,
 }
 
@@ -175,14 +179,13 @@ impl DeltaThrottle {
         Self {
             pending: String::new(),
             total: String::new(),
-            seq: 0,
             // 初始就允许立即发送，避免首字延迟 50ms。
             last: Instant::now() - DELTA_INTERVAL,
         }
     }
 
-    /// 返回应当发出的事件载荷（首次/满 50ms/满 2KB）。
-    fn push(&mut self, text: &str) -> Option<(u64, String)> {
+    /// 返回应当发出的文本（首次 / 满 50ms / 满 2KB）。
+    fn push(&mut self, text: &str) -> Option<String> {
         self.total.push_str(text);
         self.pending.push_str(text);
         if self.last.elapsed() >= DELTA_INTERVAL || self.pending.len() >= DELTA_BATCH_BYTES {
@@ -191,10 +194,94 @@ impl DeltaThrottle {
         None
     }
 
-    fn take(&mut self) -> (u64, String) {
-        self.seq = self.seq.saturating_add(1);
+    /// 无条件取走待发送内容（收尾时用；空也返回空串）。
+    fn take(&mut self) -> String {
         self.last = Instant::now();
-        (self.seq, std::mem::take(&mut self.pending))
+        std::mem::take(&mut self.pending)
+    }
+
+    /// 有残余才取走，**没有就不动时钟**。
+    ///
+    /// 切思考段时必须先调它：否则上一段攒在节流窗口里的尾巴会顶着新段号
+    /// 到达 UI，被塞进错误的段里。这个问题只在节流窗口恰好跨越段边界时
+    /// 出现，极难复现，所以由测试固定住顺序。
+    fn flush(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(self.take())
+        }
+    }
+}
+
+/// 一轮回复里思考内容的累积与分段。
+///
+/// 模型是「想一段 → 调工具 → 再看结果想一段」交错的，所以段边界就是
+/// **工具调用轮次**。段号从 1 开始，与 `AiStreamDelta.segment` 同源。
+struct ThinkingAccumulator {
+    segments: Vec<me_core::ai::ThinkingSegment>,
+    current: String,
+    segment_no: u8,
+    total_chars: usize,
+    truncated: bool,
+}
+
+impl ThinkingAccumulator {
+    fn new() -> Self {
+        Self {
+            segments: Vec::new(),
+            current: String::new(),
+            segment_no: 1,
+            total_chars: 0,
+            truncated: false,
+        }
+    }
+
+    /// 返回**实际保留**的文本（超限时会被截短，后续增量直接丢弃）。
+    fn push(&mut self, text: &str) -> String {
+        if self.truncated || text.is_empty() {
+            return String::new();
+        }
+        if self.segments.len() >= me_core::ai::MAX_THINKING_SEGMENTS {
+            self.truncated = true;
+            return String::new();
+        }
+        let room = me_core::ai::MAX_THINKING_CHARS.saturating_sub(self.total_chars);
+        let kept: String = text.chars().take(room).collect();
+        let kept_len = kept.chars().count();
+        if kept_len < text.chars().count() {
+            self.truncated = true;
+        }
+        self.total_chars += kept_len;
+        self.current.push_str(&kept);
+        kept
+    }
+
+    /// 收当前段。**必须在 `next_segment` 之前调用**，否则段号对不上。
+    fn cut(&mut self, followed_by_tool: bool) {
+        if self.current.is_empty() {
+            return;
+        }
+        self.segments.push(me_core::ai::ThinkingSegment {
+            index: self.segment_no,
+            text: std::mem::take(&mut self.current),
+            followed_by_tool,
+        });
+    }
+
+    fn next_segment(&mut self) {
+        self.segment_no = self.segment_no.saturating_add(1);
+    }
+
+    fn finish(mut self) -> Option<me_core::ai::ThinkingBlock> {
+        self.cut(false);
+        if self.segments.is_empty() && !self.truncated {
+            return None;
+        }
+        Some(me_core::ai::ThinkingBlock {
+            segments: self.segments,
+            truncated: self.truncated,
+        })
     }
 }
 
@@ -1164,27 +1251,63 @@ where
             None => None,
         };
 
-        let throttle = Arc::new(Mutex::new(DeltaThrottle::new()));
+        let answer_throttle = Arc::new(Mutex::new(DeltaThrottle::new()));
+        let thinking_throttle = Arc::new(Mutex::new(DeltaThrottle::new()));
+        let thinking = Arc::new(Mutex::new(ThinkingAccumulator::new()));
+        // 思考与回答共用一条全序：两个事件通道会让「先思考后回答」的顺序在
+        // 通道层面丢失，两套 seq 也会让 UI 的缺口检测失效。
+        let seq_counter = Arc::new(AtomicU64::new(0));
         let usage: Arc<Mutex<(Option<u32>, Option<u32>)>> = Arc::new(Mutex::new((None, None)));
         let cancel = me_core::ai::CancelFlag::new();
 
         let sink: AiDeltaSink = {
             let events = self.inner.events.clone();
-            let throttle = Arc::clone(&throttle);
+            let answer_throttle = Arc::clone(&answer_throttle);
+            let thinking_throttle = Arc::clone(&thinking_throttle);
+            let thinking = Arc::clone(&thinking);
             let usage = Arc::clone(&usage);
+            let next_seq = {
+                let counter = Arc::clone(&seq_counter);
+                move || counter.fetch_add(1, Ordering::Relaxed) + 1
+            };
             Arc::new(move |delta: AiDelta| match delta {
                 AiDelta::Text(text) => {
-                    let Ok(mut state) = throttle.lock() else {
+                    let Ok(mut state) = answer_throttle.lock() else {
                         return;
                     };
-                    if let Some((seq, chunk)) = state.push(&text) {
+                    if let Some(chunk) = state.push(&text) {
                         events.send_progress(Event::AiStreamDelta {
                             conversation,
                             message,
-                            seq,
+                            seq: next_seq(),
                             delta: chunk,
                             kind: me_core::command::AiDeltaKind::Answer,
                             segment: 0,
+                        });
+                    }
+                }
+                AiDelta::Thinking(text) => {
+                    // 先累积（可能按上限截断），再节流。思考不走 answer_throttle，
+                    // 否则回答的首字会被思考攒着的那批一起拖到下一节流窗口。
+                    let kept = match thinking.lock() {
+                        Ok(mut acc) => acc.push(&text),
+                        Err(_) => return,
+                    };
+                    if kept.is_empty() {
+                        return;
+                    }
+                    let segment = thinking.lock().map(|acc| acc.segment_no).unwrap_or(1);
+                    let Ok(mut state) = thinking_throttle.lock() else {
+                        return;
+                    };
+                    if let Some(chunk) = state.push(&kept) {
+                        events.send_progress(Event::AiStreamDelta {
+                            conversation,
+                            message,
+                            seq: next_seq(),
+                            delta: chunk,
+                            kind: me_core::command::AiDeltaKind::Thinking,
+                            segment,
                         });
                     }
                 }
@@ -1198,8 +1321,6 @@ where
                         }
                     }
                 }
-                // 批次 2 之前先忽略：协议层暂不产出 Thinking。
-                AiDelta::Thinking(_) => {}
             })
         };
 
@@ -1539,6 +1660,33 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 break;
             }
 
+            // 模型这一段想完了，接下来要调工具：**收段 + 换段号**。
+            //
+            // 顺序不能反：先把节流窗口里的残余顶着**旧段号**发出去，
+            // 再 cut，最后自增。否则残余会跟在新段号后面到达 UI，被塞进
+            // 错误的段里（只在节流窗口恰跨边界时偶发，极难复现）。
+            if let Some(tail) = thinking_throttle
+                .lock()
+                .ok()
+                .and_then(|mut state| state.flush())
+                && !tail.is_empty()
+            {
+                let segment = thinking.lock().map(|acc| acc.segment_no).unwrap_or(1);
+                self.emit(Event::AiStreamDelta {
+                    conversation,
+                    message,
+                    seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
+                    delta: tail,
+                    kind: me_core::command::AiDeltaKind::Thinking,
+                    segment,
+                })
+                .await;
+            }
+            if let Ok(mut acc) = thinking.lock() {
+                acc.cut(true);
+                acc.next_segment();
+            }
+
             let mut results: Vec<AiToolResult> = Vec::new();
             for call in &turn.tool_calls {
                 // 动机在**执行前**就要发出去：界面靠它解释「为什么现在调这个工具」。
@@ -1567,8 +1715,8 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         duration_ms: result.trace.duration_ms,
                         motive: result.trace.motive.clone(),
                         motive_source: result.trace.motive_source,
-                        step_id: None,
-                        attempt: None,
+                        step_id: result.trace.step_id,
+                        attempt: result.trace.attempt,
                     })
                     .await;
                     traces.push(result.trace.clone());
@@ -1605,8 +1753,8 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         duration_ms: result.trace.duration_ms,
                         motive: result.trace.motive.clone(),
                         motive_source: result.trace.motive_source,
-                        step_id: None,
-                        attempt: None,
+                        step_id: result.trace.step_id,
+                        attempt: result.trace.attempt,
                     })
                     .await;
                     traces.push(result.trace.clone());
@@ -1794,6 +1942,13 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     })
                     .await;
                 }
+                // 先把绑定信息算好，事件与落库用的是同一份，不会前后不一致。
+                let mut trace = result.trace.clone();
+                trace.step_id = trace.step_id.or(bound);
+                trace.attempt = trace
+                    .step_id
+                    .and_then(|id| plan.as_ref().and_then(|current| current.step(id)))
+                    .map(|step| step.attempts);
                 if visible {
                     self.emit(Event::AiToolCompleted {
                         conversation,
@@ -1805,17 +1960,11 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         // 用 trace 里的同一份，保证同一条活动条前后不跳变。
                         motive: result.trace.motive.clone(),
                         motive_source: result.trace.motive_source,
-                        step_id: None,
-                        attempt: None,
+                        step_id: trace.step_id,
+                        attempt: trace.attempt,
                     })
                     .await;
                 }
-                let mut trace = result.trace.clone();
-                trace.step_id = trace.step_id.or(bound);
-                trace.attempt = trace
-                    .step_id
-                    .and_then(|id| plan.as_ref().and_then(|current| current.step(id)))
-                    .map(|step| step.attempts);
                 // 每一步的尝试都发一次事件：清单条靠它显示「第 2/3 次」角标。
                 // 这条事件是**可丢**的（丢一次只是少一个角标）。
                 if let Some(id) = bound
@@ -2027,25 +2176,47 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
             }
         }
 
-        // 收尾：把最后一段未满 50ms 的增量发出去。
-        let (mut content, seq_tail) = {
-            let Ok(mut state) = throttle.lock() else {
+        // 收尾：两条通道各自把未满 50ms 的残余发出去，正文同时作为落库内容。
+        let (mut content, answer_tail) = {
+            let Ok(mut state) = answer_throttle.lock() else {
                 return;
             };
-            let tail = state.take();
+            let tail = state.flush().unwrap_or_default();
             (state.total.clone(), tail)
         };
-        if !seq_tail.1.is_empty() {
+        if !answer_tail.is_empty() {
             self.emit(Event::AiStreamDelta {
                 conversation,
                 message,
-                seq: seq_tail.0,
-                delta: seq_tail.1,
+                seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
+                delta: answer_tail,
                 kind: me_core::command::AiDeltaKind::Answer,
                 segment: 0,
             })
             .await;
         }
+        if let Some(tail) = thinking_throttle
+            .lock()
+            .ok()
+            .and_then(|mut state| state.flush())
+            && !tail.is_empty()
+        {
+            let segment = thinking.lock().map(|acc| acc.segment_no).unwrap_or(1);
+            self.emit(Event::AiStreamDelta {
+                conversation,
+                message,
+                seq: seq_counter.fetch_add(1, Ordering::Relaxed) + 1,
+                delta: tail,
+                kind: me_core::command::AiDeltaKind::Thinking,
+                segment,
+            })
+            .await;
+        }
+        // 收最后一段（没有后续工具），并生成要落库的思考块。
+        let thinking_for_db = match thinking.lock() {
+            Ok(mut acc) => std::mem::replace(&mut *acc, ThinkingAccumulator::new()).finish(),
+            Err(_) => None,
+        };
 
         // 兜底：整轮调用过工具却没有任何正文 → 用执行回执拼一段，绝不留白。
         //
@@ -2102,7 +2273,7 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     Some(usage),
                     &traces,
                     plan_for_db.as_ref(),
-                    None,
+                    thinking_for_db.as_ref(),
                     error_for_db.as_deref(),
                 )
             })
@@ -2401,4 +2572,67 @@ fn finalize_plan(
         }
     }
     plan
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    /// flush 在没有残余时返回 None **并且不动时钟**：否则空 flush 会把
+    /// 下一批增量硬生生再压 50ms，切段之后的首字会明显卡一下。
+    #[test]
+    fn flush_returns_none_when_empty() {
+        let mut t = DeltaThrottle::new();
+        assert_eq!(t.flush(), None);
+        // 立刻 push 仍应因为「初始允许立刻发送」而直接产出。
+        assert_eq!(t.push("首字"), Some("首字".to_string()));
+        assert_eq!(t.flush(), None);
+    }
+
+    /// 切段前 flush 必须取走攒着的残余，否则它会顶着新段号到达 UI。
+    #[test]
+    fn flush_drains_pending_before_segment_switch() {
+        let mut t = DeltaThrottle::new();
+        assert_eq!(t.push("第一段"), Some("第一段".to_string()));
+        // 上一次 take 刚刷新时钟，这一片会攒在窗口里。
+        assert_eq!(t.push("尾巴"), None);
+        assert_eq!(t.flush(), Some("尾巴".to_string()));
+        assert_eq!(t.flush(), None, "取过一次之后不能再取到");
+        assert_eq!(t.total, "第一段尾巴");
+    }
+
+    /// 超长思考被截断，后续增量直接丢弃，并带上 truncated 标记。
+    #[test]
+    fn thinking_accumulator_truncates_at_limit() {
+        let mut acc = ThinkingAccumulator::new();
+        let long = "想".repeat(me_core::ai::MAX_THINKING_CHARS + 100);
+        let kept = acc.push(&long);
+        assert_eq!(kept.chars().count(), me_core::ai::MAX_THINKING_CHARS);
+        assert!(acc.truncated);
+        assert!(acc.push("再来一段").is_empty(), "截断后不该继续累积");
+        let block = acc.finish().expect("截断也要留下标记");
+        assert!(block.truncated);
+        assert_eq!(block.segments.len(), 1);
+    }
+
+    /// 段数超上限时同样置 truncated，而不是无限加段。
+    #[test]
+    fn thinking_accumulator_caps_segment_count() {
+        let mut acc = ThinkingAccumulator::new();
+        for i in 0..me_core::ai::MAX_THINKING_SEGMENTS {
+            acc.push(&format!("第 {i} 段"));
+            acc.cut(true);
+            acc.next_segment();
+        }
+        assert!(acc.push("第 17 段").is_empty());
+        let block = acc.finish().expect("有内容");
+        assert_eq!(block.segments.len(), me_core::ai::MAX_THINKING_SEGMENTS);
+        assert!(block.truncated);
+    }
+
+    /// 没有任何思考时 finish 返回 None（界面不画这一块）。
+    #[test]
+    fn thinking_accumulator_returns_none_when_empty() {
+        assert!(ThinkingAccumulator::new().finish().is_none());
+    }
 }

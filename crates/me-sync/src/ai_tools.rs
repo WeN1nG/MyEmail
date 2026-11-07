@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use me_core::ai::{
@@ -474,6 +475,10 @@ where
         // 意味着一枚新的 tool_use，白白吃掉 1/8 的调用预算，还会在 trace 里留下
         // 「一错一对」两条记录。它是给人看的说明，不是安全边界。
         let (motive, motive_source) = tool_motive(&call.arguments);
+        // 检索类工具会把命中卡片写进这里，随后挂到 trace 上一起落库。
+        // 用 per-call 的槽位而不是返回值：只有 email_search 产卡片，
+        // 为它改所有工具的返回契约不值得。
+        let cards_out: Arc<Mutex<Vec<me_core::MailCardRef>>> = Arc::new(Mutex::new(Vec::new()));
         let outcome = if !budget.permissions.enabled(call.name) {
             // 本轮没下发这个工具，模型却调用了它：不执行，让它自己向用户解释。
             Err(CoreError::validation(format!(
@@ -486,7 +491,7 @@ where
                     with_timeout(
                         EMAIL_SEARCH_TIMEOUT,
                         "邮件检索",
-                        self.tool_email_search(conversation, call),
+                        self.tool_email_search(conversation, call, &cards_out),
                     )
                     .await
                 }
@@ -664,7 +669,10 @@ where
                     motive_source,
                     step_id: call_step_id(call),
                     attempt: None,
-                    cards: Vec::new(),
+                    cards: cards_out
+                        .lock()
+                        .map(|mut slot| std::mem::take(&mut *slot))
+                        .unwrap_or_default(),
                 },
             },
             Err(err) => {
@@ -705,6 +713,7 @@ where
         &self,
         conversation: me_core::ai::AiConversationId,
         call: &AiToolCall,
+        cards_out: &Arc<Mutex<Vec<me_core::MailCardRef>>>,
     ) -> Result<(String, String), CoreError> {
         if !call.parse_ok {
             return Err(CoreError::validation("参数不是合法 JSON"));
@@ -718,7 +727,7 @@ where
         let criteria = me_core::ai_plan::parse_criteria(args)?;
         if !criteria.is_empty() {
             return self
-                .email_search_by_criteria(conversation, call, &criteria)
+                .email_search_by_criteria(conversation, call, &criteria, cards_out)
                 .await;
         }
 
@@ -731,24 +740,29 @@ where
         let messages = outcome.messages;
         let folder_names = self.folder_names().await;
 
+        let cards: Vec<me_core::MailCardRef> = messages
+            .iter()
+            .map(|message| me_core::MailCardRef {
+                message: message.id,
+                reason: card_reason(
+                    message,
+                    reason_subject.as_deref(),
+                    reason_from.as_deref(),
+                    reason_text.as_deref(),
+                ),
+            })
+            .collect();
         self.emit(Event::AiToolEmailResults {
             conversation,
             call_id: call.id.clone(),
-            cards: messages
-                .iter()
-                .map(|message| me_core::MailCardRef {
-                    message: message.id,
-                    reason: card_reason(
-                        message,
-                        reason_subject.as_deref(),
-                        reason_from.as_deref(),
-                        reason_text.as_deref(),
-                    ),
-                })
-                .collect(),
+            cards: cards.clone(),
             total: outcome.total,
         })
         .await;
+        // 随 trace 落库：历史回看时这些卡片要重新显示出来。
+        if let Ok(mut slot) = cards_out.lock() {
+            *slot = cards;
+        }
 
         if messages.is_empty() {
             return Ok((
@@ -794,6 +808,7 @@ where
         conversation: me_core::ai::AiConversationId,
         call: &AiToolCall,
         criteria: &[me_core::ai_plan::Criterion],
+        cards_out: &Arc<Mutex<Vec<me_core::MailCardRef>>>,
     ) -> Result<(String, String), CoreError> {
         let limit = arg_u32(&call.arguments, "limit").unwrap_or(5).clamp(1, 20) as usize;
         let folder_names = self.folder_names().await;
@@ -847,10 +862,13 @@ where
         self.emit(Event::AiToolEmailResults {
             conversation,
             call_id: call.id.clone(),
-            cards,
+            cards: cards.clone(),
             total,
         })
         .await;
+        if let Ok(mut slot) = cards_out.lock() {
+            *slot = cards;
+        }
 
         if picked.is_empty() {
             let detail: Vec<String> = per_criterion

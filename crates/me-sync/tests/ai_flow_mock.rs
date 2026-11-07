@@ -23,6 +23,8 @@ use tokio::sync::mpsc;
 /// 一轮模型调用的脚本。
 struct Turn {
     text: String,
+    /// 这一轮产出的思考内容（通过 sink 发 `AiDelta::Thinking`）。
+    thinking: String,
     tool_calls: Vec<AiToolCall>,
     error: Option<AiErrorKind>,
     /// 返回前等待取消标志（模拟长时间输出）。
@@ -33,6 +35,7 @@ impl Turn {
     fn text(text: &str) -> Self {
         Self {
             text: text.to_string(),
+            thinking: String::new(),
             tool_calls: Vec::new(),
             error: None,
             hold: false,
@@ -42,10 +45,17 @@ impl Turn {
     fn with_tool(call: AiToolCall) -> Self {
         Self {
             text: String::new(),
+            thinking: String::new(),
             tool_calls: vec![call],
             error: None,
             hold: false,
         }
+    }
+
+    /// 给这一轮加上思考内容。用于验证分段、双通道 seq 与落库。
+    fn thinking(mut self, text: &str) -> Self {
+        self.thinking = text.to_string();
+        self
     }
 }
 
@@ -213,6 +223,9 @@ impl AiProvider for MockAiProvider {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 return Err(CoreError::cancelled());
+            }
+            if !turn.thinking.is_empty() {
+                sink(AiDelta::Thinking(turn.thinking.clone()));
             }
             // 按两段吐字，验证增量拼接。
             let mut chars = turn.text.chars();
@@ -595,6 +608,7 @@ async fn cancelling_keeps_partial_content_and_marks_cancelled() {
     let provider = MockAiProvider::new(vec![Turn {
         text: "这段不会出现".to_string(),
         tool_calls: Vec::new(),
+        thinking: String::new(),
         error: None,
         hold: true,
     }]);
@@ -655,6 +669,7 @@ async fn auth_error_is_reported_not_retryable() {
     let provider = MockAiProvider::new(vec![Turn {
         text: String::new(),
         tool_calls: Vec::new(),
+        thinking: String::new(),
         error: Some(AiErrorKind::Auth),
         hold: false,
     }]);
@@ -3071,5 +3086,200 @@ async fn unfinished_plan_carries_over_to_the_next_turn() {
             .iter()
             .any(|body| body.contains("还没做完的清单") && body.contains("读第一封正文")),
         "第二轮要告诉模型上一轮还剩什么：{rounds:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 思考双通道：分段、全序 seq、落库
+// ---------------------------------------------------------------------------
+
+/// 收集一轮回复里的全部流式增量，直到终止事件。
+async fn collect_deltas(
+    rx: &mut mpsc::Receiver<Event>,
+) -> Vec<(u64, me_core::command::AiDeltaKind, u8, String)> {
+    let mut out = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            Ok(Some(Event::AiStreamDelta {
+                seq,
+                kind,
+                segment,
+                delta,
+                ..
+            })) => out.push((seq, kind, segment, delta)),
+            Ok(Some(Event::AiMessageCompleted { .. })) => return out,
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("事件通道关闭"),
+            Err(_) => panic!("等待流式增量超时"),
+        }
+    }
+}
+
+/// 三段思考（每次工具调用切一段）要正确落库，且思考不能混进正文。
+#[tokio::test]
+async fn thinking_is_segmented_per_tool_round_and_persisted() {
+    use me_core::command::AiDeltaKind;
+
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])).thinking("先想清楚要查什么"),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查最近的邮件", "days": 7 }),
+        ))
+        .thinking("结果回来了，看看有没有命中"),
+        Turn::text("近 7 天没有新的邮件。").thinking("可以收尾了"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "最近有什么邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let deltas = collect_deltas(&mut rx).await;
+
+    // 1) 两条通道都真的发了增量，且思考有三段。
+    let thinking: Vec<_> = deltas
+        .iter()
+        .filter(|(_, kind, _, _)| *kind == AiDeltaKind::Thinking)
+        .collect();
+    assert!(!thinking.is_empty(), "思考增量不能丢：{deltas:?}");
+    assert!(
+        deltas
+            .iter()
+            .any(|(_, kind, _, _)| *kind == AiDeltaKind::Answer),
+        "回答增量也要在：{deltas:?}"
+    );
+    let segments: Vec<u8> = thinking.iter().map(|(_, _, seg, _)| *seg).collect();
+    assert!(
+        segments.windows(2).all(|pair| pair[0] <= pair[1]),
+        "段号不能回退：{segments:?}"
+    );
+
+    // 2) seq 全局单调：拆两个 throttle 最容易在这里撞号。
+    let seqs: Vec<u64> = deltas.iter().map(|(seq, ..)| *seq).collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "思考与回答必须共用一条全序，不能各从 0 开始：{seqs:?}"
+    );
+
+    // 3) 落库：三段、段序、跟随工具标记、正文不含思考。
+    let message = last_assistant_message(&store, conversation);
+    let block = message.thinking.expect("思考要落库");
+    assert_eq!(block.segments.len(), 3, "每轮工具调用切一段：{block:?}");
+    assert_eq!(
+        block.segments.iter().map(|s| s.index).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(block.segments[0].text, "先想清楚要查什么");
+    assert!(block.segments[0].followed_by_tool);
+    assert!(!block.segments[2].followed_by_tool);
+    assert!(!block.truncated);
+    assert!(
+        !message.content.contains("先想清楚"),
+        "思考不能混进正文：{}",
+        message.content
+    );
+}
+
+/// 没有工具调用的轮次，思考也要收成最后一段落库（不能整段丢掉）。
+#[tokio::test]
+async fn thinking_without_tools_still_persists_as_one_segment() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(tool_call(
+            "direct",
+            AiToolName::AnswerDirectly,
+            json!({ "reason": "纯闲聊", "content": "你好" }),
+        ))
+        .thinking("这不需要工具"),
+        Turn::text("你好！").thinking("直接回答就好"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "你好".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = collect_deltas(&mut rx).await;
+
+    let message = last_assistant_message(&store, conversation);
+    let block = message.thinking.expect("思考要落库");
+    assert!(!block.segments.is_empty(), "至少要有一段：{block:?}");
+    assert!(
+        block
+            .segments
+            .iter()
+            .any(|s| s.text.contains("这不需要工具")),
+        "第一轮的思考不能被切段逻辑丢掉：{block:?}"
+    );
+}
+
+/// 检索卡片要随 trace 落库：历史回看时它们才能重新显示出来。
+#[tokio::test]
+async fn email_cards_ride_along_with_the_persisted_trace() {
+    let (_dir, store) = open();
+    let now = me_core::now_unix();
+    let ids = seed_mail(
+        &store,
+        &[
+            ("标记那封", "a@example.com", now - 3600, 0b100),
+            ("未读那封", "b@example.com", now - 7200, 0b000),
+            ("无关那封", "c@example.com", now - 10800, 0b001),
+        ],
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({
+                "motive": "按两条判据查",
+                "criteria": [
+                    {"label": "标记过的", "flagged_only": true},
+                    {"label": "未读的", "unread_only": true}
+                ]
+            }),
+        )),
+        Turn::text("找到两封。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "帮我找出值得优先看的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let trace = message
+        .tool_trace
+        .iter()
+        .find(|trace| trace.tool == AiToolName::EmailSearch)
+        .expect("要有 email_search 的 trace");
+    assert_eq!(trace.cards.len(), 2, "卡片要落库：{trace:?}");
+    let ids_in_cards: Vec<_> = trace.cards.iter().map(|card| card.message).collect();
+    assert!(ids_in_cards.contains(&ids[0]));
+    assert!(ids_in_cards.contains(&ids[1]));
+    assert!(!ids_in_cards.contains(&ids[2]));
+    assert!(
+        trace.cards.iter().any(|card| card.reason == "标记过的"),
+        "命中理由也要带上：{trace:?}"
     );
 }
