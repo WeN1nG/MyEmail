@@ -137,6 +137,7 @@ fn messages_keep_chronological_order_and_round_trip_json() {
         motive_source: MotiveSource::Model,
         step_id: None,
         attempt: None,
+        cards: Vec::new(),
     };
     writable
         .finish_assistant_message(
@@ -145,6 +146,7 @@ fn messages_keep_chronological_order_and_round_trip_json() {
             AiMessageStatus::Complete,
             Some((Some(120), Some(40))),
             std::slice::from_ref(&trace),
+            None,
             None,
             None,
         )
@@ -207,7 +209,16 @@ fn oversized_reply_is_truncated_and_marked_failed() {
         .expect("begin");
     let huge = "字".repeat(MAX_MESSAGE_CHARS + 100);
     writable
-        .finish_assistant_message(id, &huge, AiMessageStatus::Complete, None, &[], None, None)
+        .finish_assistant_message(
+            id,
+            &huge,
+            AiMessageStatus::Complete,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
         .expect("finish");
 
     let message = store
@@ -240,6 +251,7 @@ fn unknown_tool_names_in_trace_are_dropped_not_fatal() {
         motive_source: MotiveSource::Default,
         step_id: None,
         attempt: None,
+        cards: Vec::new(),
     };
     writable
         .finish_assistant_message(
@@ -248,6 +260,7 @@ fn unknown_tool_names_in_trace_are_dropped_not_fatal() {
             AiMessageStatus::Failed,
             None,
             &[trace],
+            None,
             None,
             Some("失败"),
         )
@@ -688,6 +701,7 @@ fn plan_round_trips_through_the_message_row() {
             &[],
             Some(&plan),
             None,
+            None,
         )
         .expect("finish");
 
@@ -712,7 +726,16 @@ fn message_without_plan_reads_as_none() {
         .begin_assistant_message(conversation.id)
         .expect("begin");
     writable
-        .finish_assistant_message(id, "你好", AiMessageStatus::Complete, None, &[], None, None)
+        .finish_assistant_message(
+            id,
+            "你好",
+            AiMessageStatus::Complete,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
         .expect("finish");
 
     let loaded = store
@@ -721,4 +744,228 @@ fn message_without_plan_reads_as_none() {
         .expect("get")
         .expect("存在");
     assert!(loaded.plan.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// v8：分段思考与工具卡片
+// ---------------------------------------------------------------------------
+
+use me_core::ai::{MailCardRef, ThinkingBlock, ThinkingSegment};
+
+fn blank_thinking_block() -> ThinkingBlock {
+    ThinkingBlock::default()
+}
+
+fn sample_thinking() -> ThinkingBlock {
+    ThinkingBlock {
+        segments: vec![
+            ThinkingSegment {
+                index: 1,
+                text: "先想清楚要查什么".to_string(),
+                followed_by_tool: true,
+            },
+            ThinkingSegment {
+                index: 2,
+                text: "结果回来了，可以收尾".to_string(),
+                followed_by_tool: false,
+            },
+        ],
+        truncated: true,
+    }
+}
+
+/// 思考块（含 `truncated` 标记）要能完整往返，段序不能变。
+#[test]
+fn thinking_round_trips_with_truncated_flag() {
+    let (_dir, store) = open();
+    let writable = store.writable();
+    let conversation = writable
+        .create_conversation("思考往返", Some("m1"), &config())
+        .expect("create");
+    let id = writable
+        .begin_assistant_message(conversation.id)
+        .expect("begin");
+    let thinking = sample_thinking();
+    writable
+        .finish_assistant_message(
+            id,
+            "答案",
+            AiMessageStatus::Complete,
+            None,
+            &[],
+            None,
+            Some(&thinking),
+            None,
+        )
+        .expect("finish");
+
+    let loaded = store
+        .read_only()
+        .get_ai_message_readonly(id)
+        .expect("get")
+        .expect("存在");
+    assert_eq!(loaded.thinking, Some(thinking));
+    assert_eq!(loaded.content, "答案", "思考不能污染正文");
+}
+
+/// 老库没有 thinking 列 → NULL → `None`，不能报错。
+#[test]
+fn old_message_without_thinking_reads_none() {
+    let (_dir, store) = open();
+    let writable = store.writable();
+    let conversation = writable
+        .create_conversation("老消息", Some("m1"), &config())
+        .expect("create");
+    let id = writable
+        .begin_assistant_message(conversation.id)
+        .expect("begin");
+    writable
+        .finish_assistant_message(
+            id,
+            "你好",
+            AiMessageStatus::Complete,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("finish");
+    let loaded = store
+        .read_only()
+        .get_ai_message_readonly(id)
+        .expect("get")
+        .expect("存在");
+    assert_eq!(loaded.thinking, None);
+}
+
+/// `Some(空块)` 与 `None` 是两种状态：前者说明服务商返回过思考但内容为空，
+/// 后者是压根没这功能。parse_thinking 不能把前者 filter 掉。
+#[test]
+fn empty_thinking_block_is_distinguishable_from_none() {
+    let (_dir, store) = open();
+    let writable = store.writable();
+    let conversation = writable
+        .create_conversation("空思考", Some("m1"), &config())
+        .expect("create");
+    let id = writable
+        .begin_assistant_message(conversation.id)
+        .expect("begin");
+    writable
+        .finish_assistant_message(
+            id,
+            "答案",
+            AiMessageStatus::Complete,
+            None,
+            &[],
+            None,
+            Some(&blank_thinking_block()),
+            None,
+        )
+        .expect("finish");
+    let loaded = store
+        .read_only()
+        .get_ai_message_readonly(id)
+        .expect("get")
+        .expect("存在");
+    assert_eq!(loaded.thinking, Some(ThinkingBlock::default()));
+}
+
+/// 卡片随 trace 一起落库、一起读回：历史回看时才显示得出来。
+#[test]
+fn tool_trace_cards_round_trip() {
+    let (_dir, store) = open();
+    let writable = store.writable();
+    let conversation = writable
+        .create_conversation("卡片往返", Some("m1"), &config())
+        .expect("create");
+    let id = writable
+        .begin_assistant_message(conversation.id)
+        .expect("begin");
+    let trace = AiToolTrace {
+        call_id: "c1".to_string(),
+        tool: AiToolName::EmailSearch,
+        status: AiToolStatus::Ok,
+        summary: "检索到 2 封".to_string(),
+        duration_ms: 12,
+        motive: None,
+        motive_source: MotiveSource::Default,
+        step_id: Some(2),
+        attempt: Some(1),
+        cards: vec![
+            MailCardRef {
+                message: MessageId(11),
+                reason: "已星标".to_string(),
+            },
+            MailCardRef {
+                message: MessageId(12),
+                reason: "近 7 天未读".to_string(),
+            },
+        ],
+    };
+    writable
+        .finish_assistant_message(
+            id,
+            "找到两封",
+            AiMessageStatus::Complete,
+            None,
+            std::slice::from_ref(&trace),
+            None,
+            None,
+            None,
+        )
+        .expect("finish");
+
+    let loaded = store
+        .read_only()
+        .get_ai_message_readonly(id)
+        .expect("get")
+        .expect("存在");
+    assert_eq!(loaded.tool_trace.len(), 1);
+    assert_eq!(loaded.tool_trace[0].cards.len(), 2);
+    assert_eq!(loaded.tool_trace[0].cards[0].reason, "已星标");
+    assert_eq!(loaded.tool_trace[0].step_id, Some(2));
+}
+
+/// 老 JSON 没有 cards 键 → 空数组，不能整条 trace 被丢掉。
+#[test]
+fn old_tool_trace_without_cards_reads_empty() {
+    let (_dir, store) = open();
+    let writable = store.writable();
+    let conversation = writable
+        .create_conversation("老 trace", Some("m1"), &config())
+        .expect("create");
+    let id = writable
+        .begin_assistant_message(conversation.id)
+        .expect("begin");
+    writable
+        .finish_assistant_message(
+            id,
+            "答案",
+            AiMessageStatus::Complete,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("finish");
+    // 手工写一段没有 cards 键的老 JSON（绕开领域类型）。
+    let conn = rusqlite::Connection::open(store.paths().db_file()).expect("open db");
+    conn.execute(
+        "UPDATE ai_messages SET tool_trace = ?2 WHERE id = ?1",
+        rusqlite::params![
+            id.0,
+            r#"[{"call_id":"old","tool":"email_search","status":"ok","summary":"命中 1 封","duration_ms":3}]"#
+        ],
+    )
+    .expect("写老 JSON");
+    drop(conn);
+    let loaded = store
+        .read_only()
+        .get_ai_message_readonly(id)
+        .expect("get")
+        .expect("存在");
+    assert_eq!(loaded.tool_trace.len(), 1, "老 trace 不能被丢弃");
+    assert!(loaded.tool_trace[0].cards.is_empty());
 }

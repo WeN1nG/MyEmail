@@ -1625,6 +1625,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                     motive_source,
                     step_id: None,
                     attempt: None,
+                    cards: Vec::new(),
                 });
             }
             Event::AiToolEmailResults {

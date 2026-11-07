@@ -1979,6 +1979,7 @@ mod tests {
             tool_trace: Vec::new(),
             plan: None,
             created_at: 0,
+            thinking: None,
         }
     }
 

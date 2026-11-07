@@ -85,7 +85,7 @@ pub use thread::{ThreadRow, thread_key, thread_root, thread_rows};
 /// 草稿列表、AI 会话/实体列表都不再退化成临时 B 树排序或全表扫描。
 /// v7 是 v0.4 的唯一 DDL 级变更：新增 `contacts` / `saved_searches` 两张表，
 /// 给 `messages` 补 `in_reply_to` / `references` 两列。
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// 应用显示名。
 pub const APP_NAME: &str = "MyEmail";

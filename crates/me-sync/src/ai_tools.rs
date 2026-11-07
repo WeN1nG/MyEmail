@@ -159,6 +159,7 @@ pub(crate) fn intercepted_result(
             motive_source,
             step_id: call_step_id(call),
             attempt: None,
+            cards: Vec::new(),
         },
     }
 }
@@ -199,6 +200,7 @@ pub(crate) fn phase_rejected_result(
             motive_source,
             step_id: None,
             attempt: None,
+            cards: Vec::new(),
         },
     }
 }
@@ -662,6 +664,7 @@ where
                     motive_source,
                     step_id: call_step_id(call),
                     attempt: None,
+                    cards: Vec::new(),
                 },
             },
             Err(err) => {
@@ -687,6 +690,7 @@ where
                         motive_source,
                         step_id: call_step_id(call),
                         attempt: None,
+                        cards: Vec::new(),
                     },
                 }
             }

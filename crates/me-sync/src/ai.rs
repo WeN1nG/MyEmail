@@ -1183,6 +1183,8 @@ where
                             message,
                             seq,
                             delta: chunk,
+                            kind: me_core::command::AiDeltaKind::Answer,
+                            segment: 0,
                         });
                     }
                 }
@@ -1196,6 +1198,8 @@ where
                         }
                     }
                 }
+                // 批次 2 之前先忽略：协议层暂不产出 Thinking。
+                AiDelta::Thinking(_) => {}
             })
         };
 
@@ -1563,6 +1567,8 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         duration_ms: result.trace.duration_ms,
                         motive: result.trace.motive.clone(),
                         motive_source: result.trace.motive_source,
+                        step_id: None,
+                        attempt: None,
                     })
                     .await;
                     traces.push(result.trace.clone());
@@ -1599,6 +1605,8 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         duration_ms: result.trace.duration_ms,
                         motive: result.trace.motive.clone(),
                         motive_source: result.trace.motive_source,
+                        step_id: None,
+                        attempt: None,
                     })
                     .await;
                     traces.push(result.trace.clone());
@@ -1797,6 +1805,8 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         // 用 trace 里的同一份，保证同一条活动条前后不跳变。
                         motive: result.trace.motive.clone(),
                         motive_source: result.trace.motive_source,
+                        step_id: None,
+                        attempt: None,
                     })
                     .await;
                 }
@@ -2031,6 +2041,8 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 message,
                 seq: seq_tail.0,
                 delta: seq_tail.1,
+                kind: me_core::command::AiDeltaKind::Answer,
+                segment: 0,
             })
             .await;
         }
@@ -2090,6 +2102,7 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     Some(usage),
                     &traces,
                     plan_for_db.as_ref(),
+                    None,
                     error_for_db.as_deref(),
                 )
             })
@@ -2149,6 +2162,7 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     AiMessageStatus::Failed,
                     None,
                     &[],
+                    None,
                     None,
                     Some(&error),
                 )

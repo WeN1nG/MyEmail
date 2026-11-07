@@ -482,6 +482,16 @@ impl ThemeMode {
 // Event
 // ---------------------------------------------------------------------------
 
+/// 流式增量属于哪个区块。
+///
+/// 加字段而不是加事件：两个事件会让「先思考后回答」的顺序在通道层面丢失，
+/// 并且要维护两套 `seq`。`kind` 保持单一全序，UI 按它分派到不同 buffer。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AiDeltaKind {
+    Answer,
+    Thinking,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
     SettingsLoaded {
@@ -761,6 +771,10 @@ pub enum Event {
         /// 与 `AiToolStarted` 同源，避免同一条活动条前后文本不一致。
         motive: Option<String>,
         motive_source: crate::ai::MotiveSource,
+        /// 绑定计划里的第几步。持久化 trace 里有，实时事件原先丢了这一步——
+        /// 补上之后流式期间的工具块也能显示「第 3 步 · 第 2 次尝试」。
+        step_id: Option<u8>,
+        attempt: Option<u8>,
     },
     /// 本轮清单发生变化（`plan_update` 之后发一次）。
     ///
@@ -860,7 +874,13 @@ pub enum Event {
     AiStreamDelta {
         conversation: crate::ai::AiConversationId,
         message: crate::ai::AiMessageId,
+        /// 全局单调：思考与回答共用同一个序列，UI 靠它检测缺口。
         seq: u64,
+        /// 这一片增量进哪个区块。
+        kind: AiDeltaKind,
+        /// 思考的第几段（从 1 开始）。`Answer` 恒为 0。
+        /// 切段时先 flush 上一次的残余再自增，否则残余会顶着新段号到达。
+        segment: u8,
         delta: String,
     },
     /// 终止事件（完成 / 取消）。不携带全文，UI 据此重载。

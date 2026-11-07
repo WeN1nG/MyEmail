@@ -410,7 +410,7 @@ fn empty_upsert_is_a_no_op() {
 }
 
 #[test]
-fn schema_version_is_7_after_open() {
+fn schema_version_is_8_after_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     empty(dir.path());
     let store = Store::open(dir.path()).expect("open");
@@ -418,5 +418,5 @@ fn schema_version_is_7_after_open() {
         store.writable().schema_version().unwrap(),
         me_core::SCHEMA_VERSION
     );
-    assert_eq!(me_core::SCHEMA_VERSION, 7);
+    assert_eq!(me_core::SCHEMA_VERSION, 8);
 }

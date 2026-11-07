@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use me_core::ai::{
     AiConversation, AiConversationId, AiEntity, AiEntityKind, AiEntitySource, AiMemoryRepo,
     AiMessage, AiMessageId, AiMessageStatus, AiProviderConfig, AiProviderKind, AiRepo, AiRole,
-    AiToolName, AiToolStatus, AiToolTrace, MAX_ENTITIES, MAX_MESSAGE_CHARS, MotiveSource,
-    NewAiEntity, NewAiMessage, normalize_entity_name,
+    AiToolName, AiToolStatus, AiToolTrace, MAX_ENTITIES, MAX_MESSAGE_CHARS, MailCardRef,
+    MotiveSource, NewAiEntity, NewAiMessage, ThinkingBlock, normalize_entity_name,
 };
 use me_core::ai_plan::Plan;
 use me_core::model::now_unix;
@@ -30,8 +30,10 @@ const CONVERSATION_COLUMNS: &str = "c.id, c.title, c.provider, c.model, c.model_
      c.updated_at, \
      (SELECT COUNT(*) FROM ai_messages m WHERE m.conversation_id = c.id)";
 
+/// 列序**位置敏感**：`map_message` 用 `row.get(N)` 硬编码索引，新增列一律
+/// 追加在 `created_at` 之后，插在中间会让后续所有字段错位。
 const MESSAGE_COLUMNS: &str = "id, conversation_id, role, content, context_refs, status, error, \
-     input_tokens, output_tokens, tool_trace, plan, created_at";
+     input_tokens, output_tokens, tool_trace, plan, created_at, thinking";
 
 const ENTITY_COLUMNS: &str = "e.id, e.kind, e.canonical_name, e.email, e.account_id, e.calendar_id, \
      e.attributes, e.source, e.confidence, e.created_at, e.updated_at, e.last_seen_at";
@@ -82,7 +84,21 @@ fn map_message(row: &Row<'_>) -> rusqlite::Result<AiMessage> {
         // 为了一段进度条把整个会话打不开不值得。
         plan: parse_plan(row.get::<_, Option<String>>(10)?),
         created_at: row.get(11)?,
+        // 新列追加在尾部，所以既有索引一个都不用动。
+        thinking: parse_thinking(row.get::<_, Option<String>>(12)?),
     })
+}
+
+/// 思考块的容错解析：坏 JSON 或不是对象，都按「没有思考」处理。
+///
+/// **不记日志**：思考是纯展示项，坏了就当没有；像 `parse_plan` 那样每次
+/// 都 warn，会在用户每次打开旧会话时刷屏。
+///
+/// 刻意保留 `Some(空块)` 与 `None` 的区别：前者说明服务商返回过思考但内容
+/// 为空，后者是压根没这功能。UI 再决定要不要画区块（见 `show_thinking`）。
+fn parse_thinking(raw: Option<String>) -> Option<ThinkingBlock> {
+    let raw = raw?;
+    serde_json::from_str::<ThinkingBlock>(&raw).ok()
 }
 
 /// 清单列的容错解析。`None` 不是错误：绝大多数消息本来就没有清单。
@@ -116,6 +132,9 @@ struct ToolTraceRow {
     step_id: Option<u8>,
     #[serde(default)]
     attempt: Option<u8>,
+    /// v8 起才有：这次检索挑出来的邮件卡片（id + 命中理由）。老行读成空数组。
+    #[serde(default)]
+    cards: Vec<MailCardRef>,
 }
 
 impl ToolTraceRow {
@@ -130,6 +149,7 @@ impl ToolTraceRow {
             motive_source: trace.motive_source.as_str().to_string(),
             step_id: trace.step_id,
             attempt: trace.attempt,
+            cards: trace.cards.clone(),
         }
     }
 
@@ -146,6 +166,7 @@ impl ToolTraceRow {
             motive_source: MotiveSource::parse(&self.motive_source).unwrap_or_default(),
             step_id: self.step_id,
             attempt: self.attempt,
+            cards: self.cards,
         })
     }
 }
@@ -423,6 +444,7 @@ fn append_message_tx(
         tool_trace: Vec::new(),
         plan: None,
         created_at: message.created_at,
+        thinking: None,
     })
 }
 
@@ -461,6 +483,7 @@ fn finish_assistant_tx(
     usage: Option<(Option<u32>, Option<u32>)>,
     tool_trace: &[AiToolTrace],
     plan: Option<&Plan>,
+    thinking: Option<&ThinkingBlock>,
     error: Option<&str>,
 ) -> Result<(), CoreError> {
     let over_limit = content.chars().count() > MAX_MESSAGE_CHARS;
@@ -480,10 +503,16 @@ fn finish_assistant_tx(
         None => None,
     };
     let (input, output) = usage.unwrap_or((None, None));
+    let thinking_json = match thinking {
+        Some(block) => Some(
+            serde_json::to_string(block).map_err(|_| CoreError::storage("思考过程无法序列化"))?,
+        ),
+        None => None,
+    };
 
     conn.execute(
         "UPDATE ai_messages SET content = ?2, status = ?3, error = ?4, input_tokens = ?5, \
-                output_tokens = ?6, tool_trace = ?7, plan = ?8 WHERE id = ?1",
+                output_tokens = ?6, tool_trace = ?7, plan = ?8, thinking = ?9 WHERE id = ?1",
         params![
             id.0,
             content,
@@ -492,7 +521,8 @@ fn finish_assistant_tx(
             input.map(|n| n as i64),
             output.map(|n| n as i64),
             trace_json,
-            plan_json
+            plan_json,
+            thinking_json
         ],
     )
     .store()?;
@@ -749,11 +779,12 @@ impl AiRepo for WritableStore {
         usage: Option<(Option<u32>, Option<u32>)>,
         tool_trace: &[AiToolTrace],
         plan: Option<&Plan>,
+        thinking: Option<&ThinkingBlock>,
         error: Option<&str>,
     ) -> Result<(), CoreError> {
         let mut conn = self.lock();
         finish_assistant_tx(
-            &mut conn, id, content, status, usage, tool_trace, plan, error,
+            &mut conn, id, content, status, usage, tool_trace, plan, thinking, error,
         )
     }
 
@@ -1045,6 +1076,7 @@ mod tests {
                 None,
                 &[],
                 Some(&plan),
+                None,
                 None,
             )
             .expect("finish");

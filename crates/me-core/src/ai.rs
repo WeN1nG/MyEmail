@@ -784,10 +784,11 @@ pub fn tool_motive(args: &Value) -> (Option<String>, MotiveSource) {
     )
 }
 
-/// 工具调用摘要。**不存参数、不存结果原文**。
+/// 工具调用摘要。**不存参数原文、不存邮件正文**。
 ///
-/// 唯一的例外是 `motive`：它是「为什么调这个工具」的一句话说明，给用户看的，
-/// 不是原始参数。它只进 `tool_trace` 与界面，**不进 tracing 日志**（否则用户问题会落盘）。
+/// 例外是三类给用户看的短文本：`motive`（为什么调）、`summary`（一句话结果）、
+/// `cards[].reason`（命中理由，可能含用户自己的查询词）。它们只进 `tool_trace`
+/// 与界面，**不进 tracing 日志**（否则用户问题会落盘）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiToolTrace {
     pub call_id: String,
@@ -807,6 +808,12 @@ pub struct AiToolTrace {
     /// 这是该步的第几次尝试（引擎在执行后回填）。
     #[serde(default)]
     pub attempt: Option<u8>,
+    /// 这次检索挑出来的邮件卡片：**只存 id + 命中理由**，不存摘要。
+    ///
+    /// 历史回看时按 id 重新查摘要；邮件被删了就降级显示，不报错。
+    /// 老数据没有这个键，读成空数组。
+    #[serde(default)]
+    pub cards: Vec<MailCardRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -870,6 +877,53 @@ pub struct AiContextRequest {
     pub selection: Option<String>,
 }
 
+/// 单条消息的思考总长上限。超出部分丢弃并置 `truncated`。
+///
+/// 为什么单独设限而不是复用 `MAX_MESSAGE_CHARS`：思考是**纯展示用**，
+/// 不参与下一轮上下文（见 `build_chat_request`），超出 32 KiB 之后对用户没有
+/// 增量价值，反而会让折叠区块展开时一次绘制几万个字形。与正文分列存储，
+/// 所以两者本来就不共用一个预算。
+pub const MAX_THINKING_CHARS: usize = 32 * 1024;
+/// 最多保留几段思考。超出同样置 `truncated`。
+pub const MAX_THINKING_SEGMENTS: usize = 16;
+
+/// 一段思考过程。
+///
+/// 模型在工具调用之间是**分次思考**的：想一段 → 调工具 → 再看结果想一段。
+/// 拼成一整个字符串会让用户以为它一次想完，也看不出哪段推理对应哪次工具调用。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingSegment {
+    /// 从 1 开始，与 `AiStreamDelta.segment` 对齐。
+    pub index: u8,
+    pub text: String,
+    /// 这段之后是否跟着一次工具调用（最后一段为 `false`）。
+    pub followed_by_tool: bool,
+}
+
+/// 一条消息的完整思考块。`None` = 这家服务商不返回思考内容；
+/// `Some(空块)` = 返回过但内容被过滤/截断为空——UI 据此区分「没有」与「有但丢了」。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingBlock {
+    #[serde(default)]
+    pub segments: Vec<ThinkingSegment>,
+    /// 是否因超过 `MAX_THINKING_CHARS` / `MAX_THINKING_SEGMENTS` 被截断。
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl ThinkingBlock {
+    pub fn is_empty(&self) -> bool {
+        self.segments.iter().all(|segment| segment.text.is_empty())
+    }
+
+    pub fn total_chars(&self) -> usize {
+        self.segments
+            .iter()
+            .map(|segment| segment.text.chars().count())
+            .sum()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiMessage {
     pub id: AiMessageId,
@@ -893,6 +947,13 @@ pub struct AiMessage {
     #[serde(default)]
     pub plan: Option<crate::ai_plan::Plan>,
     pub created_at: i64,
+    /// 仅 `assistant`：分段的思考过程。老数据没有这一列，读成 `None`。
+    ///
+    /// 与 `content` 分开存：思考**不回灌**下一轮上下文（Anthropic 的 thinking
+    /// block 带签名，跨轮回传有硬性约束），也不能被 `split_result_block` 之类
+    /// 的正文解析逻辑碰到。
+    #[serde(default)]
+    pub thinking: Option<ThinkingBlock>,
 }
 
 /// 追加一条消息的输入结构；`context_refs` 由 `me-store` 序列化为 JSON。
@@ -1189,7 +1250,10 @@ pub type AiDeltaSink = Arc<dyn Fn(AiDelta) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AiDelta {
+    /// 回答正文。
     Text(String),
+    /// 思考过程。**只用于展示**，不进 `content`、不回灌上下文。
+    Thinking(String),
     /// 服务商在流中或流尾给出的用量；缺省时保持 `None`。
     Usage {
         input: Option<u32>,
@@ -2225,6 +2289,7 @@ pub trait AiRepo {
         usage: Option<(Option<u32>, Option<u32>)>,
         tool_trace: &[AiToolTrace],
         plan: Option<&crate::ai_plan::Plan>,
+        thinking: Option<&ThinkingBlock>,
         error: Option<&str>,
     ) -> Result<(), CoreError>;
     /// 更新 `updated_at`；`title = Some` 时同时改标题。
@@ -2361,6 +2426,7 @@ mod tests {
             tool_trace: Vec::new(),
             plan: None,
             created_at: 0,
+            thinking: None,
         }
     }
 
@@ -2378,6 +2444,7 @@ mod tests {
             tool_trace: Vec::new(),
             plan: None,
             created_at: 0,
+            thinking: None,
         }
     }
 
@@ -2834,6 +2901,7 @@ mod tests {
                 tool_trace: Vec::new(),
                 plan: None,
                 created_at: 0,
+                thinking: None,
             })
             .collect();
 

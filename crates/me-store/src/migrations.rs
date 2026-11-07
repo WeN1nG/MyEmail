@@ -305,7 +305,10 @@ CREATE TABLE ai_messages (
     -- 本轮任务清单（JSON）。v5 起新建库直接带上；v4 及更早的库由
     -- migrate_v4_to_v5 补列（见该函数）。
     plan            TEXT,
-    created_at      INTEGER NOT NULL
+    created_at      INTEGER NOT NULL,
+    -- v8 起：分段思考（JSON 对象 {segments, truncated}）。老库由
+    -- migrate_v7_to_v8 补列。追加在尾部：map_message 按位置索引读列。
+    thinking        TEXT
 );
 CREATE INDEX ix_ai_messages_conversation
     ON ai_messages(conversation_id, id);
@@ -500,10 +503,11 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v4_to_v5(&mut conn)?;
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
+            migrate_v7_to_v8(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 backup = %backup.display(),
-                "database migrated v1 -> v7"
+                "database migrated v1 -> v8"
             );
             Ok(conn)
         }
@@ -514,9 +518,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v4_to_v5(&mut conn)?;
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
+            migrate_v7_to_v8(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v2 -> v7"
+                "database migrated v2 -> v8"
             );
             Ok(conn)
         }
@@ -526,9 +531,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v4_to_v5(&mut conn)?;
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
+            migrate_v7_to_v8(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v3 -> v7"
+                "database migrated v3 -> v8"
             );
             Ok(conn)
         }
@@ -537,9 +543,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v4_to_v5(&mut conn)?;
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
+            migrate_v7_to_v8(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v4 -> v7"
+                "database migrated v4 -> v8"
             );
             Ok(conn)
         }
@@ -547,18 +554,29 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             let started = std::time::Instant::now();
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
+            migrate_v7_to_v8(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v5 -> v7"
+                "database migrated v5 -> v8"
             );
             Ok(conn)
         }
         Some(6) => {
             let started = std::time::Instant::now();
             migrate_v6_to_v7(&mut conn)?;
+            migrate_v7_to_v8(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v6 -> v7"
+                "database migrated v6 -> v8"
+            );
+            Ok(conn)
+        }
+        Some(7) => {
+            let started = std::time::Instant::now();
+            migrate_v7_to_v8(&mut conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "database migrated v7 -> v8"
             );
             Ok(conn)
         }
@@ -883,6 +901,46 @@ fn migrate_v6_to_v7(conn: &mut Connection) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// v7 → v8：给 `ai_messages` 补一列 `thinking`（分段思考 JSON）。
+///
+/// 纯加列，不动既有约束 —— `ai_messages` 上有 CHECK（role/status），
+/// 动它们就得重建表，风险远大于收益。与 v4→v5 加 `plan` 同一套理由。
+///
+/// 按列存在性判断而不是无条件 ALTER：新建库走 `create_schema`，
+/// DDL 已带这一列，重复 ALTER 会报 duplicate column。
+///
+/// **目标版本写死 `8`**：写 `SCHEMA_VERSION` 会让 v7 库被一步标成最新，
+/// 之后的 v8→v9 补列就被跳过了（v2→v3、v5→v6 都踩过这个坑）。
+fn migrate_v7_to_v8(conn: &mut Connection) -> Result<(), CoreError> {
+    const TARGET: u32 = 8;
+    let tx = conn
+        .transaction()
+        .map_err(|e| storage(format!("开始 v7→v8 迁移事务失败: {e}")))?;
+
+    let has_column: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ai_messages') WHERE name = 'thinking')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| storage(format!("读取 ai_messages 列信息失败: {e}")))?;
+    if !has_column {
+        tx.execute_batch("ALTER TABLE ai_messages ADD COLUMN thinking TEXT;")
+            .map_err(|e| storage(format!("执行 v7→v8 迁移失败: {e}")))?;
+    }
+
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        params![TARGET.to_string()],
+    )
+    .map_err(|e| storage(format!("写入 schema_version 失败: {e}")))?;
+
+    check_foreign_keys(&tx)?;
+    tx.commit()
+        .map_err(|e| storage(format!("提交 v7→v8 迁移失败: {e}")))?;
+    Ok(())
+}
+
 /// 迁移必须保持 `foreign_keys = ON`；任何悬空子行都会在这里暴露。
 fn check_foreign_keys(tx: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
     let mut stmt = tx
@@ -1085,5 +1143,72 @@ mod tests {
 
         // 幂等：v3 的升级路径会连走两步，到这里列已经存在。
         migrate_v4_to_v5(&mut conn).expect("重复执行应当成功");
+    }
+
+    /// v7 → v8：补 `ai_messages.thinking`，旧消息读成 NULL，且重复迁移不报错。
+    #[test]
+    fn v7_to_v8_adds_thinking_and_is_idempotent() {
+        let mut conn = Connection::open_in_memory().expect("memory db");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta(key, value) VALUES ('schema_version', '7');
+            CREATE TABLE ai_conversations (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE ai_messages (
+                id INTEGER PRIMARY KEY,
+                conversation_id INTEGER NOT NULL REFERENCES ai_conversations(id),
+                role TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO ai_conversations(title, provider, model, created_at, updated_at)
+            VALUES ('旧会话', 'anthropic', 'claude-sonnet-4-5', 1, 1);
+            INSERT INTO ai_messages(conversation_id, role, content, created_at)
+            VALUES (1, 'assistant', '旧回复', 1);
+            "#,
+        )
+        .expect("建 v7 库");
+
+        migrate_v7_to_v8(&mut conn).expect("升级失败");
+
+        let has_column: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ai_messages') \
+                 WHERE name = 'thinking')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读取列");
+        assert!(has_column, "v7 库升级后必须有 thinking 列");
+
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("读版本");
+        assert_eq!(version, "8", "目标版本必须写死 8，不能写 SCHEMA_VERSION");
+
+        let (content, thinking): (String, Option<String>) = conn
+            .query_row(
+                "SELECT content, thinking FROM ai_messages WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("读旧消息");
+        assert_eq!(content, "旧回复");
+        assert!(thinking.is_none(), "老消息的思考列应为 NULL");
+
+        // 幂等：新建库走 create_schema，DDL 已带这一列，重复 ALTER 会报
+        // duplicate column —— 这里验证按存在性判断确实挡住了。
+        migrate_v7_to_v8(&mut conn).expect("重复执行应当成功");
     }
 }
