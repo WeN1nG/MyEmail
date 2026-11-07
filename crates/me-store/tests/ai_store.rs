@@ -969,3 +969,69 @@ fn old_tool_trace_without_cards_reads_empty() {
     assert_eq!(loaded.tool_trace.len(), 1, "老 trace 不能被丢弃");
     assert!(loaded.tool_trace[0].cards.is_empty());
 }
+
+/// 检查点：崩溃后内容要留下，迟到的检查点不能覆盖已收尾的消息。
+#[test]
+fn checkpoint_preserves_content_across_orphan_recovery() {
+    let (_dir, store) = open();
+    let writable = store.writable();
+    let conversation = writable
+        .create_conversation("检查点", Some("m1"), &config())
+        .expect("create");
+    let id = writable
+        .begin_assistant_message(conversation.id)
+        .expect("begin");
+    let thinking = sample_thinking();
+    writable
+        .checkpoint_assistant_message(id, "写到一半的内容", &[], None, Some(&thinking))
+        .expect("checkpoint");
+
+    // 模拟崩溃：孤儿收尾只改 status / error，内容必须原样保留。
+    assert_eq!(
+        writable.fail_orphan_streaming_messages().expect("orphan"),
+        1
+    );
+    let loaded = store
+        .read_only()
+        .get_ai_message_readonly(id)
+        .expect("get")
+        .expect("存在");
+    assert_eq!(loaded.status, AiMessageStatus::Failed);
+    assert_eq!(loaded.content, "写到一半的内容");
+    assert_eq!(loaded.thinking, Some(thinking));
+}
+
+/// 已经正常收尾的消息不能被迟到的检查点改写。
+#[test]
+fn checkpoint_does_not_overwrite_a_finished_message() {
+    let (_dir, store) = open();
+    let writable = store.writable();
+    let conversation = writable
+        .create_conversation("迟到检查点", Some("m1"), &config())
+        .expect("create");
+    let id = writable
+        .begin_assistant_message(conversation.id)
+        .expect("begin");
+    writable
+        .finish_assistant_message(
+            id,
+            "正式答案",
+            AiMessageStatus::Complete,
+            None,
+            &[],
+            None,
+            None,
+            None,
+        )
+        .expect("finish");
+    writable
+        .checkpoint_assistant_message(id, "迟到的增量", &[], None, None)
+        .expect("checkpoint 应静默无操作");
+    let loaded = store
+        .read_only()
+        .get_ai_message_readonly(id)
+        .expect("get")
+        .expect("存在");
+    assert_eq!(loaded.content, "正式答案");
+    assert_eq!(loaded.status, AiMessageStatus::Complete);
+}

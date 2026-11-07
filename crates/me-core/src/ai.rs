@@ -2272,6 +2272,23 @@ pub trait AiRepo {
         &self,
         conversation: AiConversationId,
     ) -> Result<AiMessageId, CoreError>;
+    /// 流式检查点：**只更新内容列**，不改 `status`（仍是 `streaming`）。
+    ///
+    /// 为什么单独一个方法而不是复用 `finish_assistant_message`：后者会把
+    /// status 改成终态并写用量/错误，中途调用等于提前宣布本轮结束。
+    /// 崩溃后 `fail_orphan_streaming_messages` 只改状态与清单，**不清内容**，
+    /// 所以检查点写下的正文与思考能留下来。
+    ///
+    /// 实现方必须带 `AND status = 'streaming'` 条件：迟到的检查点不能覆盖
+    /// 已经正常收尾的那条消息。
+    fn checkpoint_assistant_message(
+        &self,
+        id: AiMessageId,
+        content: &str,
+        tool_trace: &[AiToolTrace],
+        plan: Option<&crate::ai_plan::Plan>,
+        thinking: Option<&ThinkingBlock>,
+    ) -> Result<(), CoreError>;
     /// 终止落库：一次性写内容、状态、用量、tool_trace 与清单。
     ///
     /// `plan` 传 `None` 表示本轮没有清单；传 `Some` 时**必须是最终态**

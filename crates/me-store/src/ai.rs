@@ -788,6 +788,47 @@ impl AiRepo for WritableStore {
         )
     }
 
+    fn checkpoint_assistant_message(
+        &self,
+        id: AiMessageId,
+        content: &str,
+        tool_trace: &[AiToolTrace],
+        plan: Option<&Plan>,
+        thinking: Option<&ThinkingBlock>,
+    ) -> Result<(), CoreError> {
+        let mut conn = self.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| crate::storage(format!("开始检查点事务失败: {e}")))?;
+        let trace_rows: Vec<ToolTraceRow> =
+            tool_trace.iter().map(ToolTraceRow::from_trace).collect();
+        let trace_json = serde_json::to_string(&trace_rows)
+            .map_err(|_| CoreError::storage("工具摘要无法序列化"))?;
+        let plan_json = plan
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| CoreError::storage("清单无法序列化"))?;
+        let thinking_json = thinking
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| CoreError::storage("思考过程无法序列化"))?;
+        tx.execute(
+            "UPDATE ai_messages SET content = ?2, tool_trace = ?3, plan = ?4, thinking = ?5 \
+                    WHERE id = ?1 AND status = 'streaming'",
+            params![
+                id.0,
+                truncate_chars(content, MAX_MESSAGE_CHARS),
+                trace_json,
+                plan_json,
+                thinking_json
+            ],
+        )
+        .store()?;
+        tx.commit()
+            .map_err(|e| crate::storage(format!("提交检查点失败: {e}")))?;
+        Ok(())
+    }
+
     fn touch_conversation(
         &self,
         id: AiConversationId,

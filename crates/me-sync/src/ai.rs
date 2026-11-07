@@ -273,6 +273,26 @@ impl ThinkingAccumulator {
         self.segment_no = self.segment_no.saturating_add(1);
     }
 
+    /// 不消耗累积器地取一份当前快照（检查点落库用）。
+    /// 未收尾的 `current` 也算一段，否则崩溃恢复后最后一段思考会丢。
+    fn snapshot(&self) -> Option<me_core::ai::ThinkingBlock> {
+        let mut segments = self.segments.clone();
+        if !self.current.is_empty() {
+            segments.push(me_core::ai::ThinkingSegment {
+                index: self.segment_no,
+                text: self.current.clone(),
+                followed_by_tool: false,
+            });
+        }
+        if segments.is_empty() && !self.truncated {
+            return None;
+        }
+        Some(me_core::ai::ThinkingBlock {
+            segments,
+            truncated: self.truncated,
+        })
+    }
+
     fn finish(mut self) -> Option<me_core::ai::ThinkingBlock> {
         self.cut(false);
         if self.segments.is_empty() && !self.truncated {
@@ -1482,6 +1502,30 @@ where
                     usage_slot.1 = turn.output_tokens;
                 }
             }
+
+            // 每轮模型返回后写一次检查点。轮数上限就是 MAX_TOOL_ROUNDS（6），
+            // 所以最多 6 次写，比 1s 定时器的写放大还小；而最容易崩的
+            // 「长时间工具循环 + 中途断电」正好被逐轮覆盖。
+            // 崩溃后 fail_orphan_streaming_messages 只改状态、不清内容，
+            // 这里写下的正文 / 思考 / 清单 / trace 就都留住了。
+            let checkpoint_content = answer_throttle
+                .lock()
+                .map(|state| state.total.clone())
+                .unwrap_or_default();
+            let checkpoint_thinking = thinking.lock().ok().and_then(|acc| acc.snapshot());
+            let checkpoint_traces = traces.clone();
+            let checkpoint_plan = plan.clone();
+            let _ = self
+                .db(move |s| {
+                    s.checkpoint_assistant_message(
+                        message,
+                        &checkpoint_content,
+                        &checkpoint_traces,
+                        checkpoint_plan.as_ref(),
+                        checkpoint_thinking.as_ref(),
+                    )
+                })
+                .await;
 
             if turn.tool_calls.is_empty() {
                 // 自检：模型给一段 JSON，引擎拿事实裁剪后决定「重列」还是「收尾」。
