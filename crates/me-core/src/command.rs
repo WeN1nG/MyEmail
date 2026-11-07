@@ -109,6 +109,8 @@ pub enum Command {
     /// 用户已确认「本地缓存为明文保存」告知，落库后不再提示。
     AcknowledgePlaintextNotice,
     RebuildIndex,
+    /// 重跑线程头回填（v0.4 的 C5）。启动时已自动跑一次，这里是手动入口。
+    BackfillThreads,
     ClearCache(Option<AccountId>),
     /// 附件缓存根目录；`None` 表示恢复默认 `<数据目录>/attach`。
     /// 变更会迁移已有附件文件并更新数据库中的本地路径。
@@ -593,6 +595,12 @@ pub enum Event {
     IndexRebuilt {
         indexed: u32,
     },
+    /// 线程头回填跑完（v0.4 的 C5）。`updated` = 本次写回两列的邮件数。
+    ///
+    /// 只有真正写了行才发——启动时空跑一遍不该惊动界面。
+    ThreadsBackfilled {
+        updated: u32,
+    },
     DraftSaved {
         id: DraftId,
         synced_to_server: bool,
@@ -880,6 +888,7 @@ impl Event {
                 | Event::FolderRemoved { .. }
                 | Event::CacheCleared { .. }
                 | Event::MessageBodyLoaded { .. }
+                | Event::ThreadsBackfilled { .. }
         )
     }
 }

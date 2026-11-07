@@ -13,6 +13,7 @@ pub mod events;
 pub mod indexer;
 pub mod oauth_flow;
 pub mod tasks;
+mod threads;
 pub mod watcher;
 mod weather;
 
@@ -92,6 +93,8 @@ pub struct Inner<S, F, M> {
     /// 所以这里存的是「等 UI 回话」的通道，而不是执行结果。
     pub(crate) ai_music_pending:
         Mutex<HashMap<String, tokio::sync::oneshot::Sender<me_core::MusicOutcome>>>,
+    /// 线程头回填正在跑（本地任务，全局单飞）。
+    pub(crate) threads_running: AtomicBool,
 }
 
 /// 用于比较目录归属：优先规范化（Windows 下同时统一大小写与分隔符），
@@ -180,6 +183,7 @@ where
                 ai_provider: RwLock::new(None),
                 ai_state: Mutex::new(AiState::default()),
                 ai_music_pending: Mutex::new(HashMap::new()),
+                threads_running: AtomicBool::new(false),
             }),
         }
     }
@@ -485,6 +489,10 @@ where
     }
 
     fn startup(&self) {
+        // 线程头回填只读本地 `raw/*.eml.gz`，与网络无关——先起它，
+        // 让历史邮件尽早成串，不必等账户同步完成。
+        self.start_threads_backfill();
+
         // 日历与邮件无关：不等账户同步，先保证默认日历存在并启动提醒循环。
         self.start_reminder_loop();
         {
@@ -777,6 +785,10 @@ where
                         .db(move |s| s.set_setting(me_core::settings_key::THEME, mode.as_str()))
                         .await;
                 });
+            }
+            Command::BackfillThreads => {
+                // 本地任务，不占连接预算；单飞由 `threads_running` 兜住。
+                self.start_threads_backfill();
             }
             Command::SetBodyBackfill { enabled } => {
                 self.inner.backfill.store(enabled, Ordering::Relaxed);

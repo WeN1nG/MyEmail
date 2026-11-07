@@ -1215,6 +1215,12 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 }
                 self.state.folders_dirty = true;
             }
+            Event::ThreadsBackfilled { updated } => {
+                // 线程头写回来了：列表要重画才能把新成串的邮件按线程折叠。
+                if updated > 0 {
+                    self.state.messages_dirty = true;
+                }
+            }
             Event::MessageBodyLoaded { id, body } => {
                 if self.state.selected_message == Some(id) {
                     let missing = !body.raw_cached;

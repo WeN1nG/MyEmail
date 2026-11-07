@@ -734,6 +734,16 @@ pub struct MessageSummary {
     pub has_attachment: bool,
     /// ⇔ `body_path.is_some()`。
     pub body_cached: bool,
+    /// `In-Reply-To` 的裸 Message-ID（不含尖括号）。
+    ///
+    /// `None` 表示**未知**：可能是邮件本来就没有这个头，也可能是
+    /// 历史邮件还没做线程头回填（`me-sync` 的 `threads` 任务）。
+    /// 两者对 UI 的处置相同——单独成串，但语义上不要混为一谈。
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// `References` 的祖先链（根 → 最近），空表示未知或没有。
+    #[serde(default)]
+    pub references: Vec<String>,
 }
 
 impl MessageSummary {
@@ -802,6 +812,12 @@ pub struct NewMessage {
     pub size: Option<u32>,
     pub flags: Flags,
     pub has_attachment: bool,
+    /// 与 [`MessageSummary::in_reply_to`] 同义，落库时直接写列。
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// 与 [`MessageSummary::references`] 同义，落库时序列化成 JSON 数组。
+    #[serde(default)]
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1484,6 +1500,8 @@ mod tests {
                 snippet: None,
                 has_attachment: false,
                 body_cached: false,
+                in_reply_to: None,
+                references: Vec::new(),
             }
         }
 

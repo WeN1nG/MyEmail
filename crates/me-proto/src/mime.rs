@@ -22,6 +22,10 @@ use me_core::model::{
 use me_core::{CoreError, LimitKind, MAX_PARSE_BYTES};
 
 /// 解析后的头部字段。`date` 为 unix 秒，失败或缺失时为 `None`。
+///
+/// `in_reply_to` / `references` 只保留**裸 Message-ID**（不含尖括号），
+/// 供会话线程分组用（v0.4 的 C5）。两者都是 `None` 表示**未知**
+/// （历史邮件还没回填），与「有头但没解析出 id」的区别由调用方按需处理。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParsedHeader {
     pub message_id: Option<String>,
@@ -30,7 +34,18 @@ pub struct ParsedHeader {
     pub to: Vec<Address>,
     pub cc: Vec<Address>,
     pub date: Option<i64>,
+    /// `In-Reply-To` 的**第一个** id（RFC 5322 允许多个，实际几乎总是一个）。
+    pub in_reply_to: Option<String>,
+    /// `References` 的祖先链，**从根到最近**，已去重。
+    ///
+    /// 上限 [`MAX_REFERENCES`]：病态邮件可以带几百个 id，
+    /// 分组只看第一个、展示也只按链读，多余部分没有价值。
+    pub references: Option<Vec<String>>,
 }
+
+/// `References` 的条数上限。保留**开头**（根 + 早期祖先）——
+/// 分组只依赖第一个 id，砍掉尾巴不影响成串。
+pub const MAX_REFERENCES: usize = 32;
 
 /// 解析后的正文与附件元数据。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +82,11 @@ fn parser() -> MessageParser {
         .with_address_headers()
         .header_text(HeaderName::Subject)
         .header_id(HeaderName::MessageId)
+        // **回复头按原文取**：`References` 是**空格分隔**的 id 列表，
+        // 而 `parse_comma_separared` 只按逗号切——用它会把整条链
+        // 当成一个字符串，永远分不出根。取原文后自己按 `<...>` 扫。
+        .header_raw(HeaderName::InReplyTo)
+        .header_raw(HeaderName::References)
 }
 
 /// 解析仅头部字节（`BODY.PEEK[HEADER]`）。
@@ -94,6 +114,7 @@ pub fn parse_headers(header: &[u8]) -> Result<ParsedHeader, CoreError> {
         push_addresses(&mut cc, address);
     }
 
+    let (in_reply_to, references) = thread_headers(&parsed);
     Ok(ParsedHeader {
         message_id,
         subject,
@@ -101,7 +122,68 @@ pub fn parse_headers(header: &[u8]) -> Result<ParsedHeader, CoreError> {
         to,
         cc,
         date: parsed.date().and_then(mail_date_to_unix),
+        in_reply_to,
+        references,
     })
+}
+
+/// 从已解析的邮件里取回复头（`In-Reply-To` / `References`）。
+///
+/// 头部解析与草稿导入共用一处——两处各写一遍迟早会漂移。
+fn thread_headers(parsed: &Message<'_>) -> (Option<String>, Option<Vec<String>>) {
+    let in_reply_to = parsed
+        .in_reply_to()
+        .as_text()
+        .map(message_ids)
+        .and_then(|ids| ids.into_iter().next());
+    let references = parsed
+        .references()
+        .as_text()
+        .map(message_ids)
+        .filter(|ids| !ids.is_empty());
+    (in_reply_to, references)
+}
+
+/// 从 `In-Reply-To` / `References` 的原始文本里抠出 Message-ID。
+///
+/// RFC 5322 的形式是 `<id@host>`，多个用空白分隔；现实里还有两类变体：
+/// 没有尖括号的裸地址、以及用逗号分隔的脏数据。所以：
+/// 1. 只要出现过 `<`，就按尖括号成对扫描（最准）；
+/// 2. 一个尖括号都没有时，才退化成按空白/逗号切。
+///
+/// 去重保序；超过 [`MAX_REFERENCES`] 的部分丢弃。
+fn message_ids(raw: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut seen_bracket = false;
+
+    let mut rest = raw;
+    while let Some(open) = rest.find('<') {
+        seen_bracket = true;
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('>') else {
+            break;
+        };
+        push_id(&mut ids, &after[..close]);
+        rest = &after[close + 1..];
+    }
+
+    if !seen_bracket {
+        for token in raw.split(|c: char| c.is_whitespace() || c == ',') {
+            push_id(&mut ids, token);
+        }
+    }
+
+    ids.truncate(MAX_REFERENCES);
+    ids
+}
+
+fn push_id(ids: &mut Vec<String>, value: &str) {
+    let Some(id) = normalize_message_id(value) else {
+        return;
+    };
+    if !ids.contains(&id) {
+        ids.push(id);
+    }
 }
 
 fn first_address(address: &MailAddress<'_>) -> Option<Address> {
@@ -232,6 +314,7 @@ fn parse_draft_inner(raw: &[u8]) -> Result<ParsedDraft, CoreError> {
         attachments: extract_attachments(&parsed),
         raw_len: raw.len(),
     };
+    let (in_reply_to, references) = thread_headers(&parsed);
     Ok(ParsedDraft {
         header: ParsedHeader {
             message_id,
@@ -240,6 +323,8 @@ fn parse_draft_inner(raw: &[u8]) -> Result<ParsedDraft, CoreError> {
             to,
             cc,
             date: parsed.date().and_then(mail_date_to_unix),
+            in_reply_to,
+            references,
         },
         body,
         attachments: extract_decoded_attachments(&parsed),

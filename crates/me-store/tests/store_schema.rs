@@ -73,6 +73,8 @@ fn msg(uid: u32, message_id: &str, subject: &str, date: i64) -> NewMessage {
         size: Some(1024 + uid),
         flags: Flags::NONE,
         has_attachment: false,
+        in_reply_to: None,
+        references: Vec::new(),
     }
 }
 

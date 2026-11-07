@@ -91,6 +91,8 @@ fn seed_account(store: &Store, email: &str) -> Seeded {
                 size: None,
                 flags: Flags::NONE,
                 has_attachment: false,
+                in_reply_to: None,
+                references: Vec::new(),
             }],
             1,
         )

@@ -16,15 +16,43 @@ use crate::{StoreResult, pending, search, storage};
 
 const SUMMARY_COLUMNS: &str = "id, account_id, folder_id, uid, message_id, subject, from_addr, \
      from_name, to_addrs, cc_addrs, date, date_source, size, flags, snippet, has_attachment, \
-     body_path";
+     body_path, in_reply_to, \"references\"";
 
 const SUMMARY_COLUMNS_M: &str = "m.id, m.account_id, m.folder_id, m.uid, m.message_id, \
      m.subject, m.from_addr, m.from_name, m.to_addrs, m.cc_addrs, m.date, m.date_source, \
-     m.size, m.flags, m.snippet, m.has_attachment, m.body_path";
+     m.size, m.flags, m.snippet, m.has_attachment, m.body_path, m.in_reply_to, m.\"references\"";
 
 pub(crate) fn parse_addresses(json: Option<&str>) -> Vec<Address> {
     json.and_then(|raw| serde_json::from_str::<Vec<Address>>(raw).ok())
         .unwrap_or_default()
+}
+
+/// `Request-References` 列存的是 JSON 数组；坏数据按空处理
+/// （线程只是展示层的聚合，不该因为一条脏数据让整页查询失败）。
+pub(crate) fn parse_references(json: Option<&str>) -> Vec<String> {
+    json.and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default()
+}
+
+/// **入库**用：空链写 `NULL`。
+///
+/// `NULL` 在这里的含义是「**还没回填过**」——回填队列的判据就是
+/// `in_reply_to IS NULL AND "references" IS NULL`。新邮件入库时如果
+/// 本来就没有回复头，写 NULL 会让它在正文补全后进入回填队列一次
+/// （换来的是「NULL 只表示未处理」这个干净语义）。
+pub(crate) fn encode_references(references: &[String]) -> Option<String> {
+    if references.is_empty() {
+        None
+    } else {
+        serde_json::to_string(references).ok()
+    }
+}
+
+/// **回填**用：空链写 `"[]"`（= 处理过、确实没有引用链）。
+///
+/// 如果回填也写 NULL，没有回复头的邮件会永远留在队列里、每次启动重解析一遍。
+pub(crate) fn encode_references_checked(references: &[String]) -> String {
+    serde_json::to_string(references).unwrap_or_else(|_| "[]".to_string())
 }
 
 pub(crate) fn encode_addresses(addresses: &[Address]) -> String {
@@ -38,6 +66,8 @@ pub(crate) fn row_to_summary(row: &Row<'_>) -> rusqlite::Result<MessageSummary> 
     let cc_addrs: Option<String> = row.get(9)?;
     let date_source: String = row.get(11)?;
     let body_path: Option<String> = row.get(16)?;
+    let in_reply_to: Option<String> = row.get(17)?;
+    let references_json: Option<String> = row.get(18)?;
     let from = from_addr.map(|addr| Address {
         name: from_name,
         addr,
@@ -59,6 +89,8 @@ pub(crate) fn row_to_summary(row: &Row<'_>) -> rusqlite::Result<MessageSummary> 
         snippet: row.get(14)?,
         has_attachment: row.get::<_, i64>(15)? != 0,
         body_cached: body_path.is_some(),
+        in_reply_to,
+        references: parse_references(references_json.as_deref()),
     })
 }
 
@@ -361,6 +393,50 @@ pub(crate) fn body_jobs_conn(
     Ok(rows)
 }
 
+/// 线程头回填队列（v0.4 的 C5）。
+///
+/// 条件：正文已补全（有 `raw/*.eml.gz` 可读），且两列都还是 `NULL`。
+/// **用 `id > after` 游标推进**，不取「前 N 条」——本轮读不到 raw 的行
+/// 会一直留在队列里，取前 N 条会让同一批被反复选中、整轮卡死。
+pub(crate) fn thread_backlog_conn(
+    conn: &Connection,
+    after: i64,
+    limit: u32,
+) -> Result<Vec<MessageId>, CoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM messages
+              WHERE body_path IS NOT NULL
+                AND in_reply_to IS NULL
+                AND \"references\" IS NULL
+                AND id > ?1
+              ORDER BY id
+              LIMIT ?2",
+        )
+        .store()?;
+    let rows = stmt
+        .query_map(params![after, i64::from(limit)], |row| row.get::<_, i64>(0))
+        .store()?
+        .collect::<Result<Vec<_>, _>>()
+        .store()?;
+    Ok(rows.into_iter().map(MessageId).collect())
+}
+
+/// 回填结果落库：两列一起写，`references` 统一写成 JSON 数组（空链是 `"[]"`）。
+pub(crate) fn set_thread_headers_conn(
+    conn: &Connection,
+    id: MessageId,
+    in_reply_to: Option<&str>,
+    references: &[String],
+) -> Result<(), CoreError> {
+    conn.execute(
+        "UPDATE messages SET in_reply_to = ?2, \"references\" = ?3 WHERE id = ?1",
+        params![id.0, in_reply_to, encode_references_checked(references)],
+    )
+    .store()?;
+    Ok(())
+}
+
 pub(crate) fn pending_body_count_conn(
     conn: &Connection,
     account: AccountId,
@@ -459,8 +535,8 @@ pub(crate) fn insert_messages_conn(
                 "INSERT INTO messages(
                      account_id, folder_id, uid, message_id, subject, from_addr, from_name,
                      to_addrs, cc_addrs, date, date_source, size, flags, snippet,
-                     has_attachment, body_path
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, NULL)",
+                     has_attachment, body_path, in_reply_to, \"references\"
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, NULL, ?15, ?16)",
             )
             .store()?;
 
@@ -512,6 +588,8 @@ pub(crate) fn insert_messages_conn(
                     message.size.map(i64::from),
                     i64::from(message.flags.bits()),
                     i64::from(message.has_attachment),
+                    message.in_reply_to.as_deref(),
+                    encode_references(&message.references),
                 ])
                 .store()?;
             let id = tx.last_insert_rowid();
@@ -985,6 +1063,21 @@ impl MessageRepo for WritableStore {
     ) -> Result<BodyCoverage, CoreError> {
         let conn = self.lock();
         body_coverage_conn(&conn, accounts, folders)
+    }
+
+    fn thread_backlog(&self, after: i64, limit: u32) -> Result<Vec<MessageId>, CoreError> {
+        let conn = self.lock();
+        thread_backlog_conn(&conn, after, limit)
+    }
+
+    fn set_thread_headers(
+        &self,
+        id: MessageId,
+        in_reply_to: Option<&str>,
+        references: &[String],
+    ) -> Result<(), CoreError> {
+        let conn = self.lock();
+        set_thread_headers_conn(&conn, id, in_reply_to, references)
     }
 
     fn apply_local_flags(

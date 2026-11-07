@@ -527,6 +527,8 @@ async fn startup_repairs_garbled_attachment_names() {
                 size: Some(4096),
                 flags: Flags::NONE,
                 has_attachment: true,
+                in_reply_to: None,
+                references: Vec::new(),
             }],
             1,
         )
@@ -647,6 +649,8 @@ async fn attachment_dir_relocation_moves_files_and_persists_setting() {
                 size: Some(1024),
                 flags: Flags::NONE,
                 has_attachment: true,
+                in_reply_to: None,
+                references: Vec::new(),
             }],
             1,
         )

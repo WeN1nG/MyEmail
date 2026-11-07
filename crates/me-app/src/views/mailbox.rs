@@ -85,6 +85,8 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
     let mut toggle_star: Option<MessageId> = None;
     let mut toggle_read: Option<MessageId> = None;
     let mut move_trash: Option<MessageId> = None;
+    // 点了线程折叠标记：**只切换展开，不算点中那一行**（否则会顺带打开邮件）。
+    let mut thread_toggle: Option<String> = None;
     // **在 TableBuilder 闭包外取修饰键**——闭包里 `ui` 已被可变借用，
     // 再调 `ui.input()` 会撞借用检查。
     let modifiers = ui.input(|i| i.modifiers);
@@ -140,15 +142,24 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                 });
             })
             .body(|body| {
-                body.rows(26.0, state.messages.len(), |mut row| {
-                    let index = row.index();
+                // **画几行、画哪几封走 `thread_rows()`**：折叠版与「关闭折叠」
+                // 共用这条路径（关闭时它返回恒等映射），不在渲染里分叉。
+                let rows = state.thread_rows();
+                body.rows(26.0, rows.len(), |mut row| {
+                    let row_index = row.index();
+                    let Some(view) = rows.get(row_index).copied() else {
+                        return;
+                    };
+                    let index = view.index;
                     let Some(message) = state.messages.get(index) else {
                         return;
                     };
                     let id = message.id;
+                    let thread_key = me_core::thread_key(message);
                     let unread = !message.flags.is_seen();
                     let starred = message.flags.is_flagged();
                     let mut star_clicked = false;
+                    let mut thread_clicked = false;
 
                     // 高亮：**在多选集合内**或**等于单选值**。
                     // 只看单选值的话，多选时看不出选了哪些。
@@ -209,6 +220,30 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                         });
                     }
                     row.col(|ui| {
+                        // 线程标记：首行画 `▸ 3` / `▾ 3`（只有一封时不画），
+                        // 展开后的后续行缩进 + `↳`——不新增列，避免挤压主题宽度。
+                        if view.group_len > 1 && view.depth == 0 {
+                            let marker = if state.thread_expanded(&thread_key) {
+                                format!("▾ {}", view.group_len)
+                            } else {
+                                format!("▸ {}", view.group_len)
+                            };
+                            let button = egui::Button::new(
+                                RichText::new(marker)
+                                    .small()
+                                    .color(Color32::from_rgb(90, 130, 200)),
+                            )
+                            .frame(false);
+                            if ui.add(button).clicked() {
+                                thread_toggle = Some(thread_key.clone());
+                                thread_clicked = true;
+                            }
+                            ui.add_space(3.0);
+                        } else if view.depth > 0 {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new("↳").small().color(Color32::GRAY));
+                            ui.add_space(3.0);
+                        }
                         let subject = message.display_subject();
                         let mut text = if unread {
                             RichText::new(subject).strong()
@@ -241,14 +276,18 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                         }
                     });
 
-                    if row.response().clicked() && !star_clicked {
+                    if row.response().clicked() && !star_clicked && !thread_clicked {
                         // **多选交互**：`Ctrl` 切换集合、`Shift` 选区间、
                         // 裸点击清集合并设单选（同时打开阅读窗）。
                         if modifiers.ctrl {
                             state.toggle_selected(id);
                         } else if modifiers.shift {
-                            let ordered: Vec<MessageId> =
-                                state.messages.iter().map(|m| m.id).collect();
+                            // 区间按**可见顺序**算：折叠时列表里看不到的行不该被选进来。
+                            let ordered: Vec<MessageId> = rows
+                                .iter()
+                                .filter_map(|view| state.messages.get(view.index))
+                                .map(|message| message.id)
+                                .collect();
                             state.select_range(id, &ordered);
                         } else {
                             state.select_only(id);
@@ -372,6 +411,9 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
         });
     }
 
+    if let Some(key) = thread_toggle {
+        state.toggle_thread(&key);
+    }
     if let Some(id) = toggle_star
         && let Some(message) = state.messages.iter().find(|m| m.id == id)
     {
@@ -486,6 +528,10 @@ fn toolbar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) 
                     .small()
                     .color(Color32::GRAY),
             );
+            // 线程折叠开关：默认开。关掉就是「一封一行」的老视图，
+            // 排查「以为是丢邮件」时有用。
+            ui.checkbox(&mut state.thread_fold, RichText::new("线程").small())
+                .on_hover_text("按 References 把同一会话折叠成一行");
         });
     });
 
@@ -1257,6 +1303,8 @@ mod tests {
                 snippet: None,
                 has_attachment: false,
                 body_cached: false,
+                in_reply_to: None,
+                references: Vec::new(),
             })
             .collect();
         UiState {
@@ -1426,6 +1474,8 @@ mod tests {
             snippet: None,
             has_attachment: false,
             body_cached: false,
+            in_reply_to: None,
+            references: Vec::new(),
         }
     }
 
@@ -1514,6 +1564,105 @@ mod tests {
             }
             other => panic!("期望 Command::Search，实际 {other:?}"),
         }
+    }
+
+    // --- 会话线程折叠（v0.4 C5）---
+
+    fn message_threaded(
+        id: i64,
+        message_id: &str,
+        in_reply_to: Option<&str>,
+        references: &[&str],
+        subject: &str,
+        date: i64,
+    ) -> me_core::MessageSummary {
+        me_core::MessageSummary {
+            id: MessageId(id),
+            account: me_core::AccountId(1),
+            folder: me_core::FolderId(10),
+            uid: Some(id as u32),
+            message_id: Some(message_id.to_string()),
+            subject: Some(subject.to_string()),
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: Some(date),
+            date_source: me_core::DateSource::Header,
+            size: None,
+            flags: me_core::Flags::NONE,
+            snippet: None,
+            has_attachment: false,
+            body_cached: false,
+            in_reply_to: in_reply_to.map(str::to_string),
+            references: references.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    /// 一封原始邮件 + 一封回复（列表按时间倒序，回复在前）。
+    fn state_with_thread() -> UiState {
+        let mut state = UiState {
+            accounts: vec![crate::state::sample_account(1, "a@example.com")],
+            selected_account: Some(me_core::AccountId(1)),
+            ..Default::default()
+        };
+        state.select_folder(me_core::FolderId(10));
+        state.messages = vec![
+            message_threaded(2, "b@x", Some("a@x"), &["a@x"], "回复：报价", 200),
+            message_threaded(1, "a@x", None, &[], "原始：报价", 100),
+        ];
+        state
+    }
+
+    fn render_list(state: &mut UiState) -> String {
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(state, &mut Vec::new(), ui);
+            });
+        });
+        texts.join("\n")
+    }
+
+    /// 折叠时：一个线程只出一行，带 `▸ N`，父邮件不单独出现。
+    #[test]
+    fn folded_thread_paints_one_row_with_a_counter() {
+        let mut state = state_with_thread();
+        let joined = render_list(&mut state);
+        assert!(joined.contains("回复：报价"), "折叠行用最新一封：{joined}");
+        assert!(joined.contains("▸ 2"), "应有折叠标记与数量：{joined}");
+        assert!(
+            !joined.contains("原始：报价"),
+            "折叠时父邮件不该单独占一行：{joined}"
+        );
+    }
+
+    /// 展开时：两封都画，且后续行带 `↳`。
+    #[test]
+    fn expanded_thread_paints_every_message() {
+        let mut state = state_with_thread();
+        let key = me_core::thread_key(&state.messages[0]);
+        state.toggle_thread(&key);
+        let joined = render_list(&mut state);
+        assert!(
+            joined.contains("原始：报价"),
+            "展开后父邮件要出现：{joined}"
+        );
+        assert!(
+            joined.contains("回复：报价"),
+            "展开后回复也要出现：{joined}"
+        );
+        assert!(joined.contains("▾ 2"), "展开标记应改成 ▾：{joined}");
+        assert!(joined.contains("↳"), "后续行要有缩进标记：{joined}");
+    }
+
+    /// 关掉折叠就是老视图：一封一行，没有标记。
+    #[test]
+    fn thread_fold_off_paints_every_message_without_markers() {
+        let mut state = state_with_thread();
+        state.thread_fold = false;
+        let joined = render_list(&mut state);
+        assert!(joined.contains("原始：报价"));
+        assert!(joined.contains("回复：报价"));
+        assert!(!joined.contains("▸ 2"), "关掉折叠不该有标记：{joined}");
     }
 
     /// 删除时按**邮件所属账户**找废件箱，不是按当前选中账户。

@@ -12,6 +12,7 @@ pub mod model;
 pub mod music;
 pub mod port;
 pub mod search_syntax;
+pub mod thread;
 pub mod weather;
 
 pub use ai::{
@@ -75,6 +76,7 @@ pub use port::{
     ReadOnlyRepo, SearchOutcome, SearchRepo, SelectedFolder, SmtpSender, StorePort, UidRange,
 };
 pub use search_syntax::{ParsedQuery, parse_search_syntax};
+pub use thread::{ThreadRow, thread_key, thread_root, thread_rows};
 
 /// 当前 schema 版本。v3 的表结构冻结（`doc/v03架构设计.md` §8.3），
 /// v4 / v5 都是**纯加列**（`ai_conversations.model_id`、`ai_messages.plan`），

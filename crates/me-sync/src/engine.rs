@@ -292,6 +292,8 @@ where
                             size: fetch.size,
                             flags: fetch.flags,
                             has_attachment: fetch.has_attachment,
+                            in_reply_to: parsed.in_reply_to,
+                            references: parsed.references.unwrap_or_default(),
                         });
                     }
                     Err(err) => {

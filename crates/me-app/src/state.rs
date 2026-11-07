@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use me_core::{
     Account, AccountId, Address, AuthMethod, ConnectionState, Contact, Draft, DraftId, FlagOp,
     Flags, Folder, FolderId, HtmlRendererMode, MessageBody, MessageId, MessageSummary, ParsedQuery,
-    SavedSearch, ThemeMode, TlsMode, parse_search_syntax,
+    SavedSearch, ThemeMode, ThreadRow, TlsMode, parse_search_syntax,
 };
 
 // ---------------------------------------------------------------------------
@@ -213,6 +213,17 @@ pub struct UiState {
     /// 键集分页游标：上一页最后一行的 `(date, id)`。
     pub messages_cursor: Option<(i64, i64)>,
     pub messages_has_more: bool,
+    /// 是否按会话线程折叠列表（v0.4 的 C5，默认开启）。
+    ///
+    /// 折叠只影响**渲染行数**，`messages` 永远是完整的一页——
+    /// 多选、批量操作、分页都还按 `messages` 下标工作，
+    /// 只有「画哪几行」走 [`UiState::thread_rows`]。
+    pub thread_fold: bool,
+    /// 已展开的线程键（`me_core::thread_key`）。
+    ///
+    /// 允许留着过期键：换文件夹后旧键不再命中，只是无害地占几个字节；
+    /// 反过来「回到某个线程它还是展开的」更符合直觉。
+    pub expanded_threads: HashSet<String>,
 
     pub selected_message: Option<MessageId>,
     /// 多选集合（批量操作）。**与 `selected_message` 并存**——
@@ -365,6 +376,8 @@ impl Default for UiState {
             messages: Vec::new(),
             messages_cursor: None,
             messages_has_more: false,
+            thread_fold: true,
+            expanded_threads: HashSet::new(),
             selected_message: None,
             selected_messages: HashSet::new(),
             list_selection_anchor: None,
@@ -558,6 +571,36 @@ impl UiState {
     pub fn clear_folder_selection(&mut self) {
         self.unified_inbox = false;
         self.selected_folder = None;
+    }
+
+    // --- 会话线程折叠（v0.4 的 C5）---
+
+    /// 列表这一帧要画的行（线程折叠后）。
+    ///
+    /// 关闭折叠时返回「一封一行」的恒等映射——**折叠版与关闭版共用同一条
+    /// 渲染路径**，否则两套分支迟早画出不一样的东西。
+    pub fn thread_rows(&self) -> Vec<ThreadRow> {
+        if !self.thread_fold {
+            return (0..self.messages.len())
+                .map(|index| ThreadRow {
+                    index,
+                    depth: 0,
+                    group_len: 1,
+                })
+                .collect();
+        }
+        me_core::thread_rows(&self.messages, &self.expanded_threads)
+    }
+
+    /// 展开/收起一个线程。
+    pub fn toggle_thread(&mut self, key: &str) {
+        if !self.expanded_threads.remove(key) {
+            self.expanded_threads.insert(key.to_string());
+        }
+    }
+
+    pub fn thread_expanded(&self, key: &str) -> bool {
+        self.expanded_threads.contains(key)
     }
 
     pub fn folders_of(&self, account: AccountId) -> &[Folder] {
@@ -1559,6 +1602,79 @@ mod tests {
         state.clear_folder_selection();
         assert!(!state.unified_inbox);
         assert_eq!(state.selected_folder, None);
+    }
+
+    // --- 会话线程折叠（v0.4 的 C5）---
+
+    fn message_with_thread(
+        id: i64,
+        message_id: &str,
+        in_reply_to: Option<&str>,
+        references: &[&str],
+    ) -> MessageSummary {
+        MessageSummary {
+            id: MessageId(id),
+            account: AccountId(1),
+            folder: FolderId(1),
+            uid: Some(id as u32),
+            message_id: Some(message_id.to_string()),
+            subject: Some(format!("邮件 {id}")),
+            from: None,
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: Some(id),
+            date_source: me_core::DateSource::Header,
+            size: None,
+            flags: Flags::NONE,
+            snippet: None,
+            has_attachment: false,
+            body_cached: false,
+            in_reply_to: in_reply_to.map(str::to_string),
+            references: references.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn thread_rows_fold_replies_into_one_row_by_default() {
+        let state = UiState {
+            messages: vec![
+                message_with_thread(2, "b@x", Some("a@x"), &["a@x"]),
+                message_with_thread(1, "a@x", None, &[]),
+            ],
+            ..Default::default()
+        };
+        let rows = state.thread_rows();
+        assert_eq!(rows.len(), 1, "默认折叠：一整个线程占一行");
+        assert_eq!(rows[0].group_len, 2);
+        assert_eq!(rows[0].index, 0, "折叠行指向最新一封");
+    }
+
+    #[test]
+    fn disabling_thread_fold_returns_identity_rows() {
+        let mut state = UiState {
+            thread_fold: false,
+            ..Default::default()
+        };
+        state.messages = vec![
+            message_with_thread(2, "b@x", Some("a@x"), &["a@x"]),
+            message_with_thread(1, "a@x", None, &[]),
+        ];
+        let rows = state.thread_rows();
+        assert_eq!(rows.len(), 2, "关掉折叠就一封一行");
+        assert_eq!(rows[0].index, 0);
+        assert_eq!(rows[1].index, 1);
+        assert!(rows.iter().all(|row| row.depth == 0 && row.group_len == 1));
+    }
+
+    #[test]
+    fn toggle_thread_flips_expansion_both_ways() {
+        let mut state = UiState::default();
+        let key = "1|a@x".to_string();
+        assert!(!state.thread_expanded(&key));
+        state.toggle_thread(&key);
+        assert!(state.thread_expanded(&key), "第一次点是展开");
+        state.toggle_thread(&key);
+        assert!(!state.thread_expanded(&key), "第二次点是收起");
     }
 
     #[test]

@@ -183,3 +183,84 @@ fn parse_addresses_handles_empty_input() {
     assert!(to.is_empty());
     assert!(cc.is_empty());
 }
+
+// --- 会话线程头（v0.4 C5）---
+
+/// 拼一份只有头部的报文，便于精确构造回复头。
+fn header_only(extra: &str) -> Vec<u8> {
+    format!(
+        "Subject: Re: 报价\r\n\
+         From: bob@example.com\r\n\
+         To: alice@example.com\r\n\
+         Date: Mon, 01 Jan 2024 10:00:00 +0000\r\n\
+         Message-ID: <c@example.com>\r\n\
+         {extra}\r\n"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn in_reply_to_and_references_are_extracted() {
+    let raw = header_only(
+        "In-Reply-To: <b@example.com>\r\n\
+         References: <a@example.com> <b@example.com>",
+    );
+    let header = me_proto::parse_headers(&raw).unwrap();
+    assert_eq!(header.in_reply_to.as_deref(), Some("b@example.com"));
+    assert_eq!(
+        header.references.as_deref(),
+        Some(["a@example.com".to_string(), "b@example.com".to_string()].as_slice()),
+        "References 必须按空白分隔成多条"
+    );
+}
+
+#[test]
+fn missing_thread_headers_are_none() {
+    let raw = header_only("");
+    let header = me_proto::parse_headers(&raw).unwrap();
+    assert!(header.in_reply_to.is_none());
+    assert!(header.references.is_none());
+}
+
+#[test]
+fn references_without_brackets_fall_back_to_whitespace_split() {
+    // 真实邮件里存在裸地址（没有尖括号）的 References。
+    let raw = header_only("References: a@example.com b@example.com");
+    let header = me_proto::parse_headers(&raw).unwrap();
+    assert_eq!(
+        header.references.as_deref(),
+        Some(["a@example.com".to_string(), "b@example.com".to_string()].as_slice())
+    );
+}
+
+#[test]
+fn references_are_deduped_and_capped() {
+    // 病态邮件可以带几百个 id——去重 + 截断，且保留**根**（第一个）。
+    let ids: Vec<String> = (0..40).map(|i| format!("<id{i}@example.com>")).collect();
+    let raw = header_only(&format!("References: {} <id0@example.com>", ids.join(" ")));
+    let header = me_proto::parse_headers(&raw).unwrap();
+    let references = header.references.expect("references");
+    assert_eq!(references.len(), me_proto::mime::MAX_REFERENCES);
+    assert_eq!(references[0], "id0@example.com", "根必须保留");
+    assert_eq!(
+        references
+            .iter()
+            .filter(|id| *id == "id0@example.com")
+            .count(),
+        1,
+        "重复的 id 只留一次"
+    );
+}
+
+#[test]
+fn unterminated_bracket_does_not_break_parsing() {
+    // 头部被截断/损坏时不该 panic，也不该把半截当 id。
+    let raw = header_only("References: <a@example.com");
+    let header = me_proto::parse_headers(&raw).unwrap();
+    assert!(header.references.is_none());
+    assert_eq!(
+        header.subject.as_deref(),
+        Some("Re: 报价"),
+        "其余头部照常解析"
+    );
+}

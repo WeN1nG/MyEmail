@@ -412,6 +412,22 @@ pub trait MessageRepo {
 
     fn pending_body_count(&self, account: AccountId) -> Result<u32, CoreError>;
 
+    /// 线程头回填队列（v0.4 的 C5）：`body_path` 已就绪、但两列都还是 NULL 的邮件。
+    ///
+    /// **按 `id > after` 游标推进**，不用「取前 N 条」：本轮缺 raw 文件的邮件
+    /// 会一直留在队列里，取前 N 条会让同一批永远被重复选中、整轮卡死。
+    /// `after = 0` 表示从头开始。
+    fn thread_backlog(&self, after: i64, limit: u32) -> Result<Vec<MessageId>, CoreError>;
+
+    /// 回填结果落库。`references` 为空写 `"[]"`（**不是 NULL**）——
+    /// 队列判据是 `"references" IS NULL`，空链写 NULL 会让这封邮件永远留在队列里。
+    fn set_thread_headers(
+        &self,
+        id: MessageId,
+        in_reply_to: Option<&str>,
+        references: &[String],
+    ) -> Result<(), CoreError>;
+
     /// 正文落盘后：同事务更新 `body_path` / `snippet` 与 FTS `body`。
     fn set_body_cached(
         &self,
