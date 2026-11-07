@@ -14,8 +14,9 @@ MyEmail 是 Rust + egui/eframe 的原生桌面邮件客户端：多账户 IMAP �
 - [doc/数据结构.md](doc/数据结构.md) §4.2/§4.3/§4.4：DDL 与字段语义的**唯一事实源**，[crates/me-store/src/migrations.rs](crates/me-store/src/migrations.rs) 的 `SCHEMA_V2_DDL` / `SCHEMA_V3_DDL` 必须与之一致。
 - [doc/项目架构.md](doc/项目架构.md)：分层、依赖方向、线程模型、通信契约。
 - [doc/versiondoc/v01架构设计.md](doc/versiondoc/v01架构设计.md)：v0.1 的文件级职责与关键流程。
+- [doc/versiondoc/版本跟踪.md](doc/versiondoc/版本跟踪.md)：**按版本记录功能的增加 / 变更 / 删除**，以代码为准；每条能力带 `文件:符号` 定位，「计划未落地」与「已删除」分栏。改功能后要同步这张表。
 - [README.md](README.md)：**GitHub 主页展示版**——面向访客讲技术要点与创新点（自研 HTML 排版引擎 / SSE 解码 / 分层架构 / AI 安全边界），不是使用说明。使用说明与已知缺口的完整清单在 `doc/versiondoc/v03收尾.md` §7。
-- `doc/versiondoc/` 下是**历史版本快照**（v01/v02/v03 架构设计、收尾清单、发布说明），改当前事实不要改它们；新内容写进 `doc/` 根目录。
+- `doc/versiondoc/` 下多数是**历史版本快照**（v01/v02/v03 架构设计、收尾清单、发布说明），改当前事实不要改它们；新内容写进 `doc/` 根目录。**例外**：`版本跟踪.md` 是持续维护的当前事实表，每个版本收尾都要更新它。
 
 ## 常用命令
 
