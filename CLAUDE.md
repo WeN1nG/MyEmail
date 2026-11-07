@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-MyEmail 是 Rust + egui/eframe 的原生桌面邮件客户端：多账户 IMAP 收信、SMTP 发信、SQLite 全量摘要 + 文件正文缓存、FTS5 离线全文检索。**v0.1、v0.2 已闭环**；当前为 **v0.3（0.3.0）**：schema **v5**，在邮件主链路上新增**日历 / 天气 / AI 对话 / 音乐播放器**四个页面（顶部页签 `邮件 / 日历 / 天气 / AI / 音乐 / 账户 / 设置`，`Ctrl+1..7` 直达）。
-自动化测试 **710 passed / 6 ignored**（`cargo test --workspace` 实测）；`cargo deny check` 已在本机通过。**尚未做**真实 Gmail/Outlook 授权、真实天气/AI 密钥、真机音频与 Docker E2E 的人工验收——见 [doc/versiondoc/v03收尾.md](doc/versiondoc/v03收尾.md) §7。
+MyEmail 是 Rust + egui/eframe 的原生桌面邮件客户端：多账户 IMAP 收信、SMTP 发信、SQLite 全量摘要 + 文件正文缓存、FTS5 离线全文检索。**v0.1、v0.2、v0.3 已闭环**；当前为 **v0.4（0.4.0）**：schema **v7**，在 v0.3 的「邮件 + 日历 / 天气 / AI / 音乐」之上，邮件侧新增**搜索语法与保存的搜索、批量多选、联系人自动补全、统一收件箱、会话线程**五项能力（详见 [doc/0.4.0发布说明.md](doc/0.4.0发布说明.md)）。
+自动化测试 **710 passed / 6 ignored**（`cargo test --workspace` 实测）；`cargo fmt --check` / `cargo clippy -D warnings` 通过。**已验收**真实天气 API Key、真实 AI Key（两种协议）、真机音频；**尚未验收**真实 Gmail/Outlook 的 OAuth 与 IDLE、Docker GreenMail E2E、多账户真实环境的批量删除联调——见 [doc/0.4.0发布说明.md](doc/0.4.0发布说明.md) §验证状态。
 
-v0.3 的**未交付项**（写代码前先看，别当成已实现）：`.ics` 导入导出与邮件 `text/calendar` 邀请导入、系统通知（只有应用内 toast）、日历「仅此次」编辑界面、四个模块的 `feature_*` 开关接线（`FEATURE_CALENDAR` / `FEATURE_AI` 只有常量、无读取方）、AI 会话滚动分页（当前固定拉 100 条）。收尾进度见 [doc/versiondoc/v3收尾项清单.md](doc/versiondoc/v3收尾项清单.md)。
+**仍未交付的项**（写代码前先看，别当成已实现）：`.ics` 导入导出与邮件 `text/calendar` 邀请导入、系统通知（只有应用内 toast）、日历「仅此次」编辑界面、四个模块的 `feature_*` 开关接线（`FEATURE_CALENDAR` / `FEATURE_AI` 只有常量、无读取方）、AI 会话滚动分页（当前固定拉 100 条）、阅读页的线程侧栏、线程头的服务器重拉（没打开过的历史邮件无法成串）、联系人手动编辑 / 导入、批量「移动到文件夹」。
 
 文档的事实源关系（与代码冲突时以文档为准，改代码也要同步文档）：
 
@@ -108,7 +108,7 @@ me-app ──Command/Event──► me-sync ──► me-proto
 ## crate 关键事实
 
 - **me-core**（[port.rs](crates/me-core/src/port.rs)、[command.rs](crates/me-core/src/command.rs)、[model.rs](crates/me-core/src/model.rs)、[ai.rs](crates/me-core/src/ai.rs)、[ai_plan.rs](crates/me-core/src/ai_plan.rs)、[calendar.rs](crates/me-core/src/calendar.rs)、[weather.rs](crates/me-core/src/weather.rs)、[music.rs](crates/me-core/src/music.rs)、[search_syntax.rs](crates/me-core/src/search_syntax.rs)、[error.rs](crates/me-core/src/error.rs)）
-  - `SCHEMA_VERSION = 6`（[lib.rs](crates/me-core/src/lib.rs)）。v3 表结构冻结，v4/v5 都是**纯加列**，v6 是**纯索引调整**（不动列/约束）。
+  - `SCHEMA_VERSION = 7`（[lib.rs](crates/me-core/src/lib.rs)）。v3 表结构冻结，v4/v5 是**纯加列**，v6 是**纯索引调整**（不动列/约束），v7 新增 `contacts` / `saved_searches` 两表并给 `messages` 补 `in_reply_to` / `"references"`。
   - [ai.rs](crates/me-core/src/ai.rs)：AI 领域类型与**纯函数**——`build_chat_request`（拼系统提示/历史/引用/实体，含字符预算与整轮裁剪）、`escape_context`（把 `---` 换成破折号，堵死伪造分隔符）、`select_entities`、`TOOL_SPECS`（**14 个工具**）/ `tool_specs(permissions)`、`AiToolName::is_replay_safe`、`CancelFlag`（`Arc<AtomicBool>`，不把 tokio 带进领域层）、`AiProvider` / `AiRepo` / `AiMemoryRepo` 端口。`AiCredential` 的 `Debug` 脱敏且**不实现 `Serialize`**。
   - 模型档案（v0.3）：`AiModel` 是**唯一**的调用参数来源（`id` / `name` / `kind` / `base_url` / `model` / `max_input_chars` / `max_output_tokens` / `tools` / `api_key`）。`tools` 是 `AiToolPermissions` 的 **9 个** bool 开关（`email_search` / `mail_read` / `weather` / `calendar_read` / `calendar_create` / `calendar_update` / `calendar_delete` / `music` / `memory`），`#[serde(default)]` 全开，**加字段不迁移**。`validate_model` 复用 `validate_config` 的端点规则并校验 key 形态（空可接受），名称判重走 `normalize_model_name`（trim + 小写），`next_model_id` 生成 `m1`/`m2`…，`resolve_model` 按「会话绑定 → 当前模型 → 列表第一个」三级回退。`AiConversation` 8 个字段，`model_id` 记录绑定，`provider`/`model` 保留为创建时快照。
   - **`api_key` 是普通字段**：与其他参数一起序列化进 `meta.ai_models`（明文），不走 keyring，没有「保存 Key」这类单独按钮。`AiModel` 因此**手写 `Debug`**，`api_key` 只输出 `<redacted>` / `<empty>`——这条不能因为「反正已经明文存了」而删掉：事件载荷、日志、测试失败输出都会经过 `Debug`。

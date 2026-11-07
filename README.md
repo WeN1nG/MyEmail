@@ -8,7 +8,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.88%2B-000?logo=rust)](https://www.rust-lang.org/)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Tests](https://img.shields.io/badge/tests-548%20passed-2ea66f)
+![Tests](https://img.shields.io/badge/tests-710%20passed-2ea66f)
 ![Deps](https://img.shields.io/badge/WebView-0%20%C2%B7%20JS%20engine-0-8b5cf6)
 
 </div>
@@ -130,15 +130,17 @@ Governor: 全局许可 → 账户锁(两段获取,避免环等待)
 
 两套预算分开计费是必需的:IDLE 监听连接是长连接,如果不与操作连接分开,一封长邮件的同步就能把发送请求饿死。
 
-### 6. 数据可迁移:从 v1 活到 v6
+### 6. 数据可迁移:从 v1 活到 v7
 
-数据库 schema 走了 6 个版本。v4/v5 是**纯加列**,靠一个反直觉的判据保证幂等:
+数据库 schema 走了 7 个版本。v4/v5 是**纯加列**,靠一个反直觉的判据保证幂等:
 
 > **判断「某列在不在」,而不是判断「版本号到没到」。**
 
 新建库的 DDL 天然带最新列,而从 v2 升级来的库刚跑完 v3 迁移时列的情况又不同——两条路径到达同一版本时状态不一致,用版本号判断必然出错。所以 `migrate_v3_to_v4` / `migrate_v4_to_v5` 都用 `pragma_table_info` 查列,缺了才 `ALTER TABLE`。
 
 v6 换了个判据:它是**纯索引调整**(不改列),幂等靠「先 DROP 再 CREATE」——SQLite 没有 `ALTER INDEX`,改索引列序只能重建。
+
+v7 是**同一次迁移里加表又加列**:两张新表用 `CREATE TABLE IF NOT EXISTS` 天然幂等,两列仍走 `pragma_table_info` 判列。`references` 是 SQLite 保留关键字,DDL 与所有 SQL 里都得写成 `"references"`——这类细节在新建库与升级库两条路径上必须同时正确,所以它被写进了迁移测试。
 
 配套一条铁律:**中间步骤的版本号必须写死**,写 `SCHEMA_VERSION` 会给旧库盖上「已是最新」的章,把后续迁移整段跳过——这个坑代码里留了注释(`migrations.rs:560`)。
 
@@ -271,7 +273,7 @@ cargo test --workspace        # 710 passed / 6 ignored
 - 日历重复事件只能改整个系列,尚无「仅此次」编辑界面
 - AI 会话列表固定拉取最近 100 条,暂无滚动分页
 - AI / 天气密钥以明文存本地库(用户明确要求与其它参数一致保存),补偿手段是「不进日志、界面暗文、`Debug` 脱敏」
-- 真实 Gmail/Outlook 授权、真机音频、Docker E2E 尚待人工验收
+- 真实 Gmail/Outlook 授权与 IDLE、Docker E2E 尚待人工验收(真实天气 / AI 密钥与真机音频已验收)
 
 ---
 

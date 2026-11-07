@@ -2741,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "me-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2776,7 +2776,7 @@ dependencies = [
 
 [[package]]
 name = "me-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -2789,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "me-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-imap",
  "base64 0.23.1",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "me-store"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "fs2",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "me-sync"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "keyring",
