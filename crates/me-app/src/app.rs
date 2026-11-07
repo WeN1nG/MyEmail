@@ -333,7 +333,10 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             Ok(messages) => {
                 // 清单跟着最后一条带清单的助手消息走：它是这一轮需求的最新进度，
                 // 上一条消息的清单已经过期，继续显示会让人以为任务还在跑。
-                self.state.ai.plan = messages.iter().rev().find_map(|item| item.plan.clone());
+                // 流式中的那一轮还没落库，这时沿用缓存（`sync_plan_from_messages`）。
+                self.state
+                    .ai
+                    .sync_plan_from_messages(conversation, &messages);
                 self.state.ai.messages = messages;
                 self.state.ai.loading = false;
             }
@@ -1582,9 +1585,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             Event::AiPlanUpdated {
                 conversation, plan, ..
             } => {
-                if self.state.ai.selected == Some(conversation) {
-                    self.state.ai.plan = Some(plan);
-                }
+                self.state.ai.apply_plan(conversation, plan);
             }
             Event::AiToolStarted { .. } => {
                 // 工具开始不单独展示：完成事件带摘要，活动条一次成型。

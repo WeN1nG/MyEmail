@@ -2763,6 +2763,7 @@ dependencies = [
  "rfd",
  "rodio",
  "scraper",
+ "serde_json",
  "symphonia",
  "tempfile",
  "thiserror 2.0.21",

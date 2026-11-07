@@ -5,6 +5,7 @@
 //! - 流式期间用纯文本直出（每帧解析 Markdown 会卡），完成后解析一次并缓存；
 //! - 工具只展示摘要与邮件卡片，不展示完整正文。
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
@@ -162,6 +163,12 @@ pub struct AiPageState {
     pub entities: Vec<AiEntity>,
     /// 当前这轮的任务清单（来自 `AiPlanUpdated` 或最后一条消息的落库值）。
     pub plan: Option<me_core::ai_plan::Plan>,
+    /// 每个会话最近一次的清单，**含还没落库的流式那一份**。
+    ///
+    /// 只放 `plan` 一个字段是不够的：流式期间不落库，切到别的页面再回来，
+    /// 消息还在但没有清单，用户会以为任务被丢了。这里是纯 UI 状态，
+    /// 不改变「流式不落库」的不变量。
+    plans: HashMap<AiConversationId, me_core::ai_plan::Plan>,
 
     /// 全部模型档案，顺序即列表顺序。
     pub models: Vec<AiModel>,
@@ -194,6 +201,36 @@ pub struct AiPageState {
 }
 
 impl AiPageState {
+    /// 收到一份新清单：写进缓存，并在「就是当前会话」时同步到显示位。
+    pub fn apply_plan(&mut self, conversation: AiConversationId, plan: me_core::ai_plan::Plan) {
+        // 缓存只服务于「切页回来还能看到」，没有长留的必要；限个上限免得
+        // 一个长会话列表把整轮会话的清单都攒在内存里。
+        if self.plans.len() > 16 {
+            self.plans.clear();
+        }
+        self.plans.insert(conversation, plan.clone());
+        if self.selected == Some(conversation) {
+            self.plan = Some(plan);
+        }
+    }
+
+    /// 消息从库里重载后对齐清单：**落库值优先**，没有就沿用缓存里那份流式的。
+    pub fn sync_plan_from_messages(
+        &mut self,
+        conversation: AiConversationId,
+        messages: &[AiMessage],
+    ) {
+        let persisted = messages.iter().rev().find_map(|item| item.plan.clone());
+        match persisted {
+            Some(plan) => self.apply_plan(conversation, plan),
+            None => {
+                if self.selected == Some(conversation) {
+                    self.plan = self.plans.get(&conversation).cloned();
+                }
+            }
+        }
+    }
+
     pub fn selected_conversation(&self) -> Option<&AiConversation> {
         let id = self.selected?;
         self.conversations.iter().find(|item| item.id == id)
@@ -258,7 +295,9 @@ impl AiPageState {
         self.activity.clear();
         self.cards.clear();
         self.card_messages.clear();
-        self.plan = None;
+        // 切会话时用缓存恢复，而不是清空：流式中的清单还没落库，
+        // 清掉就再也找不回来了（切回来时消息里没有它）。
+        self.plan = id.and_then(|conversation| self.plans.get(&conversation).cloned());
         self.pending_delete = None;
         self.last_deleted = None;
         self.stream = None;
@@ -701,6 +740,10 @@ fn show_stream(ui: &mut egui::Ui, state: &AiPageState) {
 }
 
 /// 任务清单条。全部结束之后收成一行，避免常驻占地方。
+///
+/// 这一步是整轮对话里**信息密度最高**的地方：用户不该等到最后一段文字
+/// 才发现 AI 理解错了需求。所以未完成时默认展开，且每一步都写清
+/// 「调什么工具、传什么参数、拿到什么才算成功」。
 fn show_plan(ui: &mut egui::Ui, plan: &me_core::ai_plan::Plan) {
     ui.add_space(6.0);
     let (done, total) = plan.progress();
@@ -732,29 +775,97 @@ fn show_plan(ui: &mut egui::Ui, plan: &me_core::ai_plan::Plan) {
                             .small()
                             .color(Color32::GRAY),
                     );
+                    // 重列过一次就明说「这是第 2 次计划」，别让用户以为一次就成。
+                    if let Some(round) = plan.replans.len().checked_sub(1) {
+                        ui.label(
+                            RichText::new(format!(
+                                "第 {} 次计划",
+                                plan.replans
+                                    .get(round)
+                                    .map(|record| record.round)
+                                    .unwrap_or(1)
+                            ))
+                            .small()
+                            .color(Color32::from_rgb(0xC0, 0x7A, 0x1E)),
+                        );
+                    }
                 });
             });
             plan_steps(ui, plan);
+
+            // 重列原因放在底部：用户能看出「上一轮为什么走不通」。
+            if let Some(record) = plan.replans.last() {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(format!(
+                        "上一轮的问题：{}（{}）",
+                        truncate_chars(&record.reason, 60),
+                        record.diagnosis.label()
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(0xC0, 0x7A, 0x1E)),
+                );
+            }
         });
 }
 
 fn plan_steps(ui: &mut egui::Ui, plan: &me_core::ai_plan::Plan) {
     for step in &plan.steps {
-        let (mark, color) = plan_marker(step.status);
+        let (mark, color) = plan_marker(step.status, step.kind);
         ui.horizontal(|ui| {
             ui.label(RichText::new(mark).small().color(color));
             ui.label(
                 RichText::new(format!("{}. {}", step.id, truncate_chars(&step.title, 40))).small(),
             );
+            if step.attempts > 1 {
+                ui.label(
+                    RichText::new(format!(
+                        "⟳ 第 {}/{} 次",
+                        step.attempts,
+                        me_core::ai_plan::MAX_STEP_ATTEMPTS
+                    ))
+                    .small()
+                    .color(Color32::from_rgb(0xC0, 0x7A, 0x1E)),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(step.kind.label())
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            });
+        });
+        // 细节行：工具 + 参数摘要（`{{step.3...}}` 已经渲染成「→ 第 3 步结果」）。
+        if let Some(tool) = step.tool {
+            let detail = match step.args_digest() {
+                Some(digest) => format!("{} {{{digest}}}", tool.as_str()),
+                None => tool.as_str().to_string(),
+            };
             ui.label(
-                RichText::new(step.capability.label())
+                RichText::new(format!("      {detail}"))
                     .small()
                     .color(Color32::GRAY),
             );
-        });
+        }
+        if let Some(failure) = &step.failure {
+            ui.label(
+                RichText::new(format!("      {}", truncate_chars(&failure.human(), 80)))
+                    .small()
+                    .color(Color32::from_rgb(0xC0, 0x39, 0x2B)),
+            );
+        } else if let Some(expect) = &step.expect
+            && step.status != me_core::ai_plan::PlanStatus::Done
+        {
+            ui.label(
+                RichText::new(format!("      期望：{}", truncate_chars(expect, 60)))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        }
         if let Some(evidence) = &step.evidence {
             ui.label(
-                RichText::new(format!("     {}", truncate_chars(evidence, 60)))
+                RichText::new(format!("      回执：{}", truncate_chars(evidence, 60)))
                     .small()
                     .color(Color32::GRAY),
             );
@@ -762,8 +873,15 @@ fn plan_steps(ui: &mut egui::Ui, plan: &me_core::ai_plan::Plan) {
     }
 }
 
-fn plan_marker(status: me_core::ai_plan::PlanStatus) -> (&'static str, Color32) {
-    use me_core::ai_plan::PlanStatus;
+fn plan_marker(
+    status: me_core::ai_plan::PlanStatus,
+    kind: me_core::ai_plan::StepKind,
+) -> (&'static str, Color32) {
+    use me_core::ai_plan::{PlanStatus, StepKind};
+    // 「等用户回答」不是普通状态：它意味着整轮停在这里等一句话。
+    if kind == StepKind::Ask && !status.is_terminal() {
+        return ("?", Color32::from_rgb(0xC0, 0x7A, 0x1E));
+    }
     match status {
         PlanStatus::Pending => ("○", Color32::GRAY),
         PlanStatus::Running => ("◐", Color32::from_rgb(0x3B, 0x82, 0xF6)),
@@ -1997,5 +2115,87 @@ mod tests {
         assert_eq!(block.done, "—");
         assert_eq!(block.key, "—");
         assert_eq!(block.todo, "—");
+    }
+
+    // ---- 清单条 v2 ----
+
+    fn v2_plan() -> me_core::ai_plan::Plan {
+        use me_core::ai_plan::{
+            AttemptOutcome, Capability, Diagnosis, Plan, PlanStatus, PlanStep, ReplanRecord,
+        };
+        let mut first = PlanStep::new(1, "检索星标邮件", Capability::Mail, PlanStatus::Done);
+        first.tool = Some(me_core::ai::AiToolName::EmailSearch);
+        first.args = Some(serde_json::json!({ "flagged_only": true, "limit": 10 }));
+        first.expect = Some("列出星标邮件".to_string());
+
+        let mut second = PlanStep::new(2, "读第一封的正文", Capability::Mail, PlanStatus::Running);
+        second.tool = Some(me_core::ai::AiToolName::MailRead);
+        // 引用型参数：界面上要显示成「→ 第 1 步结果」，不能把模板原样画出来。
+        second.args = Some(serde_json::json!({
+            "message_id": "{{step.1.messages.0.message_id}}"
+        }));
+        second.expect = Some("拿到 1–2 句要点".to_string());
+
+        let mut plan = Plan::v2("找出值得优先处理的邮件", vec![first, second], 1_760_000_000);
+        plan.replans.push(ReplanRecord {
+            round: 2,
+            diagnosis: Diagnosis::WrongArgs,
+            reason: "第一次只按关键词查，漏掉了星标".to_string(),
+            changes: "先查星标再查未读".to_string(),
+            failed_steps: vec![1],
+            at: 1_760_000_100,
+        });
+        // 让第 2 步带上「第 2/3 次」的角标（角标只在第 2 次起显示）。
+        for _ in 0..2 {
+            plan.record_attempt(
+                2,
+                AttemptOutcome::Failed(me_core::ai_plan::StepFailure::Transient {
+                    detail: "正文还没缓存".to_string(),
+                }),
+            );
+        }
+        plan
+    }
+
+    #[test]
+    fn plan_bar_shows_tool_args_attempts_and_replan_reason() {
+        let plan = v2_plan();
+        let texts = run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show_plan(ui, &plan));
+        });
+        let joined = texts.join("\n");
+        assert!(joined.contains("email_search"), "要显示工具名：{joined}");
+        assert!(joined.contains("flagged_only"), "要显示参数摘要：{joined}");
+        assert!(
+            joined.contains("第 1 步结果"),
+            "引用要渲染成人话，而不是模板：{joined}"
+        );
+        assert!(!joined.contains("{{"), "模板不该出现：{joined}");
+        assert!(
+            joined.contains("第 2/3 次"),
+            "重试要能看见是第几次：{joined}"
+        );
+        assert!(joined.contains("第 2 次计划"), "重列要标明轮次：{joined}");
+        assert!(
+            joined.contains("上一轮的问题"),
+            "重列原因要写出来：{joined}"
+        );
+    }
+
+    #[test]
+    fn plan_survives_switching_away_and_back() {
+        let mut state = UiState::default();
+        state.ai.conversations = vec![conversation(1), conversation(2)];
+        state.select_ai_conversation(Some(AiConversationId(1)));
+        state.ai.apply_plan(AiConversationId(1), v2_plan());
+        assert!(state.ai.plan.is_some(), "当前会话要立刻显示清单");
+
+        // 切到另一个会话：那边的清单是空的，不该串台。
+        state.select_ai_conversation(Some(AiConversationId(2)));
+        assert!(state.ai.plan.is_none(), "别的会话不该看到这份清单");
+
+        // 切回来：流式期间还没落库，只能靠缓存恢复。
+        state.select_ai_conversation(Some(AiConversationId(1)));
+        assert!(state.ai.plan.is_some(), "切走再回来，清单不能凭空消失");
     }
 }

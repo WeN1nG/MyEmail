@@ -42,3 +42,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# 只为清单条的渲染测试构造步骤参数：不进最终二进制。
+serde_json = { workspace = true }
