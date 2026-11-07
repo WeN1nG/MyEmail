@@ -350,6 +350,9 @@ struct PartialTool {
 #[derive(Default)]
 struct TurnState {
     text: String,
+    /// 服务商返回思考内容时在这里累积。**不进 `AiWireMessage::Assistant`**，
+    /// 也不回灌上下文——只用于展示。
+    thinking: String,
     tools: BTreeMap<usize, PartialTool>,
     order: Vec<usize>,
     input_tokens: Option<u32>,
@@ -523,6 +526,16 @@ fn apply_openai(
         state.stop_reason = Some(reason.to_string());
     }
     let delta = &choice["delta"];
+    // 思考字段名各家不同：DeepSeek-R1 用 reasoning_content，部分网关用 reasoning。
+    // 只认字符串——有些端点把 reasoning 塞成对象（含 effort / summary），
+    // 那不是正文，取不到就当没有，不能 panic 也不能把 JSON 当文字展示。
+    let reasoning = delta["reasoning_content"]
+        .as_str()
+        .or_else(|| delta["reasoning"].as_str());
+    if let Some(text) = reasoning.filter(|text| !text.is_empty()) {
+        state.thinking.push_str(text);
+        sink(AiDelta::Thinking(text.to_string()));
+    }
     if let Some(text) = delta["content"].as_str()
         && !text.is_empty()
     {
@@ -989,5 +1002,112 @@ mod tests {
         let err = map_status(401, b"{\"error\":\"bad key sk-test\"}");
         let text = format!("{err:?} {}", err.user_message());
         assert!(!text.contains("sk-test"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 思考内容（v1 只做 OpenAI 兼容端点的响应侧解析）
+    // -----------------------------------------------------------------------
+
+    /// 收集全部增量，用来验证思考与回答各自走对通道。
+    fn collecting_sink() -> (AiDeltaSink, Arc<Mutex<Vec<AiDelta>>>) {
+        let all = Arc::new(Mutex::new(Vec::new()));
+        let clone = all.clone();
+        let sink: AiDeltaSink = Arc::new(move |delta| clone.lock().unwrap().push(delta));
+        (sink, all)
+    }
+
+    fn openai_event(delta: &str) -> SseEvent {
+        SseEvent {
+            name: None,
+            data: format!(r#"{{"choices":[{{"index":0,"delta":{delta}}}]}}"#),
+        }
+    }
+
+    #[test]
+    fn openai_reasoning_content_reaches_sink() {
+        let (sink, all) = collecting_sink();
+        let mut state = TurnState::default();
+        apply_openai(
+            &mut state,
+            &openai_event(r#"{"reasoning_content":"先想一下"}"#),
+            &sink,
+        )
+        .unwrap();
+        let deltas = all.lock().unwrap().clone();
+        assert_eq!(deltas, vec![AiDelta::Thinking("先想一下".to_string())]);
+        assert_eq!(state.thinking, "先想一下");
+        assert_eq!(state.text, "", "思考不能混进正文");
+    }
+
+    /// 部分网关用 `reasoning` 而不是 `reasoning_content`。
+    #[test]
+    fn openai_reasoning_fallback_field() {
+        let (sink, all) = collecting_sink();
+        let mut state = TurnState::default();
+        apply_openai(
+            &mut state,
+            &openai_event(r#"{"reasoning":"换个字段名"}"#),
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(
+            *all.lock().unwrap(),
+            vec![AiDelta::Thinking("换个字段名".to_string())]
+        );
+    }
+
+    /// 有些端点把 reasoning 塞成对象（effort/summary），不是正文。
+    /// `.as_str()` 拿 None 就够了，绝不能 panic 或把 JSON 当文字展示。
+    #[test]
+    fn openai_reasoning_object_form_is_ignored_safely() {
+        let (sink, all) = collecting_sink();
+        let mut state = TurnState::default();
+        apply_openai(
+            &mut state,
+            &openai_event(r#"{"reasoning":{"effort":"high","summary":"略"}}"#),
+            &sink,
+        )
+        .unwrap();
+        assert!(all.lock().unwrap().is_empty(), "不该产出任何增量");
+        assert_eq!(state.thinking, "");
+    }
+
+    /// 思考与正文交错到达时，两条通道各自正确、顺序不乱。
+    #[test]
+    fn openai_text_and_thinking_do_not_mix() {
+        let (sink, all) = collecting_sink();
+        let mut state = TurnState::default();
+        for delta in [
+            r#"{"reasoning_content":"第一步"}"#,
+            r#"{"content":"答案开头"}"#,
+            r#"{"reasoning_content":"，再想一步"}"#,
+            r#"{"content":"，答案结尾"}"#,
+        ] {
+            apply_openai(&mut state, &openai_event(delta), &sink).unwrap();
+        }
+        assert_eq!(state.thinking, "第一步，再想一步");
+        assert_eq!(state.text, "答案开头，答案结尾");
+        assert_eq!(
+            *all.lock().unwrap(),
+            vec![
+                AiDelta::Thinking("第一步".to_string()),
+                AiDelta::Text("答案开头".to_string()),
+                AiDelta::Thinking("，再想一步".to_string()),
+                AiDelta::Text("，答案结尾".to_string()),
+            ]
+        );
+    }
+
+    /// 普通端点只给 content：不该产生空的 Thinking 增量。
+    #[test]
+    fn openai_without_reasoning_emits_no_thinking() {
+        let (sink, all) = collecting_sink();
+        let mut state = TurnState::default();
+        apply_openai(&mut state, &openai_event(r#"{"content":"你好"}"#), &sink).unwrap();
+        assert_eq!(
+            *all.lock().unwrap(),
+            vec![AiDelta::Text("你好".to_string())]
+        );
+        assert_eq!(state.thinking, "");
     }
 }
