@@ -3367,6 +3367,174 @@ async fn failed_plan_submit_is_visible_in_the_trace() {
     );
 }
 
+/// 事故里那三种「差一点点」的计划参数，现在应当**一次就通过**。
+///
+/// 2026-11-07 的真实对话：模型连续 5 次 `plan_submit` 被拒——
+/// `date_from`（应为 `after`）、判据漏写 `label`、推理步却带了 `tool`。
+/// 每次被拒都是一次模型往返，5 次往返把请求密度顶到限流线上，
+/// 整轮以「请求过于频繁」失败，而模型其实已经查到了 20 封邮件。
+///
+/// 这条测试锁死「不再被拒」：一份带这些毛病的计划必须**一次建清单成功**。
+#[tokio::test]
+async fn almost_right_plan_is_accepted_without_a_retry() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(AiToolCall {
+            id: "plan".to_string(),
+            name: AiToolName::PlanSubmit,
+            parse_ok: true,
+            arguments: json!({
+                "motive": "先建个清单",
+                "goal": "看看邮件并生成画像",
+                "steps": [
+                    {
+                        "id": 1,
+                        "title": "检索近 30 天邮件",
+                        "kind": "tool",
+                        // 少了 capability —— 引擎按工具名反推。
+                        "tool": "email_search",
+                        // date_from 是错的名字 —— 引擎改成 after。
+                        "args": {"date_from": "2026-10-01"},
+                        // 判据漏了 label —— 引擎按条件反推名字。
+                        "expect": "拿到邮件列表"
+                    },
+                    {
+                        "id": 2,
+                        "title": "归纳出用户画像",
+                        // 推理步却带了 tool —— 引擎按工具步处理。
+                        "kind": "reason",
+                        "tool": "email_search",
+                        "expect": "给出一段画像"
+                    }
+                ]
+            }),
+        }),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查最近的邮件", "days": 30 }),
+        )),
+        Turn::text("近 30 天有 2 封。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看我的邮件 生成我的用户画像".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let submits: Vec<_> = message
+        .tool_trace
+        .iter()
+        .filter(|trace| trace.tool == AiToolName::PlanSubmit)
+        .collect();
+    assert!(
+        submits
+            .iter()
+            .all(|trace| trace.status != me_core::ai::AiToolStatus::Error),
+        "这份计划不该被拒：{submits:?}"
+    );
+    // 清单建起来了，而且走到了业务工具调用。
+    assert!(
+        message
+            .tool_trace
+            .iter()
+            .any(|trace| trace.tool == AiToolName::EmailSearch
+                && trace.status == me_core::ai::AiToolStatus::Ok),
+        "清单建好后应当继续执行：{:?}",
+        message.tool_trace
+    );
+}
+
+/// 模型连续交不出合格清单时，引擎不该一直等它。
+///
+/// 2026-11-07 的真实对话：模型连续 5 次 `plan_submit` 被拒（每次都是参数
+/// 写错），5 次模型往返把请求密度顶到限流线上，后面的请求全被 429 打掉，
+/// 整轮以「请求过于频繁」失败——**而模型其实已经查到了 20 封邮件**。
+///
+/// 闸门的作用：连续两次交不出清单，引擎就自己代建一份，让流程继续往下走。
+/// 清单不完美，总比整轮失败好。
+#[tokio::test]
+async fn repeated_plan_rejections_do_not_stall_the_turn() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        // 前两份清单参数都是错的（工具名不存在，猜不出意图，只能报错）。
+        Turn::with_tool(bad_plan()),
+        Turn::with_tool(bad_plan()),
+        // 第三轮模型改用正确参数——但闸门已经生效，引擎自己建了清单，
+        // 流程应该继续到业务工具调用。
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查最近的邮件", "days": 7 }),
+        )),
+        Turn::text("近 7 天有 2 封。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看我的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(
+        message
+            .tool_trace
+            .iter()
+            .any(|trace| trace.tool == AiToolName::EmailSearch
+                && trace.status == me_core::ai::AiToolStatus::Ok),
+        "闸门之后仍要走完业务调用：{:?}",
+        message.tool_trace
+    );
+    assert_eq!(
+        message.status,
+        me_core::ai::AiMessageStatus::Complete,
+        "不该整轮失败：{:?}",
+        message.error
+    );
+}
+
+/// 一份参数必然被拒的计划（工具名不存在）。
+fn bad_plan() -> AiToolCall {
+    AiToolCall {
+        id: "bad_plan".to_string(),
+        name: AiToolName::PlanSubmit,
+        parse_ok: true,
+        arguments: json!({
+            "motive": "先建个清单",
+            "goal": "查看邮件",
+            "steps": [
+                {
+                    "id": 1,
+                    "title": "检索近 7 天邮件",
+                    "kind": "tool",
+                    "capability": "mail",
+                    "tool": "not_a_real_tool",
+                    "expect": "拿到邮件列表"
+                }
+            ]
+        }),
+    }
+}
+
 /// 纯按时间窗检索时，卡片的命中理由要有区分度。
 ///
 /// 2026-11-07 的事故：模型用 `days:7` 检索，20 张卡片的理由全是同一句

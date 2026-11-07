@@ -1621,6 +1621,241 @@ pub fn validate_plan(prev: Option<&Plan>, next: &Plan) -> Result<Plan, CoreError
 // v2：plan_submit 的全量校验
 // ---------------------------------------------------------------------------
 
+/// 计划期的一步「能被猜出来的错误」。
+///
+/// 每修好一处，就少一次模型往返。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepRepair {
+    /// 修了什么（回灌给模型 + 界面上给用户看）。
+    pub note: String,
+}
+
+/// 工具步的 `capability` 缺失时，从工具名反推。
+///
+/// 工具与能力模块是一一对应的，让模型再填一遍纯属多余——而且它会填错。
+/// 2026-11-07 的事故里，模型为了一步 `reason` 的 capability 连改 4 次。
+fn infer_capability(tool: AiToolName) -> Capability {
+    match tool {
+        AiToolName::EmailSearch | AiToolName::MailRead => Capability::Mail,
+        AiToolName::WeatherGet | AiToolName::WeatherLocations => Capability::Weather,
+        AiToolName::CalendarList
+        | AiToolName::CalendarCreate
+        | AiToolName::CalendarUpdate
+        | AiToolName::CalendarDelete => Capability::Calendar,
+        AiToolName::MusicSearch
+        | AiToolName::MusicPlay
+        | AiToolName::MusicState
+        | AiToolName::MusicControl => Capability::Music,
+        // 记账类工具不进计划；落到这里说明模型写错了工具名。
+        AiToolName::MemoryUpsert
+        | AiToolName::PlanUpdate
+        | AiToolName::PlanSubmit
+        | AiToolName::AnswerDirectly => Capability::General,
+    }
+}
+
+/// 把模型写错的参数名改成正确的。
+///
+/// 返回被改掉的名字（`date_from` → `after`）。改不动的（拼错且猜不出）
+/// 原样留下，交给 [`validate_plan_v2`] 报错——宁可报错也不要静默丢掉参数，
+/// 静默丢掉会让检索范围悄悄变掉，用户拿到的是一份「没兑现的理解」。
+fn repair_argument_names(tool: AiToolName, args: &mut serde_json::Value) -> Vec<String> {
+    let Some(map) = args.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut renamed = Vec::new();
+    for (key, value) in map.iter() {
+        if key == "motive" || key == "step_id" {
+            continue;
+        }
+        if let Some(target) = crate::ai::tool_argument_alias(tool, key, value) {
+            renamed.push((key.clone(), target.to_string(), value.clone()));
+        }
+    }
+    let mut notes = Vec::new();
+    for (from, to, value) in &renamed {
+        map.remove(from);
+        map.insert(to.clone(), value.clone());
+        notes.push(format!("{from} → {to}"));
+    }
+    notes
+}
+
+/// 判据项缺 `label` 时，按它自己的条件反推一个名字。
+///
+/// 判据名是**给人看的**（「已星标」「近 7 天未读」），模型偶尔会漏写。
+/// 引擎能从条件反推出一个够用的名字，但不能替模型决定「什么算重要」——
+/// 条件本身仍然是模型写的。
+fn infer_criterion_label(conditions: &serde_json::Map<String, serde_json::Value>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if conditions
+        .get("flagged_only")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        parts.push("已星标".to_string());
+    }
+    if conditions
+        .get("unread_only")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        parts.push("未读".to_string());
+    }
+    if let Some(days) = conditions.get("days").and_then(serde_json::Value::as_u64) {
+        parts.push(format!("近 {days} 天"));
+    }
+    if let Some(subject) = conditions
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+    {
+        parts.push(format!("主题含「{subject}」"));
+    }
+    if let Some(query) = conditions.get("query").and_then(serde_json::Value::as_str) {
+        parts.push(format!("含「{query}」"));
+    }
+    if let Some(from) = conditions.get("from").and_then(serde_json::Value::as_str) {
+        parts.push(format!("来自 {from}"));
+    }
+    if let Some(folder) = conditions.get("folder").and_then(serde_json::Value::as_str) {
+        parts.push(folder.to_string());
+    }
+    if parts.is_empty() {
+        return "自定义条件".to_string();
+    }
+    parts.join("、")
+}
+
+/// 修好判据组：补名字、删掉不认的条件键。
+///
+/// 删条件键是有代价的（判据范围会变），所以只在**该判据还有别的条件**时才删；
+/// 删完就空了的话宁可留着让校验报错——那说明模型写的判据压根没法执行。
+fn repair_criteria(args: &mut serde_json::Value) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Some(items) = args
+        .get_mut("criteria")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return notes;
+    };
+    for (index, item) in items.iter_mut().enumerate() {
+        let Some(map) = item.as_object_mut() else {
+            continue;
+        };
+        // 删掉不认的条件键。
+        let unknown: Vec<String> = map
+            .keys()
+            .filter(|key| key.as_str() != "label" && !CRITERION_CONDITIONS.contains(&key.as_str()))
+            .cloned()
+            .collect();
+        let has_known = map
+            .keys()
+            .any(|key| CRITERION_CONDITIONS.contains(&key.as_str()));
+        if !unknown.is_empty() && has_known {
+            for key in unknown {
+                map.remove(&key);
+                notes.push(format!(
+                    "判据 {} 删掉了不认的条件「{key}」（可用：{}）",
+                    index + 1,
+                    CRITERION_CONDITIONS.join(" / ")
+                ));
+            }
+        }
+        // 补名字。
+        let missing = map
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .is_none();
+        if missing {
+            let label = infer_criterion_label(map);
+            map.insert(
+                "label".to_string(),
+                serde_json::Value::String(label.clone()),
+            );
+            notes.push(format!("判据 {} 补上了名字「{label}」", index + 1));
+        }
+    }
+    notes
+}
+
+/// 把一步里「明显写错了但猜得出意图」的地方改对。
+///
+/// 2026-11-07 的事故：模型连续 5 次 `plan_submit` 被拒，每次都是差一点点——
+/// `date_from`（应为 `after`）、`count`（`mail_read` 没有这个参数）、
+/// 判据少写 `label`、推理步却带了 `tool`。每一次被拒都是一次模型往返，
+/// 5 次往返把请求密度顶到限流线上，整轮以 429 收场。
+///
+/// 这里的原则：**能唯一确定意图的就替模型改对**，改完的说明回灌给它，
+/// 让它知道下轮怎么写；只有改不动的才交给 [`validate_plan_v2`] 报错。
+pub fn repair_plan_step(step: &mut PlanStep) -> Vec<StepRepair> {
+    let mut repairs = Vec::new();
+
+    // 1) 工具步的 capability：从工具名反推。
+    if let Some(tool) = step.tool
+        && step.capability == Capability::General
+    {
+        let inferred = infer_capability(tool);
+        if inferred != Capability::General {
+            step.capability = inferred;
+            repairs.push(StepRepair {
+                note: format!(
+                    "第 {} 步的 capability 补成了「{}」",
+                    step.id,
+                    inferred.label()
+                ),
+            });
+        }
+    }
+
+    // 2) 推理/提问步却带了 tool：多半是模型想调工具，把 kind 改成 tool。
+    //
+    // 这一条值得单独修：事故里模型为了一步 reason 反复改 kind，
+    // 改了 4 次，每次都撞「不能带 tool / args」。
+    if matches!(step.kind, StepKind::Reason | StepKind::Ask) && step.tool.is_some() {
+        step.kind = StepKind::Tool;
+        repairs.push(StepRepair {
+            note: format!("第 {} 步写了 tool，已按工具步处理", step.id),
+        });
+    }
+
+    // 3) 工具步的 expect 缺失：用标题兜底。
+    //
+    // expect 是「拿到什么才算成功」，缺了它模型在自检时无从判断。
+    // 兜底成标题的复述虽然不如模型自己写的好，但比整份计划被拒划算。
+    if step.kind == StepKind::Tool
+        && step
+            .expect
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .is_none()
+    {
+        let fallback = format!("完成「{}」", step.title.trim());
+        step.expect = Some(fallback.clone());
+        repairs.push(StepRepair {
+            note: format!("第 {} 步的 expect 补成了「{fallback}」", step.id),
+        });
+    }
+
+    // 4) 参数名修正 + 判据修复。
+    if let Some(tool) = step.tool
+        && let Some(args) = step.args.as_mut()
+    {
+        for renamed in repair_argument_names(tool, args) {
+            repairs.push(StepRepair {
+                note: format!("第 {} 步的参数名 {renamed}", step.id),
+            });
+        }
+        for note in repair_criteria(args) {
+            repairs.push(StepRepair { note });
+        }
+    }
+
+    repairs
+}
+
 /// 计划期就把「参数填得不对」拦下来。
 ///
 /// D1 那类错误的代价是极高的：schema 允许、实现拒绝、报错又不说明缺什么，
@@ -2008,7 +2243,7 @@ fn normalized_goal(prev: Option<&Plan>, next: &Plan) -> Result<String, CoreError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn step(id: u8, title: &str, status: PlanStatus) -> PlanStep {
         PlanStep::new(id, title, Capability::Mail, status)
@@ -2251,6 +2486,155 @@ mod tests {
 
     fn allowed() -> Vec<AiToolName> {
         vec![AiToolName::EmailSearch, AiToolName::MailRead]
+    }
+
+    // -----------------------------------------------------------------------
+    // 宽容修复：2026-11-07 事故的直接复现
+    // -----------------------------------------------------------------------
+
+    /// 事故里模型把 `after` 写成 `date_from`，整份计划被拒。
+    ///
+    /// 它接着又改了 4 次参数名，每一次都是一次模型往返；5 次往返把请求
+    /// 密度顶到限流线上，整轮以「请求过于频繁」失败——而模型其实已经
+    /// 查到了 20 封邮件。
+    #[test]
+    fn wrong_argument_name_is_renamed_instead_of_rejected() {
+        let mut step = tool_step(
+            1,
+            "检索近 30 天邮件",
+            AiToolName::EmailSearch,
+            json!({ "date_from": "2026-10-01" }),
+        );
+        let repairs = repair_plan_step(&mut step);
+        assert_eq!(
+            step.args.as_ref().and_then(|args| args.get("after")),
+            Some(&json!("2026-10-01")),
+            "date_from 要被改成 after"
+        );
+        assert!(
+            repairs.iter().any(|r| r.note.contains("date_from → after")),
+            "改名要有说明：{repairs:?}"
+        );
+        // 改完之后这份计划能过校验——这是关键：不再被拒。
+        validate_plan_v2(None, &v2_draft("目标", vec![step]), &allowed())
+            .expect("改过之后应该能过校验");
+    }
+
+    /// `count` 在 `mail_read` 上没有对应参数（它只认 `message_id`），
+    /// 这种猜不出的错仍然要报错——静默丢掉会让检索悄悄变了味。
+    #[test]
+    fn unguessable_argument_name_is_still_rejected() {
+        let step = tool_step(1, "读正文", AiToolName::MailRead, json!({ "count": 3 }));
+        let err = validate_plan_v2(None, &v2_draft("目标", vec![step]), &allowed())
+            .expect_err("猜不出的参数名仍然要报错");
+        assert!(
+            err.user_message().contains("count"),
+            "{}",
+            err.user_message()
+        );
+    }
+
+    /// 事故里模型为了一步 reason 连改 4 次 capability。
+    ///
+    /// 现在工具步的 capability 由引擎按工具名反推，模型不必猜。
+    #[test]
+    fn tool_step_capability_is_inferred_from_the_tool_name() {
+        let mut step = tool_step(
+            1,
+            "检索邮件",
+            AiToolName::EmailSearch,
+            json!({ "days": 30 }),
+        );
+        step.capability = Capability::General;
+        let repairs = repair_plan_step(&mut step);
+        assert_eq!(step.capability, Capability::Mail);
+        assert!(repairs.iter().any(|r| r.note.contains("capability")));
+    }
+
+    /// 事故里模型给 reason 步写了 tool，撞上「不能带 tool / args」。
+    ///
+    /// 它显然是想调工具，kind 写错了——改成 tool 步比拒收整份计划划算。
+    #[test]
+    fn reason_step_carrying_a_tool_is_promoted_to_a_tool_step() {
+        let mut step = reason_step(2, "归纳结论");
+        step.tool = Some(AiToolName::EmailSearch);
+        let repairs = repair_plan_step(&mut step);
+        assert_eq!(step.kind, StepKind::Tool);
+        assert!(repairs.iter().any(|r| r.note.contains("tool")));
+        // 改完之后这份计划能过校验。
+        validate_plan_v2(None, &v2_draft("目标", vec![step]), &allowed())
+            .expect("改过之后应该能过校验");
+    }
+
+    /// 事故里判据项漏了 `label`，被整份计划拒掉。
+    ///
+    /// 判据名是给人看的，引擎能从条件反推一个够用的名字。
+    #[test]
+    fn criterion_without_label_gets_one_inferred_from_its_conditions() {
+        let mut step = tool_step(
+            1,
+            "检索邮件",
+            AiToolName::EmailSearch,
+            json!({ "criteria": [{ "flagged_only": true, "days": 7 }] }),
+        );
+        let repairs = repair_plan_step(&mut step);
+        let label = step
+            .args
+            .as_ref()
+            .and_then(|args| args.get("criteria"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("label"))
+            .and_then(Value::as_str)
+            .expect("判据要有名字");
+        assert!(label.contains("已星标"), "反推的名字要能看懂：{label}");
+        assert!(repairs.iter().any(|r| r.note.contains("名字")));
+        validate_plan_v2(None, &v2_draft("目标", vec![step]), &allowed())
+            .expect("改过之后应该能过校验");
+    }
+
+    /// 判据里写了不认的条件键：删掉它（前提是这条判据还有别的条件）。
+    ///
+    /// 删条件是有代价的（判据范围会变），所以只有在这条判据还剩别的
+    /// 条件时才删——删完就空的话，宁可留着报错。
+    #[test]
+    fn unknown_criterion_key_is_dropped_when_other_conditions_remain() {
+        let mut step = tool_step(
+            1,
+            "检索邮件",
+            AiToolName::EmailSearch,
+            json!({ "criteria": [{ "label": "近 30 天", "days": 30, "description": "随便写" }] }),
+        );
+        repair_plan_step(&mut step);
+        let criterion = &step
+            .args
+            .as_ref()
+            .and_then(|args| args.get("criteria"))
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .expect("判据还在");
+        assert!(
+            criterion.get("description").is_none(),
+            "不认的条件键要删掉：{criterion}"
+        );
+        assert_eq!(criterion.get("days"), Some(&json!(30)), "真条件要留着");
+    }
+
+    /// 工具步漏了 expect：用标题兜底，而不是整份计划被拒。
+    #[test]
+    fn missing_expect_is_filled_from_the_title() {
+        let mut step = tool_step(
+            1,
+            "检索近 30 天邮件",
+            AiToolName::EmailSearch,
+            json!({ "days": 30 }),
+        );
+        step.expect = None;
+        let repairs = repair_plan_step(&mut step);
+        assert_eq!(step.expect.as_deref(), Some("完成「检索近 30 天邮件」"));
+        assert!(repairs.iter().any(|r| r.note.contains("expect")));
+        validate_plan_v2(None, &v2_draft("目标", vec![step]), &allowed())
+            .expect("补过之后应该能过校验");
     }
 
     #[test]

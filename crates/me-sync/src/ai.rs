@@ -56,6 +56,17 @@ const MAX_SELFCHECK_RETRIES: u32 = 1;
 /// 这里管的是「模型交不出合格的第二份计划」。
 const MAX_REPLAN_REJECTIONS: u32 = 2;
 
+/// PLAN 阶段 `plan_submit` 连续被参数校验拒收几次后，引擎放弃等它交计划。
+///
+/// 2026-11-07 的真实事故：模型连续 5 次 `plan_submit` 被拒（每次都是参数
+/// 写错），每一次都是一次模型往返。5 次往返把请求密度顶到限流线上，
+/// 后面的请求全被 429 打掉，整轮以「请求过于频繁」失败——**模型其实已经
+/// 查到了 20 封邮件**。
+///
+/// 所以这里给参数重试也设一个闸门：超过两次还交不出来，引擎就用模型
+/// 已经表明的意图合成一份最简计划继续往下走。清单不完美总比整轮失败好。
+const MAX_PLAN_SUBMIT_REJECTIONS: u32 = 2;
+
 /// 每个阶段的时间上限（秒）。
 ///
 /// 阶段预算是**上界**：正常路径远小于它，超了也只是提前收尾，
@@ -84,6 +95,15 @@ fn phase_budget(phase: Phase) -> Duration {
 /// 第一次重试等 300ms，第二次等 900ms：网络抖动通常一秒内就恢复，
 /// 等太久用户会以为卡死了。
 const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(300), Duration::from_millis(900)];
+
+/// 两次模型请求之间的最小间隔。
+///
+/// 限流按时间窗口计算，窗口内请求太多就挨 429。工具循环里每轮都是一次
+/// 新请求，参数反复出错时就会连着发好几轮——真实对话里就是这么把请求
+/// 密度顶到限流线上的，最后整轮以「请求过于频繁」失败。
+///
+/// 主动留间隔比撞上 429 再退避更省：撞上意味着那一轮已经白费了。
+const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(400);
 
 /// 调用过工具却一个字没说时，最多催它写正文几次。
 ///
@@ -1373,10 +1393,14 @@ where
         // 而 `plan_submit` 的契约里没有这些字段（不新加参数，改由引擎带过来）。
         let mut prev_plan: Option<me_core::ai_plan::Plan> = None;
         let mut replan_meta: Option<ReplanMeta> = None;
+        // 上一次模型请求的时刻，用来保证两次请求之间留出最小间隔。
+        let mut last_request_at: Option<Instant> = None;
+        // `plan_submit` 连续被参数校验拒收的次数；超限后引擎自己合成计划。
+        let mut plan_submit_rejections = 0u32;
 
         // 两套工具集：PLAN 阶段只有 `plan_submit` / `answer_directly`，
         // 物理上取消了模型「边想边查」的可能——想查就必须先说要查什么。
-        let mut plan_tools = me_core::ai::plan_phase_tool_specs();
+        let mut plan_tools = me_core::ai::plan_phase_tool_specs(&permissions);
         let mut execute_tools = me_core::ai::execute_phase_tool_specs(&permissions);
         if replay_only {
             plan_tools.retain(|spec| spec.name.is_replay_safe());
@@ -1468,6 +1492,21 @@ where
                 // REFLECT / FINAL 不给工具：前者只要一段 JSON，后者只要一段答复。
                 Phase::Reflect | Phase::Final => Vec::new(),
             };
+
+            // 两次模型请求之间的最小间隔。
+            //
+            // 限流是按时间窗口算的，窗口内请求太多就挨 429。
+            // 工具循环里每一轮都是一次新请求，参数反复出错时会连着发好几轮——
+            // 2026-11-07 的真实对话就是这样把请求密度顶到限流线上的。
+            //
+            // 主动留间隔比撞上 429 再退避更省：撞上意味着那一轮已经浪费了。
+            if let Some(previous) = last_request_at {
+                let elapsed = previous.elapsed();
+                if elapsed < MIN_REQUEST_INTERVAL {
+                    tokio::time::sleep(MIN_REQUEST_INTERVAL - elapsed).await;
+                }
+            }
+            last_request_at = Some(Instant::now());
 
             let turn = tokio::select! {
                 biased;
@@ -2046,6 +2085,28 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 results.push(result);
             }
 
+            // 统计 `plan_submit` 被拒收的次数。
+            //
+            // PLAN 阶段唯一的工具就是它，所以「拒收」=「模型交不出清单」。
+            // 连续拒收说明它陷进了参数细节里出不来——每次拒收都是一次模型
+            // 往返，而请求密度顶上去会撞 429，整轮就白费了
+            // （2026-11-07 的两次真实对话都是这样结束的，而模型其实已经
+            // 查到了 20 封邮件）。
+            //
+            // 统计放在循环**之后**：被「相同参数熔断」拦下的调用会提前
+            // `continue`，在循环内计数会漏掉它——而那恰恰是最该计入的一种
+            // 拒绝（模型原样重交了一次）。
+            for result in &results {
+                if result.tool != AiToolName::PlanSubmit {
+                    continue;
+                }
+                if result.is_error {
+                    plan_submit_rejections += 1;
+                } else {
+                    plan_submit_rejections = 0;
+                }
+            }
+
             request
                 .messages
                 .push(me_core::ai::AiWireMessage::Assistant {
@@ -2087,6 +2148,23 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 phase = Phase::Final;
                 request.messages.push(me_core::ai::AiWireMessage::User {
                     content: "好，请直接回答用户。".to_string(),
+                });
+            } else if phase == Phase::Plan && plan_submit_rejections >= MAX_PLAN_SUBMIT_REJECTIONS {
+                // 模型连续两次交不出合格的清单：别再等它了。
+                //
+                // 每多等一轮就是多一次模型往返，而请求密度顶上去会撞 429，
+                // 整轮对话就白费了——2026-11-07 的两次真实对话都是这样结束的，
+                // 而模型其实已经查到了 20 封邮件。
+                //
+                // 这里合成一份最简清单继续：清单不完美，总比整轮失败好。
+                plan = Some(synthetic_plan());
+                phase = Phase::Execute;
+                error_text = Some("模型未能提交合格的清单，已按单步处理".to_string());
+                request.messages.push(me_core::ai::AiWireMessage::User {
+                    content:
+                        "清单校验连续未通过，已由引擎代建一份清单。请直接调用工具完成用户的请求，\
+最后按 [结果] 格式给出答复。"
+                            .to_string(),
                 });
             }
 

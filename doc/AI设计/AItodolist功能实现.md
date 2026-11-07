@@ -458,17 +458,31 @@ PLAN 阶段发出的请求里，`tools` 只有两个：
 // me-core/src/ai.rs
 /// PLAN 阶段只下发「建计划」与「显式豁免」两个工具。
 /// **不经 `AiToolPermissions` 过滤**：它们是引擎机制，不是用户可关的能力。
-pub fn plan_phase_tool_specs() -> Vec<AiToolSpec> {
+pub fn plan_phase_tool_specs(permissions: &AiToolPermissions) -> Vec<AiToolSpec> {
     TOOL_SPECS
         .iter()
         .filter(|s| matches!(s.name, AiToolName::PlanSubmit | AiToolName::AnswerDirectly))
         .cloned()
+        .map(|mut spec| {
+            // 把业务工具的参数名写进 plan_submit 的 args 说明。
+            if spec.name == AiToolName::PlanSubmit {
+                spec.input_schema = with_arg_reference(spec.input_schema, &reference);
+            }
+            spec
+        })
         .collect()
 }
 ```
 
 这样模型在物理上没有 `email_search` 可调——它想查邮件，就必须先说要查什么。
 这是整个方案里最关键的一处设计：**用「你能做什么」代替「你应该做什么」**。
+
+**代价与补偿（2026-11-07 事故后加）**：正因为业务工具的 schema 这一轮没发给模型，
+模型在 `plan_submit` 的 `args` 里写参数名时**只能猜**——真实事故里它猜了
+`date_from`（真名 `after`）、`count`（`mail_read` 没有这个参数），
+连续 5 次 `plan_submit` 全被拒。所以 `plan_submit` 的 `args` 说明里必须附上
+各业务工具的参数表（由 `TOOL_SPECS` 现算，不手抄）。详见
+[《AI限流事故复盘》](./AI限流事故复盘.md)。
 
 两处必须同步的细节：
 
@@ -1096,6 +1110,8 @@ fn system_prompt_does_not_hardcode_a_particular_requirement() {
 | --- | --- | --- |
 | 没建清单 | 首轮只下发 `plan_submit` / `answer_directly` | 第一次业务调用前必有 4–5 步清单 |
 | 6 次同参数报错 | `InvalidArgs` 不重试 + 指纹熔断 + 计划期参数校验 | 同参数只真正执行 1 次，第 2 次被拦下并给具体修法，第 3 次判该步失败 |
+| 计划参数「差一点就对了」 | 参数宽容修复（`ai_plan::repair_plan_step`）+ PLAN 阶段下发参数表 | 改参数名、按工具名反推 capability、判据名兜底等自动改对；**猜不出的才报错**（静默丢参数会让检索悄悄变味） |
+| 连续交不出清单 | PLAN 拒绝闸门（连续 2 次被拒 → 引擎代建清单） | 不会卡在 PLAN 阶段空转；清单不完美，总比整轮失败好 |
 | 2 次「未找到」后继续乱试 | `on_empty` 策略 | 第 3 步 0 命中 → 自动放宽一档（或问用户） |
 | 空回复 | 空正文守卫 + 兜底摘要 | 界面必有内容；`error` 非空可追溯 |
 | **需求被误解** | **判据可见 + 每条结果标注命中判据** | **用户第一眼就能看出「你把重要理解成了什么」，当场纠正** |

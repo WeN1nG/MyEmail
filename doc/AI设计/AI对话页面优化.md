@@ -1246,6 +1246,7 @@ Anthropic 签名透传是**解锁一个端点类别**。如果用户主要用 Cl
 | 2026-11-07 | 初版。基于当前代码实测盘点 D1–D6 六个缺陷，提出四区块 `TurnView` 渲染器、思考双通道流式、schema v8 |
 | 2026-11-07 | 实施完成（6 次提交，792 → 821），补 §13 实施状态、七处偏差与未做项 |
 | 2026-11-07 | 审查修正（9 处）。A1 删除「Anthropic 无工具调用 ✅」这一不存在的路径，Anthropic 整体改列 P2；A2 `render_turn` 改为接 `TurnCtx` 而非 `&mut UiState`（原签名自引用借用冲突，编译不过）；A3 `status = Running` 改为 UI 侧 `LiveTool`（不污染持久化枚举）；B1 补上「数据库流式占位行会被渲染成第二个气泡」这一半；B2 `AiToolCompleted` 补 `step_id` / `attempt`；B3 `thinking` 列改存 `ThinkingBlock` 对象以带上 `truncated`；B4 `AiStreamDelta` 补 `segment` 让流式期间能分段；B5 变更清单补上删除 `show_cards` / `state.ai.cards` / `state.ai.activity`；C1–C8 修正注释理由、补齐迁移实现、补 trait 签名与 `map_message`、补字面量成本、同步 `AiToolTrace` 注释、把 `../crates` 改为 `../../crates` |
+| 2026-11-07 | 限流事故修复（见 [《AI限流事故复盘》](./AI限流事故复盘.md)）。同一条提问连跑两次都因 HTTP 429 失败，而模型两次都已查到 20 封邮件。根因是 PLAN 阶段模型看不到业务工具参数表 → `plan_submit` 连续 5 次被拒 → 请求密度顶到限流线。修四处：PLAN 阶段下发参数表、参数宽容修复、PLAN 拒绝闸门、请求间隔 + 429 退避重试 |
 
 ---
 

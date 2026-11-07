@@ -1777,8 +1777,15 @@ days / folder / unread_only / flagged_only / has_attachment",
             .ok_or_else(|| CoreError::validation("缺少 steps（计划步骤数组）"))?;
 
         let mut steps = Vec::with_capacity(raw_steps.len());
+        // 先按「宽容」解析：模型偶尔会漏字段或写错字段名，
+        // 这些都能从上下文唯一确定，直接补上，别为此浪费一整轮。
+        let mut repairs: Vec<String> = Vec::new();
         for item in raw_steps {
-            steps.push(plan_step_v2_from_json(item)?);
+            let mut step = plan_step_v2_from_json(item)?;
+            for repair in me_core::ai_plan::repair_plan_step(&mut step) {
+                repairs.push(repair.note);
+            }
+            steps.push(step);
         }
 
         let now = now_unix();
@@ -1798,10 +1805,16 @@ days / folder / unread_only / flagged_only / has_attachment",
         let summary = next.summary_line();
         *plan = Some(next.clone());
 
+        // 改过的地方要告诉模型：否则它下轮还会写错同样的参数。
+        let repairs = if repairs.is_empty() {
+            String::new()
+        } else {
+            format!("（已自动修正：{}）", repairs.join("；"))
+        };
         Ok((
             format!(
                 "计划已收到（{} 步）。现在逐步执行：每完成一步就用 plan_update 把该步标成 \
-done/failed/skipped 并写一句 evidence（拿到了什么）。{summary}",
+done/failed/skipped 并写一句 evidence（拿到了什么）。{summary}{repairs}",
                 next.steps.len()
             ),
             summary,
@@ -1951,15 +1964,13 @@ fn plan_step_v2_from_json(value: &Value) -> Result<PlanStep, CoreError> {
     // 2026-11-07 的事故：模型为了一步 reason 连续改了 4 次 capability
     // （试过省略、试过空串、试过整步改成 tool），4 次工具往返全废在参数上。
     // 这里对非工具步放宽：缺失或非法都记成 `general`。
+    //
+    // 工具步缺 `capability` 也不在这里报错：`repair_plan_step` 会按工具名
+    // 反推出来（工具与能力模块一一对应，让模型再填一遍纯属多余）。
     let capability = match value.get("capability").and_then(Value::as_str) {
         Some(text) => Capability::parse(text.trim()).unwrap_or(Capability::General),
         None => Capability::General,
     };
-    if kind.is_tool() && capability == Capability::General {
-        return Err(CoreError::validation(format!(
-            "第 {id} 步是工具步，必须写 capability：mail / weather / calendar / music"
-        )));
-    }
 
     let tool = match value.get("tool").and_then(Value::as_str) {
         Some(name) if !name.trim().is_empty() => {
@@ -2323,10 +2334,16 @@ mod tests {
         assert_eq!(step.capability, Capability::General);
     }
 
-    /// 工具步**仍然**必须写 capability：它是「这一步要调哪个模块的工具」的依据，
-    /// 放宽到推理步就够了，工具步不能一起放。
+    /// 工具步**不再**要求模型自己写 capability：引擎按工具名反推。
+    ///
+    /// 工具与能力模块是一一对应的（`email_search` → 邮件、`weather_get` → 天气），
+    /// 让模型再填一遍纯属多余——而且它会填错。
+    ///
+    /// 2026-11-07 的事故：模型为了一步 `reason` 的 capability 连改 4 次
+    /// （省略 / 空串 / 改成 tool 步），4 次工具往返全废在参数上。
+    /// 工具步的 capability 现在同样由引擎推导，模型不必猜。
     #[test]
-    fn tool_step_still_requires_capability() {
+    fn tool_step_capability_is_inferred_from_the_tool() {
         let value = serde_json::json!({
             "id": 1,
             "title": "检索近 7 天邮件",
@@ -2335,11 +2352,13 @@ mod tests {
             "args": {"days": 7},
             "expect": "拿到邮件列表",
         });
-        let err = plan_step_v2_from_json(&value).expect_err("工具步缺 capability 应报错");
+        let mut step = plan_step_v2_from_json(&value).expect("不该报错");
+        assert_eq!(step.capability, Capability::General, "解析阶段不猜");
+        let repairs = me_core::ai_plan::repair_plan_step(&mut step);
+        assert_eq!(step.capability, Capability::Mail, "按工具名反推成邮件");
         assert!(
-            err.user_message().contains("capability"),
-            "错误信息要点名 capability：{}",
-            err.user_message()
+            repairs.iter().any(|r| r.note.contains("capability")),
+            "补 capability 要有说明：{repairs:?}"
         );
     }
 

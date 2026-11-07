@@ -35,6 +35,50 @@ const MAX_ERROR_BODY: usize = 8 * 1024;
 /// Anthropic 要求固定版本头。
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// 遇到 429（请求过于频繁）时的退避间隔。
+///
+/// 429 是**服务端在说「你太快了」**，不是请求本身有问题。工具循环里
+/// 每一轮都是一次新的模型请求，密集请求很容易撞上限流——
+/// 2026-11-07 的两次真实对话就是这么收场的：前几轮因为参数写错反复重试，
+/// 请求密度顶上去，后面的请求全被 429 打掉，整轮失败。
+///
+/// 退避后重试而不是直接失败：请求还没被处理，重发是安全的。
+const RATE_LIMIT_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(12),
+];
+
+/// 退避表；测试会把它换成毫秒级的。
+///
+/// 抽成静态而不是常量：集成测试要跑「一直限流」那条路径，
+/// 真等 19 秒太慢了。**只给测试用**，生产值固定。
+static RATE_LIMIT_BACKOFF_SLOTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// 读当前的退避表。生产走 [`RATE_LIMIT_BACKOFF`]，测试可以覆盖。
+fn rate_limit_backoff() -> Vec<Duration> {
+    let overridden = RATE_LIMIT_BACKOFF_SLOTS
+        .iter()
+        .map(|slot| slot.load(std::sync::atomic::Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    if overridden.iter().all(|value| *value > 0) {
+        return overridden.into_iter().map(Duration::from_millis).collect();
+    }
+    RATE_LIMIT_BACKOFF.to_vec()
+}
+
+/// 把退避表换成毫秒级。**只给测试用**。
+///
+/// 放在 `#[doc(hidden)]` 的公开函数里，是因为集成测试是独立的 crate，
+/// 摸不到模块内部的私有状态。
+#[doc(hidden)]
+pub fn override_rate_limit_backoff(millis: [u64; 3]) {
+    for (slot, value) in RATE_LIMIT_BACKOFF_SLOTS.iter().zip(millis) {
+        slot.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// 生产实现。一个实例可同时服务两种协议：按 `config.kind` 分支。
 #[derive(Clone)]
 pub struct HttpAiProvider {
@@ -583,31 +627,36 @@ async fn stream_turn(
     cancel: CancelFlag,
 ) -> Result<AiTurnResult, CoreError> {
     let url = endpoint(&request.config)?;
-    let mut builder = client
-        .post(&url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream");
 
-    match request.config.kind {
-        AiProviderKind::Anthropic => {
-            let credential = request.credential.as_ref().ok_or_else(|| {
-                CoreError::ai(
-                    AiErrorKind::Config,
-                    None::<String>,
-                    "尚未配置 Anthropic API Key",
-                )
-            })?;
-            builder = builder
-                .header("x-api-key", credential.expose())
-                .header("anthropic-version", ANTHROPIC_VERSION);
-        }
-        AiProviderKind::OpenAiCompatible => {
-            if let Some(credential) = request.credential.as_ref() {
-                builder =
-                    builder.header("authorization", format!("Bearer {}", credential.expose()));
+    // 每次发请求都要重建 builder：`RequestBuilder` 不支持 clone，
+    // 而 429 退避后要重发同一个请求。
+    let build = || -> Result<reqwest::RequestBuilder, CoreError> {
+        let mut builder = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        match request.config.kind {
+            AiProviderKind::Anthropic => {
+                let credential = request.credential.as_ref().ok_or_else(|| {
+                    CoreError::ai(
+                        AiErrorKind::Config,
+                        None::<String>,
+                        "尚未配置 Anthropic API Key",
+                    )
+                })?;
+                builder = builder
+                    .header("x-api-key", credential.expose())
+                    .header("anthropic-version", ANTHROPIC_VERSION);
+            }
+            AiProviderKind::OpenAiCompatible => {
+                if let Some(credential) = request.credential.as_ref() {
+                    builder =
+                        builder.header("authorization", format!("Bearer {}", credential.expose()));
+                }
             }
         }
-    }
+        Ok(builder)
+    };
 
     let body = match request.config.kind {
         AiProviderKind::Anthropic => anthropic_body(&request),
@@ -616,7 +665,46 @@ async fn stream_turn(
 
     let payload = serde_json::to_vec(&body)
         .map_err(|_| CoreError::ai(AiErrorKind::Protocol, None::<String>, "AI 请求体无法序列化"))?;
-    let response = builder.body(payload).send().await.map_err(map_transport)?;
+
+    // 429（请求过于频繁）退避后重试。
+    //
+    // 请求还没被服务端处理，重发是安全的；而直接失败会让整轮对话白费——
+    // 前面的工具调用、已经拿到的结果全都没了。
+    //
+    // 退避次数用完仍被限流，才把错误抛给上层。
+    let backoff = rate_limit_backoff();
+    let mut response = None;
+    for attempt in 0..=backoff.len() {
+        cancel.check()?;
+        let sent = build()?
+            .body(payload.clone())
+            .send()
+            .await
+            .map_err(map_transport)?;
+        let status = sent.status();
+        if status.as_u16() != 429 {
+            response = Some(sent);
+            break;
+        }
+        // 读掉响应体，否则连接不会释放。
+        let _ = sent.bytes().await;
+        let Some(backoff) = backoff.get(attempt) else {
+            // 退避用完仍然 429：按限流失败返回。
+            return Err(CoreError::ai(
+                AiErrorKind::RateLimited,
+                Some("429"),
+                "请求过于频繁",
+            ));
+        };
+        tokio::time::sleep(*backoff).await;
+    }
+    let Some(response) = response else {
+        return Err(CoreError::ai(
+            AiErrorKind::RateLimited,
+            Some("429"),
+            "请求过于频繁",
+        ));
+    };
     let status = response.status();
     if !status.is_success() {
         let bytes = response.bytes().await.unwrap_or_default();

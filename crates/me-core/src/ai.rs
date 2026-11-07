@@ -2165,7 +2165,8 @@ pub fn tool_specs(permissions: &AiToolPermissions) -> Vec<AiToolSpec> {
 /// 这是「强制清单」唯一真正可靠的实现方式：模型物理上没有 `email_search` 可调，
 /// 它想查邮件就必须先说要查什么。**不经 [`AiToolPermissions`] 过滤**——
 /// 它们是引擎机制，不是用户可以关掉的能力。
-pub fn plan_phase_tool_specs() -> Vec<AiToolSpec> {
+pub fn plan_phase_tool_specs(permissions: &AiToolPermissions) -> Vec<AiToolSpec> {
+    let reference = tool_argument_reference(permissions);
     TOOL_SPECS
         .iter()
         .filter(|spec| {
@@ -2175,7 +2176,105 @@ pub fn plan_phase_tool_specs() -> Vec<AiToolSpec> {
             )
         })
         .cloned()
+        .map(|mut spec| {
+            if spec.name == AiToolName::PlanSubmit {
+                spec.input_schema = with_arg_reference(spec.input_schema, &reference);
+            }
+            spec
+        })
         .collect()
+}
+
+/// 各业务工具的参数白名单（给 PLAN 阶段的模型看）。
+///
+/// PLAN 阶段只下发 `plan_submit` / `answer_directly`——这是「强制清单」的
+/// 物理约束：模型手上没有业务工具，想查邮件就必须先说要查什么。
+///
+/// 代价是模型**看不到** `email_search` 等工具的 schema，却要在 `plan_submit`
+/// 的 `args` 里写出它们的参数名。看不到就只能猜。
+///
+/// 2026-11-07 的真实事故：模型连续 5 次 `plan_submit` 被拒，猜错的名字有
+/// `date_from`（真名是 `after`）、`count`（`mail_read` 根本没有这个参数）、
+/// `description`（`criteria` 里不认这个条件键）。每一次被拒都是一次模型往返，
+/// 5 次往返把请求密度顶到限流线上，最后整轮以 429 收场。
+///
+/// 白名单从 `TOOL_SPECS` 现算，不手抄：手抄的清单必然和 schema 漂移。
+pub fn tool_argument_reference(permissions: &AiToolPermissions) -> String {
+    let mut out = String::new();
+    for spec in TOOL_SPECS.iter() {
+        if spec.name.is_bookkeeping() || !permissions.enabled(spec.name) {
+            continue;
+        }
+        let Some(props) = spec
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let mut names: Vec<&str> = props
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != "motive")
+            .collect();
+        names.sort_unstable();
+        if names.is_empty() {
+            out.push_str(&format!("- {}：没有参数\n", spec.name.as_str()));
+            continue;
+        }
+        out.push_str(&format!(
+            "- {}：{}\n",
+            spec.name.as_str(),
+            names.join(" / ")
+        ));
+        if let Some(required) = spec.input_schema.get("required").and_then(Value::as_array) {
+            let mut required: Vec<&str> = required
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|key| *key != "motive")
+                .collect();
+            if !required.is_empty() {
+                required.sort_unstable();
+                out.push_str(&format!("  必填：{}\n", required.join(" / ")));
+            }
+        }
+        // 嵌套的对象数组（如 `email_search` 的 `criteria`）也要说明，
+        // 否则模型会自己编子字段名（事故里它写了 `description`）。
+        for (key, schema) in props {
+            let Some(items) = schema
+                .get("items")
+                .and_then(|value| value.get("properties"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            let mut sub: Vec<&str> = items.keys().map(String::as_str).collect();
+            sub.sort_unstable();
+            out.push_str(&format!(
+                "  {key} 是数组，每项的键只能是：{}\n",
+                sub.join(" / ")
+            ));
+        }
+    }
+    out
+}
+
+/// 把参数白名单塞进 `plan_submit` 的 `args` 字段说明里。
+///
+/// 只改 `args` 这一处：`args` 是模型唯一需要「查表」的地方——`tool` 写什么
+/// 决定用哪张表，而表的内容就在 `args` 的说明里，改一处就够。
+fn with_arg_reference(mut schema: Value, reference: &str) -> Value {
+    let Some(slot) = schema.pointer_mut("/properties/steps/items/properties/args/description")
+    else {
+        return schema;
+    };
+    let Some(text) = slot.as_str().map(str::to_owned) else {
+        return schema;
+    };
+    *slot = Value::String(format!(
+        "{text}\n\n参数名只能从下面这张表里选，写错的名字会让**整份计划**被拒：\n{reference}"
+    ));
+    schema
 }
 
 /// EXECUTE / REFLECT / FINAL 阶段下发的工具：能力工具 + `plan_update`。
@@ -2221,6 +2320,54 @@ pub fn tool_argument_names(tool: AiToolName) -> Option<Vec<String>> {
             .cloned()
             .collect(),
     )
+}
+
+/// 参数名的常见别名 → 正确名。
+///
+/// 只在「正确名确实是该工具的合法参数、且别名本身不合法」时才替换，
+/// 所以 `keyword`（`calendar_list` 的合法参数）不会被误改成 `query`。
+///
+/// 2026-11-07 的事故：模型给 `email_search` 写 `date_from`，
+/// 整份计划被拒，它接着又改了 4 次参数名，每改一次都是一次模型往返。
+const ARGUMENT_ALIASES: &[(&str, &str)] = &[
+    ("date_from", "after"),
+    ("date_to", "before"),
+    ("since", "after"),
+    ("until", "before"),
+    ("count", "limit"),
+    ("max_count", "limit"),
+    ("keyword", "query"),
+    ("text", "query"),
+    ("title", "subject"),
+    ("message", "message_id"),
+];
+
+/// 把模型写错的参数名换成正确名。**不适用就返回 `None`**。
+///
+/// 值类型也要对得上：日期类别名只接字符串，条数类只接数字——
+/// `since: 7`（7 天）与 `since: "2026-01-01"`（起始日期）含义完全不同，
+/// 换错了比不换更糟。
+pub fn tool_argument_alias(tool: AiToolName, key: &str, value: &Value) -> Option<&'static str> {
+    let names = tool_argument_names(tool)?;
+    // 别名本身合法 → 它就是对的，别动。
+    if names.iter().any(|name| name == key) {
+        return None;
+    }
+    let (_, target) = ARGUMENT_ALIASES.iter().find(|(alias, _)| *alias == key)?;
+    let target = *target;
+    if !names.iter().any(|name| name == target) {
+        return None;
+    }
+    let date_like = matches!(target, "after" | "before" | "message_id");
+    let number_like = matches!(target, "limit");
+    let ok = if date_like {
+        value.is_string()
+    } else if number_like {
+        value.is_number()
+    } else {
+        value.is_string()
+    };
+    ok.then_some(target)
 }
 
 // ---------------------------------------------------------------------------
@@ -2352,6 +2499,92 @@ pub trait AiMemoryRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PLAN 阶段必须把业务工具的参数名告诉模型。
+    ///
+    /// 2026-11-07 的事故：PLAN 阶段只下发 `plan_submit` / `answer_directly`，
+    /// 模型看不到 `email_search` 的 schema，却要在 `plan_submit` 的 `args` 里
+    /// 写它的参数名——它只能猜。猜了 `date_from`、`count`、`description`，
+    /// 连续 5 次 `plan_submit` 全被拒，5 次模型往返把请求密度顶到限流线上，
+    /// 整轮以 429 收场。
+    ///
+    /// 这条断言把「参数表随 `plan_submit` 一起下发」钉死。
+    #[test]
+    fn plan_phase_carries_the_business_tool_parameter_table() {
+        let permissions = AiToolPermissions::default();
+        let specs = plan_phase_tool_specs(&permissions);
+        let submit = specs
+            .iter()
+            .find(|spec| spec.name == AiToolName::PlanSubmit)
+            .expect("PLAN 阶段必须下发 plan_submit");
+
+        let description = submit
+            .input_schema
+            .pointer("/properties/steps/items/properties/args/description")
+            .and_then(Value::as_str)
+            .expect("args 要有说明");
+        for needle in ["email_search", "days", "after", "unread_only"] {
+            assert!(
+                description.contains(needle),
+                "参数表里要能看到 {needle}：{description}"
+            );
+        }
+        // 判据是嵌套结构，模型看不到它就会自己编字段名（事故里写了 description）。
+        assert!(
+            description.contains("has_attachment"),
+            "判据的可写键也要列出来：{description}"
+        );
+    }
+
+    /// 关掉的能力不该出现在参数表里——那会让模型去规划一个用不了的工具。
+    #[test]
+    fn parameter_table_only_lists_enabled_tools() {
+        let permissions = AiToolPermissions {
+            email_search: false,
+            ..AiToolPermissions::default()
+        };
+        let specs = plan_phase_tool_specs(&permissions);
+        let submit = specs
+            .iter()
+            .find(|spec| spec.name == AiToolName::PlanSubmit)
+            .expect("PLAN 阶段必须下发 plan_submit");
+        let description = submit
+            .input_schema
+            .pointer("/properties/steps/items/properties/args/description")
+            .and_then(Value::as_str)
+            .expect("args 要有说明");
+        assert!(
+            !description.contains("email_search"),
+            "关掉的工具不该出现在参数表里：{description}"
+        );
+    }
+
+    /// 参数别名的映射要守规矩：只在「正确名合法、别名不合法」时才换。
+    ///
+    /// `keyword` 对 `calendar_list` 是合法参数名，换成 `query` 就把它的意思改了。
+    #[test]
+    fn argument_alias_only_applies_when_the_target_is_valid() {
+        // date_from → after：email_search 认 after，不认 date_from。
+        assert_eq!(
+            tool_argument_alias(AiToolName::EmailSearch, "date_from", &json!("2026-10-01")),
+            Some("after")
+        );
+        // keyword 对 calendar_list 本来就合法，不能动。
+        assert_eq!(
+            tool_argument_alias(AiToolName::CalendarList, "keyword", &json!("报价")),
+            None
+        );
+        // 认不出的名字不猜。
+        assert_eq!(
+            tool_argument_alias(AiToolName::EmailSearch, "nonsense", &json!("x")),
+            None
+        );
+        // 类型对不上不换：since 是 7（天）还是 "2026-01-01"（日期）含义完全不同。
+        assert_eq!(
+            tool_argument_alias(AiToolName::EmailSearch, "since", &json!(7)),
+            None
+        );
+    }
 
     /// 提示词不能再给「跳过清单」留合法出口。
     ///
