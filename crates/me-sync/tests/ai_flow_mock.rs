@@ -1126,6 +1126,154 @@ async fn email_search_without_any_condition_lists_them_all() {
     }
 }
 
+/// 同参数 + 校验类错误，第二次起不再真正执行。
+///
+/// 那次事故的形态：模型连发 8 次 `email_search`，6 次拿到同一个「至少需要一个检索条件」。
+/// 关键点是**只改 `motive` 不算改参数**——指纹剔除了 `motive` 与 `step_id`。
+#[tokio::test]
+async fn same_args_after_validation_error_is_not_retried() {
+    let (_dir, store) = open();
+    // 三个调用参数完全一致，只有 id 与 motive 不同（模拟「换个说法再来一次」）。
+    let call = |id: &str, motive: &str| {
+        tool_call(
+            id,
+            AiToolName::EmailSearch,
+            json!({ "motive": motive, "limit": 5 }),
+        )
+    };
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(call("c1", "查重要邮件")),
+        Turn::with_tool(call("c2", "查看重要邮件，未读优先")),
+        Turn::with_tool(call("c3", "再查一次")),
+        Turn::text("我没查到，需要你给个更具体的条件。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+
+    commands
+        .send(Command::CreateAiConversation { model: None })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiConversationsChanged)
+    })
+    .await;
+    let conversation = latest_conversation(&store);
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let mut completed = Vec::new();
+    for _ in 0..3 {
+        let event = wait_for(&mut rx, |event| {
+            matches!(event, Event::AiToolCompleted { .. })
+        })
+        .await;
+        let Event::AiToolCompleted {
+            summary, status, ..
+        } = event
+        else {
+            panic!("期望工具完成事件");
+        };
+        completed.push((summary, status));
+    }
+
+    assert_eq!(completed.len(), 3);
+    assert!(
+        completed[0].0.contains("至少需要一个检索条件"),
+        "第一次应当真的执行并拿到校验错误，实际：{}",
+        completed[0].0
+    );
+    for (index, (summary, status)) in completed.iter().enumerate().skip(1) {
+        assert_eq!(
+            *status,
+            me_core::ai::AiToolStatus::Error,
+            "被拦下的调用仍然要记成 error"
+        );
+        assert_eq!(
+            summary,
+            "相同参数已失败过，未执行",
+            "第 {} 次应当被熔断拦下，实际：{summary}",
+            index + 1
+        );
+    }
+    // 三次里只有第一次真的进了工具实现，其余两次是纯内存拦截。
+    let executed = completed
+        .iter()
+        .filter(|(summary, _)| summary != "相同参数已失败过，未执行")
+        .count();
+    assert_eq!(executed, 1, "同参数只应真正执行一次");
+}
+
+/// 参数**真的变了**就必须放行：熔断不能把「换个条件再试」也一起挡掉。
+#[tokio::test]
+async fn changed_args_are_not_blocked_by_the_circuit_breaker() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        // 第一次无条件 → 失败并被记入熔断表。
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "先查一次", "limit": 5 }),
+        )),
+        // 换了参数（时间窗）→ 必须放行，锁表只认「完全相同的参数」。
+        Turn::with_tool(tool_call(
+            "c2",
+            AiToolName::EmailSearch,
+            json!({ "motive": "换时间窗再查", "days": 30 }),
+        )),
+        Turn::text("两次都查完了。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+
+    commands
+        .send(Command::CreateAiConversation { model: None })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiConversationsChanged)
+    })
+    .await;
+    let conversation = latest_conversation(&store);
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "找报价单".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let mut summaries = Vec::new();
+    for _ in 0..2 {
+        let event = wait_for(&mut rx, |event| {
+            matches!(event, Event::AiToolCompleted { .. })
+        })
+        .await;
+        let Event::AiToolCompleted { summary, .. } = event else {
+            panic!("期望工具完成事件");
+        };
+        summaries.push(summary);
+    }
+    assert!(
+        summaries[0].contains("至少需要一个检索条件"),
+        "第一次应当失败并进入熔断表，实际：{}",
+        summaries[0]
+    );
+    assert_ne!(
+        summaries[1], "相同参数已失败过，未执行",
+        "参数变了就必须放行，实际：{}",
+        summaries[1]
+    );
+    assert!(
+        summaries[1].contains("0 命中"),
+        "第二次是真的执行了（时间窗合法、库里没有邮件），实际：{}",
+        summaries[1]
+    );
+}
+
 /// 动机要随事件一起发出来：界面在工具**执行中**就要能显示「为什么调它」。
 #[tokio::test]
 async fn tool_events_carry_motive() {

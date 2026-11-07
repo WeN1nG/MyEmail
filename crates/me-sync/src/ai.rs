@@ -1209,6 +1209,39 @@ where
 
             let mut results: Vec<AiToolResult> = Vec::new();
             for call in &turn.tool_calls {
+                // 动机在**执行前**就要发出去：界面靠它解释「为什么现在调这个工具」。
+                let (motive, motive_source) = me_core::ai::tool_motive(&call.arguments);
+
+                // 同参数 + 不可重试错误已经失败过：不再执行，直接回灌「换个参数」。
+                // 必须放在 `executed_calls` 计数之前——被拦下的调用没有产生任何 IO，
+                // 不该消耗那 24 次预算；否则模型连撞几次就把预算烧光了。
+                if let Some(previous) = budget.previous_failure(call).map(str::to_string) {
+                    self.emit(Event::AiToolStarted {
+                        conversation,
+                        call_id: call.id.clone(),
+                        tool: call.name,
+                        motive: motive.clone(),
+                        motive_source,
+                    })
+                    .await;
+                    let result =
+                        crate::ai_tools::intercepted_result(call, motive, motive_source, &previous);
+                    self.emit(Event::AiToolCompleted {
+                        conversation,
+                        call_id: result.call_id.clone(),
+                        tool: result.tool,
+                        status: result.trace.status,
+                        summary: result.trace.summary.clone(),
+                        duration_ms: result.trace.duration_ms,
+                        motive: result.trace.motive.clone(),
+                        motive_source: result.trace.motive_source,
+                    })
+                    .await;
+                    traces.push(result.trace.clone());
+                    results.push(result);
+                    continue;
+                }
+
                 // 清单维护不算「干活」：否则一份 6 步清单光更新状态就要吃掉一半预算。
                 // 轮次仍然受限，所以它不能被用来无限刷。
                 if !call.name.is_bookkeeping() {
@@ -1219,8 +1252,6 @@ where
                     }
                     executed_calls += 1;
                 }
-                // 动机在**执行前**就要发出去：界面靠它解释「为什么现在调这个工具」。
-                let (motive, motive_source) = me_core::ai::tool_motive(&call.arguments);
                 self.emit(Event::AiToolStarted {
                     conversation,
                     call_id: call.id.clone(),

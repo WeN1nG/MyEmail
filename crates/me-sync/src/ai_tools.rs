@@ -7,13 +7,14 @@
 //!
 //! 工具结果只给模型**必要摘要**：不返回完整正文、附件、原始 JSON。
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
 use me_core::ai::{
     AiEntityKind, AiEntitySource, AiToolCall, AiToolName, AiToolPermissions, AiToolResult,
-    AiToolStatus, AiToolTrace, MAX_BODY_CHARS, MAX_TOOL_RESULT_CHARS, NewAiEntity, tool_motive,
-    truncate_chars,
+    AiToolStatus, AiToolTrace, MAX_BODY_CHARS, MAX_TOOL_RESULT_CHARS, MotiveSource, NewAiEntity,
+    tool_motive, truncate_chars,
 };
 use me_core::ai_plan::{Capability, Plan, PlanStatus, PlanStep, validate_plan};
 use me_core::calendar::{CalendarEventDraft, CalendarSeries};
@@ -34,6 +35,12 @@ pub(crate) struct ToolBudget {
     pub calendar_read: u32,
     pub mail_read: u32,
     pub memory: u32,
+    /// 本轮**不可重试**失败的调用指纹 → 错误摘要。
+    ///
+    /// 只记 `!err.is_retryable()` 的失败：网络抖动、超时本来就该重试，
+    /// 而参数/权限类错误，参数不变结果就不会变。`Validation` 重发一次是空转，
+    /// 重发八次就是那次「有什么重要的邮件」的真实事故（8 次调用里 6 次同一报错）。
+    pub failed: HashMap<String, String>,
     /// 执行期也要按它拦一次：模型可能返回一个本轮**没下发**的工具名，
     /// 而在协议层这类名字仍然合法（白名单固定）。
     pub permissions: AiToolPermissions,
@@ -43,6 +50,69 @@ pub(crate) struct ToolBudget {
     /// 又白吃一次工具预算。只存 id 而不是整份 `AiContextRef`——后者带正文快照，
     /// 每轮克隆几千字符没有任何收益。
     pub context_refs: Vec<MessageId>,
+}
+
+/// 「工具 + 业务参数」的指纹。
+///
+/// 剔除 `motive` 与 `step_id`：它们只说明「为什么调」，不改变「查什么」。
+/// 模型换个说法重发同一份参数时 `motive` 会变，但语义完全一样——那正是要拦下的情况。
+///
+/// `serde_json::Value` 的对象在未启用 `preserve_order` 时是 `BTreeMap`，
+/// 键天然有序，所以同一份参数永远得到同一个字符串。
+fn attempt_fingerprint(call: &AiToolCall) -> String {
+    let mut value = call.arguments.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.remove("motive");
+        object.remove("step_id");
+    }
+    format!("{}:{value}", call.name.as_str())
+}
+
+impl ToolBudget {
+    /// 记下这次不可重试的失败。同一指纹只留第一条错误，后面重复的没有新信息。
+    pub(crate) fn remember_failure(&mut self, call: &AiToolCall, error: &str) {
+        self.failed
+            .entry(attempt_fingerprint(call))
+            .or_insert_with(|| truncate_chars(error, 120));
+    }
+
+    /// 这次调用的参数是否已经失败过。返回上次的错误摘要。
+    pub(crate) fn previous_failure(&self, call: &AiToolCall) -> Option<&str> {
+        self.failed
+            .get(&attempt_fingerprint(call))
+            .map(String::as_str)
+    }
+}
+
+/// 同参数已失败过的调用：**不执行**，直接告诉模型「换参数或放弃」。
+///
+/// 界面上仍然发一对 Started/Completed 事件：用户要能看到「这次被拦下了」，
+/// 否则活动条会莫名其妙少一条，看起来像工具没被调用。
+pub(crate) fn intercepted_result(
+    call: &AiToolCall,
+    motive: Option<String>,
+    motive_source: MotiveSource,
+    previous: &str,
+) -> AiToolResult {
+    AiToolResult {
+        call_id: call.id.clone(),
+        tool: call.name,
+        content: format!(
+            "这次没有执行：你刚用完全相同的参数调用过，返回的是同一个错误「{previous}」。\
+必须改变参数（换关键词、放宽时间窗、去掉某个限定）或放弃这一步；\
+原样重发不会得到不同结果。"
+        ),
+        is_error: true,
+        trace: AiToolTrace {
+            call_id: call.id.clone(),
+            tool: call.name,
+            status: AiToolStatus::Error,
+            summary: "相同参数已失败过，未执行".to_string(),
+            duration_ms: 0,
+            motive,
+            motive_source,
+        },
+    }
 }
 
 const CALENDAR_LIMIT: u32 = 5;
@@ -328,21 +398,29 @@ where
                     motive_source,
                 },
             },
-            Err(err) => AiToolResult {
-                call_id: call.id.clone(),
-                tool: call.name,
-                content: format!("工具执行失败：{}", err.user_message()),
-                is_error: true,
-                trace: AiToolTrace {
+            Err(err) => {
+                // 记住**不可重试**的失败：同参数再调一次结果不会变。
+                // 可重试的（网络、超时）不记，否则真的临时故障会被误伤成永久熔断。
+                let message = err.user_message();
+                if !err.is_retryable() {
+                    budget.remember_failure(call, &message);
+                }
+                AiToolResult {
                     call_id: call.id.clone(),
                     tool: call.name,
-                    status: AiToolStatus::Error,
-                    summary: err.user_message(),
-                    duration_ms,
-                    motive: motive.clone(),
-                    motive_source,
-                },
-            },
+                    content: format!("工具执行失败：{message}"),
+                    is_error: true,
+                    trace: AiToolTrace {
+                        call_id: call.id.clone(),
+                        tool: call.name,
+                        status: AiToolStatus::Error,
+                        summary: message,
+                        duration_ms,
+                        motive: motive.clone(),
+                        motive_source,
+                    },
+                }
+            }
         }
     }
 
