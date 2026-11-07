@@ -1244,4 +1244,49 @@ Anthropic 签名透传是**解锁一个端点类别**。如果用户主要用 Cl
 | 日期 | 内容 |
 | --- | --- |
 | 2026-11-07 | 初版。基于当前代码实测盘点 D1–D6 六个缺陷，提出四区块 `TurnView` 渲染器、思考双通道流式、schema v8 |
+| 2026-11-07 | 实施完成（6 次提交，792 → 821），补 §13 实施状态、七处偏差与未做项 |
 | 2026-11-07 | 审查修正（9 处）。A1 删除「Anthropic 无工具调用 ✅」这一不存在的路径，Anthropic 整体改列 P2；A2 `render_turn` 改为接 `TurnCtx` 而非 `&mut UiState`（原签名自引用借用冲突，编译不过）；A3 `status = Running` 改为 UI 侧 `LiveTool`（不污染持久化枚举）；B1 补上「数据库流式占位行会被渲染成第二个气泡」这一半；B2 `AiToolCompleted` 补 `step_id` / `attempt`；B3 `thinking` 列改存 `ThinkingBlock` 对象以带上 `truncated`；B4 `AiStreamDelta` 补 `segment` 让流式期间能分段；B5 变更清单补上删除 `show_cards` / `state.ai.cards` / `state.ai.activity`；C1–C8 修正注释理由、补齐迁移实现、补 trait 签名与 `map_message`、补字面量成本、同步 `AiToolTrace` 注释、把 `../crates` 改为 `../../crates` |
+
+---
+
+## 13. 实施状态（2026-11-07）
+
+**已全部落地**：P0 五批 + 流式检查点，共 6 次提交。
+测试 **792 → 821 passed / 0 failed / 6 ignored**；`cargo fmt --check` 与
+`cargo clippy --workspace --all-targets -- -D warnings` 全通过。
+
+| 提交 | 内容 |
+| --- | --- |
+| `feb3a19` | 批次 1：`ThinkingBlock` / `AiMessage.thinking` / `AiToolTrace.cards` / `AiDelta::Thinking` / `AiDeltaKind` / schema v8 与 `migrate_v7_to_v8` / `finish_assistant_message` 加参数 |
+| `49dddb9` | 批次 2：`apply_openai` 认 `reasoning_content` / `reasoning`（v1 不动 Anthropic，见 A1） |
+| `ac5a14d` | 批次 3：`DeltaThrottle` 剥 seq + `flush()`；双通道共享 `AtomicU64`；`ThinkingAccumulator` 分段/截断；卡片随 trace 落库；`AiToolCompleted` 填真实步号 |
+| `b4d3fa9` | 批次 4+5：`TurnView` / `TurnCtx` / `render_turn` 四区统一渲染；`LiveTool`；流式 `thinking` 分桶；删除四处会话级渲染；修 `card_messages` |
+| `565c88b` | 检查点：`checkpoint_assistant_message` + 每轮写一次，抗中途崩溃 |
+
+### 13.1 与方案的偏差（都是实现期实测后调整的）
+
+| # | 方案 | 实际 | 理由 |
+| --- | --- | --- | --- |
+| 1 | `TurnView` 由「两个构造点」分别组装 | 统一持 `&AiMessage`，流式那条构造一份临时 `AiMessage` | `TurnView` 四块全是 assistant 语义，装不下 user 的 `context_refs`；保留独立 `show_user_message`，历史零拷贝借用，流式每帧只 clone 一次（§开发准备 E2/E3） |
+| 2 | 检查点 1s 节流 | **每轮模型返回后写一次** | 轮数上限就是 6，最多 6 次写比定时器写放大更小，却正好覆盖「长工具循环 + 中途断电」 |
+| 3 | 删除 `state.ai.activity` / `cards` | 两个都**保留** | 流式期间 `AiToolCompleted` 先于落库到达，没有内存位就显示不出刚调过什么；`cards` / `card_messages` 是 reader 打开邮件的摘要缓存（§开发准备 §2.3 ④、E11） |
+| 4 | `LiveTool` 在工具区显示 | 工具区有 live_tool 时**默认展开** | 默认折叠时「执行中…」藏在里面，等于没显示；测试 `live_tool_shows_while_running` 抓到了这一点 |
+| 5 | 未提 | 折叠区 `id_salt` 按 `message_id` 隔离 | egui 是 immediate mode，共用 salt 会让所有历史消息共享同一个折叠状态 |
+| 6 | 「沿用现有 `show_cards` 逻辑」 | 该逻辑是**坏的**：`card_messages` 从未被写入 | `reader.rs:32` 的回退分支永远命中不了 → 点卡片打开不在当前列表的邮件时阅读窗立刻关。顺手修了，并在 `refresh_ai_messages` 里补历史卡片摘要 |
+| 7 | 未提 | `AiCard` 删掉 `reason` / `from` / `date` | 命中理由现在随 `MailCardRef` 落在 trace 上，两边各存一份必然漂移 |
+
+### 13.2 明确未做（方案里就列为可选 / P2）
+
+- **流式 Markdown 节流**（P1 后半）：流式期间仍是纯文本直出，结束后解析一次并缓存。这是体验优化，不是硬要求；纯文本反而更稳。
+- **Anthropic 思考**（P2）：A1 已证明 PLAN 阶段恒下发两个工具 → 必然产生 `tool_use` → 同轮必须原样回传带 `signature` 的 thinking block，否则 400。v1 请求侧不开 thinking，服务端也不会返回 `thinking_delta`，所以只做响应侧 OpenAI 兼容解析。要解锁需先把 signature 从协议层透传到 `AiWireMessage::Assistant`。
+- **历史分页**（P2）：`list_messages_conn` 支持 `before` 游标，UI 仍是固定 200 条。需要先定交互（滚动到顶自动加载 vs 显式按钮）。
+- **过程叙述归块**（§10.2 未决 1）：工具调用前的「我先查一下」仍混在 `content` 里，出现在回答区顶部。彻底解决要引擎区分 `narration` / `answer` 两个字段。
+
+### 13.3 四条硬要求的落点
+
+| 要求 | 落点 |
+| --- | --- |
+| 四部分由上到下、没有就不显示 | `render_turn` 单点定顺序；每块 `Option` / 空数组则不画。`missing_blocks_render_nothing` 守着 |
+| 流式实时传输 | `AiStreamDelta.kind` 双通道 + `segment` 分桶；`live_tool` 让工具执行期间有反馈；检查点让内容边生成边落库 |
+| 每轮全部内容持久化 | `ai_messages.thinking` + `tool_trace.cards` + `plan`（已有）；schema v8 迁移；检查点抗崩溃 |
+| 点击历史记录可显示 | 历史与实时共用 `render_turn`；历史消息自带四块数据；卡片摘要在 `refresh_ai_messages` 里补回；`historical_message_shows_its_own_plan` 守着 |
