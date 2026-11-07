@@ -2265,3 +2265,162 @@ async fn invalid_plan_is_rejected_at_plan_time() {
         "落库的是**改对之后**的那一份"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REFLECT / REPLAN
+// ---------------------------------------------------------------------------
+
+/// 自检用的 JSON。
+fn selfcheck(verdict: &str, diagnosis: &str, hint: &str) -> Turn {
+    Turn::text(&format!(
+        "{{\"verdict\":\"{verdict}\",\"failed_step\":1,\"diagnosis\":\"{diagnosis}\",\
+\"reason\":\"检索条件一直没给对，三次都报同一个错\",\"replan_hint\":\"{hint}\"}}"
+    ))
+}
+
+/// 一步连续失败三次 → 自检 → 重列 → 换参数重来。
+#[tokio::test]
+async fn failed_step_triggers_reflect_then_replan() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        // 三次都只给 limit（没有检索条件），参数各不相同所以不会被指纹熔断。
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查重要邮件", "limit": 5 }),
+        )),
+        Turn::with_tool(tool_call(
+            "c2",
+            AiToolName::EmailSearch,
+            json!({ "motive": "换个数量再查", "limit": 6 }),
+        )),
+        Turn::with_tool(tool_call(
+            "c3",
+            AiToolName::EmailSearch,
+            json!({ "motive": "再试一次", "limit": 7 }),
+        )),
+        // 自检：模型承认没做成，并给出改法。
+        selfcheck("failed", "wrong_args", "改成按最近 7 天未读查"),
+        // 重列：换成有时间窗的参数。
+        Turn::with_tool(tool_call(
+            "plan2",
+            AiToolName::PlanSubmit,
+            json!({
+                "motive": "换一个思路",
+                "goal": "完成用户这一次的请求",
+                "steps": [{
+                    "id": 1, "title": "检索近 7 天未读", "kind": "tool", "capability": "mail",
+                    "tool": "email_search", "args": { "unread_only": true, "days": 7 },
+                    "expect": "列出未读邮件"
+                }]
+            }),
+        )),
+        Turn::with_tool(tool_call(
+            "c4",
+            AiToolName::EmailSearch,
+            json!({ "motive": "执行第 1 步", "unread_only": true, "days": 7 }),
+        )),
+        Turn::text("最近 7 天没有未读邮件。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(
+        message.content.contains("没有未读"),
+        "最终答复要保留：{}",
+        message.content
+    );
+    let plan = message.plan.expect("要有清单");
+    assert_eq!(plan.replans.len(), 1, "重列一次：{:?}", plan.replans);
+    assert_eq!(
+        plan.replans[0].diagnosis,
+        me_core::ai_plan::Diagnosis::WrongArgs
+    );
+    assert_eq!(plan.history.len(), 1, "旧计划要进 history");
+    assert_eq!(
+        plan.steps[0].args,
+        Some(json!({ "unread_only": true, "days": 7 })),
+        "落库的是重列之后的计划"
+    );
+}
+
+/// 重列如果原样重试失败过的调用，直接被砍掉，不再真跑一遍。
+#[tokio::test]
+async fn replan_repeating_a_failed_call_is_dropped() {
+    let (_dir, store) = open();
+    let read = |id: &str, message_id: u64| {
+        Turn::with_tool(tool_call(
+            id,
+            AiToolName::MailRead,
+            json!({ "motive": "读正文", "message_id": message_id }),
+        ))
+    };
+    let plan_read = |id: &str, message_id: u64| {
+        Turn::with_tool(tool_call(
+            id,
+            AiToolName::PlanSubmit,
+            json!({
+                "motive": "读三封邮件",
+                "goal": "读出三封邮件的要点",
+                "steps": [{
+                    "id": 1, "title": "读邮件正文", "kind": "tool", "capability": "mail",
+                    "tool": "mail_read", "args": { "message_id": message_id },
+                    "expect": "拿到正文"
+                }]
+            }),
+        ))
+    };
+    let provider = MockAiProvider::new(vec![
+        plan_read("plan1", 9_991),
+        // 三次读不到（本地没有这些邮件），参数不同所以都能真正执行。
+        read("r1", 9_991),
+        read("r2", 9_992),
+        read("r3", 9_993),
+        selfcheck("failed", "missing_data", "先让用户打开这几封邮件"),
+        // 重列：又写回 9992 —— 与历史失败指纹完全相同，必须被剔除。
+        plan_read("plan2", 9_992),
+        Turn::text("读不到正文，需要你先在邮件列表里打开这几封。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "把这三封邮件的要点读出来".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(
+        message.content.contains("读不到正文"),
+        "最终答复要保留：{}",
+        message.content
+    );
+    let plan = message.plan.expect("旧清单要留着给用户看");
+    assert!(
+        plan.replans.is_empty(),
+        "一步不剩的重列不该记一次成功：{:?}",
+        plan.replans
+    );
+    assert_eq!(plan.steps[0].status, me_core::ai_plan::PlanStatus::Failed);
+}

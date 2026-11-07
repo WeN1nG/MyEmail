@@ -44,6 +44,17 @@ const MAX_PLAN_NUDGES: u32 = 2;
 /// 「等模型学会」的设计在生产里一定会变成死循环。
 const MAX_PLAN_ROUNDS: u32 = 2;
 
+/// 自检输出不是 JSON 时最多重问几次。
+///
+/// 只给一次：模型连 JSON 都写不对时，再问也是同一句话，不如按「部分完成」收场。
+const MAX_SELFCHECK_RETRIES: u32 = 1;
+
+/// 同一轮重列里，新计划被拒收（缺诊断/全是重复指纹）几次后放弃。
+///
+/// 注意这与「重列次数上限」是两件事：那个数已经在 `Plan.replans` 里，
+/// 这里管的是「模型交不出合格的第二份计划」。
+const MAX_REPLAN_REJECTIONS: u32 = 2;
+
 /// 调用过工具却一个字没说时，最多催它写正文几次。
 ///
 /// 只给一次：再催就是逼它编内容。第二次仍然空白就走引擎兜底摘要。
@@ -85,6 +96,9 @@ struct StreamSetup {
     permissions: me_core::ai::AiToolPermissions,
     context_refs: Vec<MessageId>,
     replay_only: bool,
+    /// 用户这一轮的原始输入。REFLECT 要把「用户到底要什么」再摆到模型面前，
+    /// 否则它只能对着一份清单自评，容易自说自话。
+    user_input: String,
 }
 
 impl Default for AiState {
@@ -938,6 +952,7 @@ where
                         permissions,
                         context_refs,
                         replay_only,
+                        user_input: content.clone(),
                     },
                 )
                 .await;
@@ -1090,6 +1105,7 @@ where
             permissions,
             context_refs,
             replay_only,
+            user_input,
         } = setup;
         let started = Instant::now();
         let permit = self
@@ -1156,6 +1172,12 @@ where
         let mut phase = Phase::Plan;
         let mut plan_rounds = 0u32;
         let mut answered_directly = false;
+        let mut reflect_retries = 0u32;
+        let mut replan_rejections = 0u32;
+        // 重列需要的三样东西：旧清单、诊断、改法。都来自 REFLECT 的输出，
+        // 而 `plan_submit` 的契约里没有这些字段（不新加参数，改由引擎带过来）。
+        let mut prev_plan: Option<me_core::ai_plan::Plan> = None;
+        let mut replan_meta: Option<ReplanMeta> = None;
 
         // 两套工具集：PLAN 阶段只有 `plan_submit` / `answer_directly`，
         // 物理上取消了模型「边想边查」的可能——想查就必须先说要查什么。
@@ -1165,6 +1187,13 @@ where
             plan_tools.retain(|spec| spec.name.is_replay_safe());
             execute_tools.retain(|spec| spec.name.is_replay_safe());
         }
+        // 重列阶段只给 `plan_submit`：给 `answer_directly` 等于允许它「放弃重列」，
+        // 那会让「重列」变成「随时可以退出」，上限也就没有意义了。
+        let replan_tools: Vec<me_core::ai::AiToolSpec> = plan_tools
+            .iter()
+            .filter(|spec| spec.name == AiToolName::PlanSubmit)
+            .cloned()
+            .collect();
         request.tools = plan_tools.clone();
         let mut budget = crate::ai_tools::ToolBudget {
             permissions,
@@ -1190,8 +1219,9 @@ where
             request.tools = match phase {
                 Phase::Plan => plan_tools.clone(),
                 Phase::Execute => execute_tools.clone(),
-                // FINAL 不给工具：模型必须把话说出来，而不是再发起一轮调用。
-                Phase::Final => Vec::new(),
+                Phase::Replan => replan_tools.clone(),
+                // REFLECT / FINAL 不给工具：前者只要一段 JSON，后者只要一段答复。
+                Phase::Reflect | Phase::Final => Vec::new(),
             };
 
             let turn = tokio::select! {
@@ -1229,6 +1259,88 @@ where
             }
 
             if turn.tool_calls.is_empty() {
+                // 自检：模型给一段 JSON，引擎拿事实裁剪后决定「重列」还是「收尾」。
+                if phase == Phase::Reflect {
+                    match me_core::ai_plan::SelfCheck::parse(&turn.text) {
+                        Some(check) => {
+                            let verdict = match plan.as_ref() {
+                                Some(current) => me_core::ai_plan::reconcile(&check, current),
+                                None => check.verdict,
+                            };
+                            let rounds_left =
+                                plan.as_ref().map_or(0, |current| current.replans.len())
+                                    < me_core::ai_plan::MAX_REPLANS as usize;
+                            if verdict == me_core::ai_plan::Verdict::Failed
+                                && rounds_left
+                                && check.can_replan()
+                            {
+                                let meta = ReplanMeta {
+                                    diagnosis: check
+                                        .diagnosis
+                                        .unwrap_or(me_core::ai_plan::Diagnosis::WrongArgs),
+                                    reason: check.reason.clone(),
+                                    changes: check.replan_hint.clone(),
+                                    failed_step: check.failed_step,
+                                };
+                                prev_plan = plan.clone();
+                                request.messages.push(me_core::ai::AiWireMessage::User {
+                                    content: replan_prompt(&meta),
+                                });
+                                replan_meta = Some(meta);
+                                phase = Phase::Replan;
+                                continue;
+                            }
+                            let note = if rounds_left {
+                                "请按 [结果] 格式给出最终答复，把没做到的写进「未完成」。"
+                            } else {
+                                "重列次数已用完。请如实说明哪些没做到、为什么，并给出下一步建议。"
+                            };
+                            request.messages.push(me_core::ai::AiWireMessage::User {
+                                content: format!("核对结论：{}。{note}", verdict.label()),
+                            });
+                            phase = Phase::Final;
+                            continue;
+                        }
+                        None => {
+                            // 模型没按格式回。重问一次，再不行就按「部分完成」收场——
+                            // 自检不该成为新的死循环。
+                            if reflect_retries < MAX_SELFCHECK_RETRIES {
+                                reflect_retries += 1;
+                                request.messages.push(me_core::ai::AiWireMessage::User {
+                                    content: "只输出那段 JSON，不要解释、不要 Markdown 代码块：{\"verdict\":\"done|partial|failed\",\"failed_step\":4,\"diagnosis\":\"wrong_plan|wrong_args|\
+missing_data|tool_broken|user_ambiguous\",\"reason\":\"…\",\"replan_hint\":\"…\"}"
+                                        .to_string(),
+                                });
+                                continue;
+                            }
+                            request.messages.push(me_core::ai::AiWireMessage::User {
+                                content: "请按 [结果] 格式给出最终答复，把没做到的写进「未完成」。"
+                                    .to_string(),
+                            });
+                            phase = Phase::Final;
+                            continue;
+                        }
+                    }
+                }
+
+                // 重列阶段只认 `plan_submit`。模型改说人话就先提醒一次，
+                // 第二次不再等——上限是「两次重列」，不是「两次聊天」。
+                if phase == Phase::Replan {
+                    if replan_rejections == 0 {
+                        request.messages.push(me_core::ai::AiWireMessage::User {
+                            content: "请调用 plan_submit 提交**新的**计划（不要重复已经失败过的调用参数）；如果确实无法继续，再直接说明结论。"
+                                .to_string(),
+                        });
+                        replan_rejections = 1;
+                        continue;
+                    }
+                    request.messages.push(me_core::ai::AiWireMessage::User {
+                        content: "请按 [结果] 格式给出最终答复。".to_string(),
+                    });
+                    phase = Phase::Final;
+                    continue;
+                }
+
                 if phase == Phase::Plan {
                     // PLAN 阶段模型直接说了一段话，没有提交计划。
                     // 只在「这句话看起来是在说『我打算去查…』」时才追问一次；
@@ -1358,8 +1470,15 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         motive_source,
                     })
                     .await;
-                    let result =
-                        crate::ai_tools::phase_rejected_result(call, motive, motive_source);
+                    let result = crate::ai_tools::phase_rejected_result(
+                        call,
+                        motive,
+                        motive_source,
+                        "现在还在**制定计划**阶段，不能执行工具。请先调用 plan_submit 把要做的事\
+写成 1–8 步（每步写清 tool / args / expect），我会在计划阶段就帮你校验参数；\
+若确实不需要任何工具，请调用 answer_directly 并说明理由。",
+                        "计划阶段不能执行工具",
+                    );
                     self.emit(Event::AiToolCompleted {
                         conversation,
                         call_id: result.call_id.clone(),
@@ -1480,6 +1599,25 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 results.push(result);
             }
 
+            request
+                .messages
+                .push(me_core::ai::AiWireMessage::Assistant {
+                    content: turn.text,
+                    tool_calls: turn.tool_calls.clone(),
+                });
+            for result in results {
+                request
+                    .messages
+                    .push(me_core::ai::AiWireMessage::ToolResult {
+                        call_id: result.call_id,
+                        content: result.content,
+                        is_error: result.is_error,
+                    });
+            }
+
+            // 阶段推进放在工具结果**之后**：`assistant(tool_calls)` 后面必须紧跟
+            // 对应的 tool 消息，中间插一条 user 会让协议对不上号。
+
             // 计划到手 → 进入执行阶段，并把「接下来做什么」写清楚。
             //
             // 这里只要求「有清单」，不要求 `is_executable()`：模型用旧接口
@@ -1505,20 +1643,115 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 });
             }
 
-            request
-                .messages
-                .push(me_core::ai::AiWireMessage::Assistant {
-                    content: turn.text,
-                    tool_calls: turn.tool_calls.clone(),
+            // 重列：新计划要过「历史失败指纹」这道闸。
+            if phase == Phase::Replan
+                && let Some(candidate) = plan.clone()
+                && let Some(previous) = prev_plan.clone()
+            {
+                let meta = replan_meta.clone().unwrap_or(ReplanMeta {
+                    diagnosis: me_core::ai_plan::Diagnosis::WrongArgs,
+                    reason: "上一轮的执行没有达到目标".to_string(),
+                    changes: "换一组参数重试".to_string(),
+                    failed_step: None,
                 });
-            for result in results {
-                request
-                    .messages
-                    .push(me_core::ai::AiWireMessage::ToolResult {
-                        call_id: result.call_id,
-                        content: result.content,
-                        is_error: result.is_error,
+                let outcome = me_core::ai_plan::validate_replan(
+                    &previous,
+                    &candidate,
+                    &me_core::ai_plan::ReplanRequest {
+                        diagnosis: meta.diagnosis,
+                        reason: &meta.reason,
+                        changes: &meta.changes,
+                        at: now_unix(),
+                    },
+                    &budget.failed_fingerprints(),
+                );
+                match outcome {
+                    Ok(outcome) => {
+                        let dropped = outcome.dropped.len();
+                        // 一步不剩时保留**旧清单**：用户需要看到「哪些步失败了」，
+                        // 而不是让清单凭空消失。
+                        plan = outcome.plan.clone().or_else(|| Some(previous.clone()));
+                        match outcome.plan {
+                            Some(current) => {
+                                self.emit(Event::AiPlanUpdated {
+                                    conversation,
+                                    message,
+                                    plan: current.clone(),
+                                })
+                                .await;
+                                phase = Phase::Execute;
+                                request.messages.push(me_core::ai::AiWireMessage::User {
+                                    content: format!(
+                                        "已换成第 {} 次计划（砍掉 {dropped} 个与历史失败重复的步骤）。\
+继续执行，工具调用请带上 step_id。{}",
+                                        current.replans.len(),
+                                        current.summary_line()
+                                    ),
+                                });
+                            }
+                            None => {
+                                // 一步不剩：新计划里全是失败过的调用，再试也是一样的结果。
+                                phase = Phase::Final;
+                                request.messages.push(me_core::ai::AiWireMessage::User {
+                                    content: "新计划里的步骤全都和之前失败过的调用一样，再试也不会\
+有不同结果。请直接说明当前能给出的最好结果，不要再提交计划。"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        // 退回旧清单：宁可显示「上一轮失败了」，也不要把一份
+                        // 没过校验的计划留在界面上。
+                        plan = Some(previous.clone());
+                        replan_rejections += 1;
+                        let exhausted = replan_rejections >= MAX_REPLAN_REJECTIONS;
+                        if exhausted {
+                            phase = Phase::Final;
+                        }
+                        request.messages.push(me_core::ai::AiWireMessage::User {
+                            content: if exhausted {
+                                format!(
+                                    "新计划没有通过校验：{}。重列次数已用完，请直接给出最终答复。",
+                                    err.user_message()
+                                )
+                            } else {
+                                format!(
+                                    "新计划没有通过校验：{}。请改参数后重新提交（或直接说明结论）。",
+                                    err.user_message()
+                                )
+                            },
+                        });
+                    }
+                }
+            }
+
+            // 计划跑完了 → 先自检（只为「有失败步」的情况），再写答复。
+            //
+            // 全部成功就不必让模型自评：那只会多花一轮，还可能把一份好好的
+            // 结果自贬成 partial。
+            if phase == Phase::Execute
+                && plan
+                    .as_ref()
+                    .is_some_and(|current| !current.has_open_steps())
+            {
+                let failed = plan.as_ref().is_some_and(|current| current.any_failed());
+                let rounds_left = plan.as_ref().map_or(0, |current| current.replans.len())
+                    < me_core::ai_plan::MAX_REPLANS as usize;
+                if failed && rounds_left {
+                    phase = Phase::Reflect;
+                    if let Some(current) = plan.as_ref() {
+                        request.messages.push(me_core::ai::AiWireMessage::User {
+                            content: reflect_prompt(current, &user_input),
+                        });
+                    }
+                } else {
+                    phase = Phase::Final;
+                    request.messages.push(me_core::ai::AiWireMessage::User {
+                        content: "计划已执行完。请按 [结果] 格式给出最终答复，不要只重复工具回执。"
+                            .to_string(),
                     });
+                }
             }
         }
 
@@ -1689,8 +1922,56 @@ enum Phase {
     Plan,
     /// 按计划执行：能力工具 + `plan_update`。
     Execute,
+    /// 自检：把执行事实回灌给模型，要它判断「这次到底做完没有」。不给工具。
+    Reflect,
+    /// 重列：只给 `plan_submit`，拿到新计划后由引擎按「历史失败指纹」裁剪。
+    Replan,
     /// 收尾：不下发任何工具，模型必须把话说出来。
     Final,
+}
+
+/// REFLECT 判定「要重列」时带过来的三样东西。
+///
+/// 为什么不把它们塞进 `plan_submit` 的参数：那是模型每次都要写的协议字段，
+/// 多三个字段就多三处可能写错的地方；而这些信息本来就是自检那一轮的产物，
+/// 由引擎带过来既省一次往返，也不会被模型「忘掉」。
+#[derive(Debug, Clone)]
+struct ReplanMeta {
+    diagnosis: me_core::ai_plan::Diagnosis,
+    reason: String,
+    changes: String,
+    failed_step: Option<u8>,
+}
+
+/// 自检要的回灌事实表。**不含正文原文**：8 步全跑完也只有几百字，
+/// 既不会把上下文顶爆，也不会把邮件内容当成指令送进模型。
+fn reflect_prompt(plan: &me_core::ai_plan::Plan, user_input: &str) -> String {
+    format!(
+        "【本轮执行事实】\n目标：{}\n{}\n用户原始需求：{}\n\n请判断：这次任务完成了吗？只输出一段 JSON，不要解释、不要代码块：\n{{\"verdict\":\"done|partial|failed\",\"failed_step\":<失败的步号，完成时不填>,\
+\"diagnosis\":\"wrong_plan|wrong_args|missing_data|tool_broken|user_ambiguous\",\
+\"reason\":\"一句话说清哪里不对（至少 8 字）\",\
+\"replan_hint\":\"如果重来一次该怎么改（至少 4 字；verdict=failed 时必填）\"}}\n\
+判定标准：全部步骤都完成、且结果确实回答了用户的需求 → done；\n有步骤失败但对用户的问题仍给出了可用的答案 → partial；\n拿不到能回答用户的结果 → failed。不要为了显得勤奋而判 failed。",
+        plan.goal,
+        plan.facts_block(),
+        me_core::ai::truncate_chars(user_input, 200)
+    )
+}
+
+/// 重列要的指令：把「错在哪、怎么改」说清楚，否则模型只会重抄一遍。
+fn replan_prompt(meta: &ReplanMeta) -> String {
+    format!(
+        "这一轮没有达到目标：{}\n诊断：{}\n改法建议：{}\n\n请调用 plan_submit 提交一份**新的**计划。要求：\n- 不要重复已经失败过的调用参数（换关键词、放宽时间窗、去掉某个限定，或换一条路）；\n\
+- 如果问题在于本地没有这份数据，就加一步先让用户打开/同步；\n\
+- 如果需求本身含糊，就把最后一步写成 kind=ask 停下来问用户。\n\
+重列次数有限（最多 {} 次），这一次要真的换一个思路。",
+        meta.failed_step
+            .map(|id| format!("第 {id} 步没做成"))
+            .unwrap_or_else(|| "有步骤没有做成".to_string()),
+        meta.diagnosis.label(),
+        meta.changes,
+        me_core::ai_plan::MAX_REPLANS
+    )
 }
 
 /// 模型两轮都不提交计划时的兜底：合成一份「直接回答」的单步清单。

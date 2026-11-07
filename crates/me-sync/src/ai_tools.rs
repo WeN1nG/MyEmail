@@ -75,6 +75,14 @@ impl ToolBudget {
             .or_insert_with(|| truncate_chars(error, 120));
     }
 
+    /// 本轮所有「不可重试失败」的调用指纹。
+    ///
+    /// 重列时用它剔除「换个说法但业务参数没变」的步骤——没有这道闸，
+    /// 「重列」就是「重新抽卡」，用户看到的是 AI 认真地又失败了一次。
+    pub(crate) fn failed_fingerprints(&self) -> Vec<String> {
+        self.failed.keys().cloned().collect()
+    }
+
     /// 这次调用的参数是否已经失败过。返回上次的错误摘要。
     pub(crate) fn previous_failure(&self, call: &AiToolCall) -> Option<&str> {
         self.failed
@@ -133,20 +141,19 @@ pub(crate) fn phase_rejected_result(
     call: &AiToolCall,
     motive: Option<String>,
     motive_source: MotiveSource,
+    hint: &str,
+    summary: &str,
 ) -> AiToolResult {
     AiToolResult {
         call_id: call.id.clone(),
         tool: call.name,
-        content: "现在还在**制定计划**阶段，不能执行工具。请先调用 plan_submit 把要做的事\
-写成 1–8 步（每步写清 tool / args / expect），我会在计划阶段就帮你校验参数；\
-若确实不需要任何工具，请调用 answer_directly 并说明理由。"
-            .to_string(),
+        content: hint.to_string(),
         is_error: true,
         trace: AiToolTrace {
             call_id: call.id.clone(),
             tool: call.name,
             status: AiToolStatus::Error,
-            summary: "计划阶段不能执行工具".to_string(),
+            summary: summary.to_string(),
             duration_ms: 0,
             motive,
             motive_source,

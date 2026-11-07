@@ -613,6 +613,17 @@ impl Plan {
             .count()
     }
 
+    /// 有没有**真正失败**的步。
+    ///
+    /// 与 [`Self::any_terminal_failure`] 的区别很重要：`skipped` 常常是
+    /// 「这一步不需要做」（用户没给日期、条件不适用），为它触发自检与重列
+    /// 只会白花两轮。
+    pub fn any_failed(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| step.status == PlanStatus::Failed)
+    }
+
     pub fn any_terminal_failure(&self) -> bool {
         self.steps
             .iter()
@@ -787,6 +798,30 @@ impl Plan {
         changed
     }
 
+    /// 收尾时把 `running` 的步收干净：有回执（含「0 命中」）算完成，
+    /// 一次都没执行过的如实标跳过。
+    ///
+    /// 留一个 `running` 在界面上就是永远转圈的圆圈——用户会以为还在跑。
+    pub fn settle_running(&mut self) -> bool {
+        let mut changed = false;
+        for step in self.steps.iter_mut() {
+            if step.status != PlanStatus::Running {
+                continue;
+            }
+            if step.kind == StepKind::Reason || step.evidence.is_some() {
+                step.status = PlanStatus::Done;
+                if step.evidence.is_none() {
+                    step.evidence = Some("已直接回答".to_string());
+                }
+            } else {
+                step.status = PlanStatus::Skipped;
+                step.evidence = Some("本轮没有执行".to_string());
+            }
+            changed = true;
+        }
+        changed
+    }
+
     /// 把当前清单推进 `history`（重列时调用），最多留 [`MAX_PLAN_HISTORY`] 份。
     pub fn push_history(&mut self, mut previous: Plan) {
         previous.history.clear();
@@ -845,6 +880,102 @@ impl Plan {
             out.push('\n');
         }
         truncate_chars(&out, 1200)
+    }
+}
+
+/// 模型的自检结果（REFLECT 阶段）。
+///
+/// 它是**不可信**的：模型倾向说「完成了」。所以 `verdict` 只是一份证词，
+/// 最终结论由 [`reconcile`] 拿事实裁剪。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfCheck {
+    pub verdict: Verdict,
+    pub failed_step: Option<u8>,
+    pub diagnosis: Option<Diagnosis>,
+    pub reason: String,
+    pub replan_hint: String,
+}
+
+impl SelfCheck {
+    /// 从模型输出里抠出 JSON。
+    ///
+    /// 不能要求「整段就是 JSON」：模型常包一层 ```json 代码块或加一句前言。
+    /// 抠不出来就当没自检成功，由调用方决定重问还是按 `partial` 收场。
+    pub fn parse(text: &str) -> Option<Self> {
+        let start = text.find('{')?;
+        let end = text.rfind('}')?;
+        if end <= start {
+            return None;
+        }
+        let value: serde_json::Value = serde_json::from_str(&text[start..=end]).ok()?;
+        let verdict = value
+            .get("verdict")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Verdict::parse)?;
+        let failed_step = value
+            .get("failed_step")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|id| u8::try_from(id).ok());
+        let diagnosis = value
+            .get("diagnosis")
+            .and_then(serde_json::Value::as_str)
+            .and_then(Diagnosis::parse);
+        let reason = value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let replan_hint = value
+            .get("replan_hint")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Some(Self {
+            verdict,
+            failed_step,
+            diagnosis,
+            reason: truncate_chars(&reason, MAX_STEP_EVIDENCE_CHARS),
+            replan_hint: truncate_chars(&replan_hint, MAX_STEP_EVIDENCE_CHARS),
+        })
+    }
+
+    /// 自检是否给出了「可以据此重列」的信息。
+    pub fn can_replan(&self) -> bool {
+        self.verdict == Verdict::Failed
+            && self.reason.chars().count() >= 8
+            && self.replan_hint.chars().count() >= 4
+    }
+}
+
+/// 事实优先：模型的结论不能盖过清单上的事实。
+///
+/// 三种裁剪：
+/// - 全部完成却说失败 → `partial`（保留模型原话，界面上「5 步都打了勾」与
+///   「模型认为不够好」同时可见）；
+/// - 有失败/跳过的步却说完成 → `partial`（虚报是最常见的）；
+/// - `failed_step` 指向一个已完成的步 → `partial`。
+///
+/// 为什么「全做完却说失败」不直接判 `done`：模型有时是自我苛责（常见），
+/// 有时是真的发现 evidence 与目标不符（少见但重要）。引擎分不出来，
+/// 取信息量最大的处理——判 partial，而不是抹掉这层不确定性。
+pub fn reconcile(check: &SelfCheck, plan: &Plan) -> Verdict {
+    let all_done = plan
+        .steps
+        .iter()
+        .all(|step| step.status == PlanStatus::Done);
+    let any_failure = plan.any_terminal_failure();
+    let points_to_done = check
+        .failed_step
+        .and_then(|id| plan.step(id))
+        .is_some_and(|step| step.status == PlanStatus::Done);
+
+    match check.verdict {
+        Verdict::Failed if all_done => Verdict::Partial,
+        Verdict::Failed if points_to_done => Verdict::Partial,
+        Verdict::Done if any_failure => Verdict::Partial,
+        other => other,
     }
 }
 
@@ -2091,6 +2222,116 @@ mod tests {
         assert_eq!(back, plan);
         assert_eq!(back.version, PLAN_VERSION_V2);
         assert_eq!(back.steps[0].tool, Some(AiToolName::EmailSearch));
+    }
+
+    fn check(verdict: Verdict, failed_step: Option<u8>) -> SelfCheck {
+        SelfCheck {
+            verdict,
+            failed_step,
+            diagnosis: Some(Diagnosis::WrongArgs),
+            reason: "第一步的参数一直不对，查不到东西".to_string(),
+            replan_hint: "改成按时间窗查".to_string(),
+        }
+    }
+
+    #[test]
+    fn selfcheck_parses_json_wrapped_in_prose() {
+        let text = "我核对了一下：\n```json\n{\"verdict\":\"failed\",\"failed_step\":2,\
+\"diagnosis\":\"missing_data\",\"reason\":\"正文没有缓存，读不出来\",\
+\"replan_hint\":\"先让用户打开这封邮件\"}\n```";
+        let check = SelfCheck::parse(text).expect("要能从散文里抠出 JSON");
+        assert_eq!(check.verdict, Verdict::Failed);
+        assert_eq!(check.failed_step, Some(2));
+        assert_eq!(check.diagnosis, Some(Diagnosis::MissingData));
+        assert!(check.can_replan());
+    }
+
+    #[test]
+    fn selfcheck_rejects_garbage() {
+        assert!(SelfCheck::parse("我觉得还行").is_none());
+        assert!(
+            SelfCheck::parse("{\"verdict\":\"unsure\"}").is_none(),
+            "枚举外的值不认"
+        );
+    }
+
+    #[test]
+    fn selfcheck_needs_a_real_reason_to_replan() {
+        let mut check = check(Verdict::Failed, Some(1));
+        check.reason = "失败".to_string();
+        assert!(!check.can_replan(), "理由是空话时不能据此重列");
+    }
+
+    #[test]
+    fn reconcile_downgrades_false_claims_in_both_directions() {
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "目标",
+                vec![
+                    tool_step(1, "检索", AiToolName::EmailSearch, json!({ "days": 7 })),
+                    reason_step(2, "归纳"),
+                ],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+
+        // 全部完成却说失败：不抹掉模型的原话，降为 partial。
+        plan.steps[0].status = PlanStatus::Done;
+        plan.steps[1].status = PlanStatus::Done;
+        assert_eq!(
+            reconcile(&check(Verdict::Failed, Some(1)), &plan),
+            Verdict::Partial
+        );
+
+        // 有失败步却说完成：一律降级。
+        plan.steps[0].status = PlanStatus::Failed;
+        assert_eq!(
+            reconcile(&check(Verdict::Done, None), &plan),
+            Verdict::Partial
+        );
+
+        // 事实与自检一致时不动。
+        assert_eq!(
+            reconcile(&check(Verdict::Failed, Some(1)), &plan),
+            Verdict::Failed
+        );
+        plan.steps[0].status = PlanStatus::Done;
+        assert_eq!(reconcile(&check(Verdict::Done, None), &plan), Verdict::Done);
+    }
+
+    #[test]
+    fn settle_running_closes_spinners_honestly() {
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "目标",
+                vec![
+                    tool_step(1, "检索", AiToolName::EmailSearch, json!({ "days": 7 })),
+                    tool_step(
+                        2,
+                        "读正文",
+                        AiToolName::MailRead,
+                        json!({ "message_id": 1 }),
+                    ),
+                ],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+        plan.steps[0].status = PlanStatus::Running;
+        plan.steps[0].evidence = Some("0 命中".to_string());
+        plan.steps[1].status = PlanStatus::Running;
+
+        assert!(plan.settle_running());
+        assert_eq!(plan.steps[0].status, PlanStatus::Done, "有回执就是执行过了");
+        assert_eq!(
+            plan.steps[1].status,
+            PlanStatus::Skipped,
+            "一次没执行要如实标跳过"
+        );
+        assert_eq!(plan.open_steps(), 0, "不能留永远转圈的步");
     }
 
     #[test]
