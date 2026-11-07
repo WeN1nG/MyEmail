@@ -49,7 +49,7 @@ P0–P2 全程不需要 `cargo deny`（除非 P3 引入新 crate）。
 
 | # | 方案里的假设 | 实测 | 结论 |
 | --- | --- | --- | --- |
-| F1 | `Event` 共 63 个变体 | **65 个**（脚本按顶层变体统计） | 🔧 方案已改；`CLAUDE.md` 的 63 也是过期数字，P2 收尾时一并改成 69 |
+| F1 | `Event` 共 63 个变体 | **65 个**（P0 时）→ **69 个**（P2 加了四个清单事件后） | 🔧 方案已改；`CLAUDE.md` 的 63 已改成 69 |
 | F2 | 协议层有第二份工具名白名单需要同步 | `me-proto/src/ai.rs:392` 用的是 `AiToolName::parse`，没有硬编码列表 | ✅ 新增变体只要登记 `parse`/`as_str` 即可，协议层自动跟随 |
 | F3 | 熔断可以放在工具函数里 | `execute_ai_tool`（`ai_tools.rs:134`）统一把 `Err` 转成 `is_error` 的 trace | 🔧 **熔断必须插在调用方 `run_ai_stream` 的循环里**，插在 `execute_ai_tool` 入口会绕过 `attempts` 记账 |
 | F4 | `is_progress()` 只有 3 个可丢事件 | `command.rs:868`：`SyncProgress` / `IndexProgress` / `AiStreamDelta` | ✅ 新增的 `AiPlanStepAttempt` 要加进去 |
@@ -416,15 +416,43 @@ async fn email_search_accepts_time_window_without_keyword() {
    `Partial` 落不了地，除非做表重建迁移。P0 改为 `complete` + `error`，
    语义由兜底正文首句承担。**P2 若要 `partial`，必须和 v8 迁移一起做。**
 
-### 11.2 与准备文档的出入
+### 11.2 F15 的最终解法（与准备文档的建议不同）
 
-§2 的 F15（per-tool 限额与重试打架）**没有在 P0 处理**：P0 还没有 `attempts`，
-重试只发生在模型自己重发时，而熔断已经拦掉了同参数重复。
-真正需要 `failed_reads` 的时机是 P2 引入引擎自动重试之后——那时再补，测试要覆盖
-「同一封未缓存邮件重试 3 次不撞 `MAIL_READ_LIMIT`」。
+§2 的 F15 建议用 `ToolBudget.failed_reads: HashSet<MessageId>`——「失败读短路且不消耗限额」。
+**实现时没采用**，改成了 `ToolBudget::quota_snapshot()` / `restore_quota()`：
+重试前把配额整体退回快照。
 
-### 11.3 下一步（P1）的入口
+为什么换：那个方案只解决 `mail_read` 一个工具，而「重试会重复计配额」是**所有**带
+per-tool 限额的工具的通病（天气 1 次/回复、日程 5 次、记忆 5 次……）。
+配额退回是通用解法：重试是**同一次逻辑调用**，配额已经付过一次了。
+
+```
+执行前 snapshot = budget.quota_snapshot()
+重试前  budget.restore_quota(snapshot)   ← 第二次不会撞「本次消息已查询过天气」
+```
+
+P2 已实现并有测试（`restoring_the_quota_gives_the_slot_back`）。
+
+### 11.3 P1–P3 的执行顺序（已全部完成）
 
 P1 的第一件事不是写 `plan_submit`，而是**先把 `PlanStep` 的构造点收敛到 `PlanStep::new`**
 （7 处，见 §4.2），否则加 7 个字段会一次报 7 个 missing field。
-然后才是 `Plan v2` 结构 → 工具规格 → 首轮白名单 → 清单条 UI。
+实际顺序：
+
+1. **P1**：收敛构造器 → Plan v2 结构 → 工具规格 → 首轮白名单 → 清单条 UI；
+2. **P2**：`SelfCheck` + `reconcile` → `validate_replan` → 错误分级与引擎重试 →
+   0 命中放宽 → 阶段预算 → 四个新事件；
+3. **P3**：`is:important` / `important_only` → 跨轮延续 → 清单统计。
+
+每一步一次提交 + 全量门禁。最终 **测试 710 → 777（+67）**，0 failed / 6 ignored。
+
+### 11.4 准备阶段没预见、但撞出来的四个真问题
+
+1. **放宽条件必须由引擎做，不能回灌给模型。** 第一版把放宽后的参数回灌给模型，
+   让它下一轮重试——但模型常常换个毫不相干的关键词。改成引擎自己在同一轮内改参数重试。
+2. **0 命中不是失败。** 第一版把「放宽到底仍无结果」判成失败，结果触发 REFLECT 白跑一轮，
+   用户还看到红色叉号——而「最近 30 天没有这样的邮件」本来就是正确答案。
+3. **放宽不能把时间窗整段丢掉。** 丢掉等于把「最近 7 天的未读」变成「所有未读」——
+   那是换了一个问题，不是放宽了同一个问题。改成扩到 30 天。
+4. **续做提示必须在第一次请求里发出。** 第一版在「模型没调工具」的分支里补提示，
+   但模型第一轮直接提交计划是**正常路径**——那时再补就晚了，它已经规划完了。
