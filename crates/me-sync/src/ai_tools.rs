@@ -414,6 +414,8 @@ where
             to,
             subject,
             unread_only,
+            // 星标条件在下一步接线（`email_search` 的 `flagged_only` 参数）。
+            flagged_only: false,
             limit,
             cursor: None,
         };

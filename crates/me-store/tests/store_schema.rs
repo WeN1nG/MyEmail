@@ -478,6 +478,60 @@ fn null_message_id_is_never_deduped() {
 // 标志
 // ---------------------------------------------------------------------------
 
+/// 星标是「重要」在本地唯一可靠的显式标注：检索必须能只按它过滤，
+/// 且与未读、时间窗这些既有条件**取交集**而不是互相覆盖。
+#[test]
+fn search_flagged_only_returns_only_starred() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+    let messages = vec![
+        msg(1, "starred1@example.com", "starred one", 10),
+        msg(2, "plain@example.com", "plain two", 20),
+        msg(3, "starred3@example.com", "starred three", 30),
+    ];
+    let inserted = insert(&store, account, inbox, &messages);
+    let writable = store.writable();
+    writable
+        .apply_local_flags(
+            &[inserted[0].id, inserted[2].id],
+            FlagOp::Set(Flags::FLAGGED),
+        )
+        .unwrap();
+
+    let starred = writable
+        .search(&SearchQuery {
+            flagged_only: true,
+            limit: 20,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(starred.total, 2, "只应命中两封星标邮件");
+    assert!(
+        starred.messages.iter().all(|m| m.id != inserted[1].id),
+        "未星标的邮件不能混进来"
+    );
+
+    // 与未读取交集：三封都没有 \Seen，所以两封星标仍然都命中。
+    let starred_unread = writable
+        .search(&SearchQuery {
+            flagged_only: true,
+            unread_only: true,
+            limit: 20,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(starred_unread.total, 2, "两个条件应取交集");
+
+    // 关掉星标条件后回到全量，证明它没有污染其它查询。
+    let all = writable
+        .search(&SearchQuery {
+            limit: 20,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(all.total, 3);
+}
+
 #[test]
 fn local_flag_toggles_collapse_to_one_target_state() {
     let (_dir, store) = open_store();

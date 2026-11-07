@@ -1047,6 +1047,11 @@ pub struct SearchQuery {
     pub subject: Option<String>,
     /// 只要未读。与其它条件取交集。
     pub unread_only: bool,
+    /// 只要已星标（`FLAG_FLAGGED`）。与其它条件取交集。
+    ///
+    /// 与 `unread_only` 是**两个独立的位**，不是互斥选项：模型问「重要的邮件」时
+    /// 会分别查「星标」与「未读近期」两次，最后合并排序。
+    pub flagged_only: bool,
     /// 分页大小，后端强制 ≤ 200。
     pub limit: u32,
     /// `(date, id)` 键集游标。
@@ -1100,6 +1105,9 @@ pub struct SavedSearchQuery {
     pub subject: Option<String>,
     #[serde(default)]
     pub unread_only: bool,
+    /// 只要已星标。老数据没有这个键，按 false 读（行为不变）。
+    #[serde(default)]
+    pub flagged_only: bool,
 }
 
 impl SavedSearchQuery {
@@ -1116,6 +1124,7 @@ impl SavedSearchQuery {
             to: query.to.clone(),
             subject: query.subject.clone(),
             unread_only: query.unread_only,
+            flagged_only: query.flagged_only,
         }
     }
 
@@ -1132,6 +1141,7 @@ impl SavedSearchQuery {
             to: self.to.clone(),
             subject: self.subject.clone(),
             unread_only: self.unread_only,
+            flagged_only: self.flagged_only,
             limit: crate::MAX_PAGE_SIZE,
             cursor: None,
         }

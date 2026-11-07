@@ -167,6 +167,11 @@ fn base_filters(query: &SearchQuery) -> (Vec<String>, Vec<SqlValue>) {
     if query.unread_only {
         parts.push("(m.flags & 1) = 0".to_string());
     }
+    // `flags & 4` 是 `\Flagged`（`FLAG_FLAGGED = 1 << 2`）。
+    // 「重要」在本地没有独立字段，星标是唯一可靠的用户显式标注。
+    if query.flagged_only {
+        parts.push("(m.flags & 4) != 0".to_string());
+    }
 
     (parts, values)
 }

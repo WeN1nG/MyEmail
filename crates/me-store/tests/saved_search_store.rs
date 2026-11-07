@@ -45,6 +45,7 @@ fn sample_query() -> me_core::model::SavedSearchQuery {
         to: None,
         subject: Some("预算".to_string()),
         unread_only: true,
+        flagged_only: false,
     }
 }
 
@@ -236,6 +237,7 @@ fn persisted_query_excludes_pagination_state() {
         to: None,
         subject: Some("预算".to_string()),
         unread_only: true,
+        flagged_only: true,
         // **分页态**——不该被存。
         limit: 50,
         cursor: Some((100, 200)),

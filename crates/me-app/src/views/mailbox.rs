@@ -771,6 +771,9 @@ fn current_query(state: &UiState) -> SearchQuery {
         to: non_empty(&state.search.to).or_else(|| parsed.to.clone()),
         subject: non_empty(&state.search.subject).or_else(|| parsed.subject.clone()),
         unread_only: state.search.unread_only || parsed.unread_only,
+        // 界面与速记语法暂不提供星标筛选；条件恒为 false，行为与改动前一致。
+        // 数据通路（`SearchQuery` → SQL）已经就绪，加 `is:flagged` 时只需改这里。
+        flagged_only: false,
         limit: 200,
         cursor: None,
     }
@@ -826,6 +829,9 @@ fn submit_search(state: &mut UiState, commands: &mut Vec<Command>) {
         to: non_empty(&state.search.to).or(parsed.to),
         subject: non_empty(&state.search.subject).or(parsed.subject),
         unread_only: state.search.unread_only || parsed.unread_only,
+        // 界面与速记语法暂不提供星标筛选；条件恒为 false，行为与改动前一致。
+        // 数据通路（`SearchQuery` → SQL）已经就绪，加 `is:flagged` 时只需改这里。
+        flagged_only: false,
         limit: 200,
         cursor: None,
     };
