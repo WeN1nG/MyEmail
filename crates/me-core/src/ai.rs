@@ -1604,7 +1604,10 @@ pub static TOOL_SPECS: LazyLock<Vec<AiToolSpec>> = LazyLock::new(|| {
             name: AiToolName::EmailSearch,
             description: "检索本地已缓存的邮件摘要（不下载正文、不读附件、不联网）。\
 只返回主题/发件人/日期/文件夹/是否带附件/片段。多个条件按「同时满足」处理。\
-用户问「有没有某封邮件」「谁发过…」时使用。",
+**至少要给一个条件**：query / from / to / subject / after / before / folder / \
+unread_only / flagged_only / days 任意一个即可（只给时间窗或只给星标也算合法）。\
+用户问「有没有某封邮件」「谁发过…」「最近有什么」「哪些是重要的」时使用；\
+「重要」优先用 flagged_only 查星标，再用 days + unread_only 查近期未读，最后合并排序。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1612,10 +1615,13 @@ pub static TOOL_SPECS: LazyLock<Vec<AiToolSpec>> = LazyLock::new(|| {
                     "from": {"type": "string", "maxLength": 320, "description": "发件人邮箱或姓名（姓名会先在记忆里查邮箱）"},
                     "to": {"type": "string", "maxLength": 320, "description": "收件人"},
                     "subject": {"type": "string", "maxLength": 200, "description": "主题关键词"},
-                    "after": {"type": "string", "description": "起始日期 YYYY-MM-DD"},
+                    "after": {"type": "string", "description": "起始日期 YYYY-MM-DD（与 days 同时给时以 days 为准）"},
                     "before": {"type": "string", "description": "结束日期 YYYY-MM-DD"},
+                    "days": {"type": "integer", "minimum": 1, "maximum": 365,
+                             "description": "相对时间窗：最近 N 天。不需要知道今天是几号，优先用它"},
                     "folder": {"type": "string", "maxLength": 200, "description": "文件夹名"},
-                    "unread_only": {"type": "boolean"},
+                    "unread_only": {"type": "boolean", "description": "只要未读"},
+                    "flagged_only": {"type": "boolean", "description": "只要已星标（用户手动标记的重要）"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}
                 },
                 "additionalProperties": false

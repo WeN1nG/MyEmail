@@ -49,6 +49,16 @@ impl Turn {
     }
 }
 
+/// 构造一次工具调用。`parse_ok` 恒为真：这些测试关心的是参数**语义**，不是 JSON 坏掉的情况。
+fn tool_call(id: &str, name: AiToolName, args: serde_json::Value) -> AiToolCall {
+    AiToolCall {
+        id: id.to_string(),
+        name,
+        arguments: args,
+        parse_ok: true,
+    }
+}
+
 struct MockAiProvider {
     script: Mutex<VecDeque<Turn>>,
     /// 每轮请求携带的 `tools` 数量（用于验证开关真的收紧了请求）。
@@ -998,6 +1008,122 @@ async fn corrupt_model_json_keeps_original_profiles() {
         .get_setting(me_core::settings_key::AI_MODELS)
         .expect("read");
     assert_eq!(raw.as_deref(), Some(corrupt), "原值不能被覆盖");
+}
+
+/// 只给时间窗（不给关键词/发件人/主题/收件人）也必须能检索。
+///
+/// 这是「有什么重要的邮件」那一轮的根因之一：模型写 `unread_only` + `after`
+/// 完全符合 schema，实现却只认四个文本条件，于是它换着说法撞了 6 次。
+#[tokio::test]
+async fn email_search_accepts_time_window_without_keyword() {
+    let (_dir, store) = open();
+    let call = tool_call(
+        "c1",
+        AiToolName::EmailSearch,
+        json!({
+            "motive": "用户问最近有什么邮件，按时间窗检索",
+            "days": 7,
+            "limit": 5
+        }),
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(call),
+        Turn::text("近 7 天没有新的邮件。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+
+    commands
+        .send(Command::CreateAiConversation { model: None })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiConversationsChanged)
+    })
+    .await;
+    let conversation = latest_conversation(&store);
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "最近有什么邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let completed = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiToolCompleted { .. })
+    })
+    .await;
+    let Event::AiToolCompleted {
+        status, summary, ..
+    } = completed
+    else {
+        panic!("期望工具完成事件");
+    };
+    assert_eq!(
+        status,
+        me_core::ai::AiToolStatus::Ok,
+        "时间窗是合法检索条件，实际：{summary}"
+    );
+    assert!(
+        !summary.contains("至少需要一个检索条件"),
+        "不应再出现旧报错文案，实际：{summary}"
+    );
+}
+
+/// 一个条件都不给时才报错，且文案要把**全部**可用条件列出来。
+///
+/// 只说「至少需要一个检索条件」等于没说：模型不知道该补什么，只能猜。
+#[tokio::test]
+async fn email_search_without_any_condition_lists_them_all() {
+    let (_dir, store) = open();
+    let call = tool_call(
+        "c1",
+        AiToolName::EmailSearch,
+        json!({
+            "motive": "用户问邮件，但没说要查什么",
+            "limit": 5
+        }),
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(call),
+        Turn::text("没给检索条件，我不该硬查。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+
+    commands
+        .send(Command::CreateAiConversation { model: None })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiConversationsChanged)
+    })
+    .await;
+    let conversation = latest_conversation(&store);
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看邮箱".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+
+    let completed = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiToolCompleted { .. })
+    })
+    .await;
+    let Event::AiToolCompleted {
+        status, summary, ..
+    } = completed
+    else {
+        panic!("期望工具完成事件");
+    };
+    assert_eq!(status, me_core::ai::AiToolStatus::Error);
+    for expected in ["flagged_only", "days", "unread_only", "folder", "query"] {
+        assert!(
+            summary.contains(expected),
+            "报错文案必须列出可用条件 `{expected}`，实际：{summary}"
+        );
+    }
 }
 
 /// 动机要随事件一起发出来：界面在工具**执行中**就要能显示「为什么调它」。

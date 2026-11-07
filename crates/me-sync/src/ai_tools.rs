@@ -17,7 +17,7 @@ use me_core::ai::{
 };
 use me_core::ai_plan::{Capability, Plan, PlanStatus, PlanStep, validate_plan};
 use me_core::calendar::{CalendarEventDraft, CalendarSeries};
-use me_core::model::{FolderId, MessageId, MessageSummary};
+use me_core::model::{FolderId, MessageId, MessageSummary, now_unix};
 use me_core::music::{MusicAction, MusicOp};
 use me_core::port::StorePort;
 use me_core::{CoreError, Event, Flags, SearchQuery};
@@ -363,8 +363,35 @@ where
         let subject = arg_str(args, "subject", 200);
         let to = arg_str(args, "to", 320);
         let mut from = arg_str(args, "from", 320);
-        if query_text.is_none() && from.is_none() && subject.is_none() && to.is_none() {
-            return Err(CoreError::validation("至少需要一个检索条件"));
+        let folder_arg = arg_str(args, "folder", 200);
+        let unread_only = arg_bool(args, "unread_only").unwrap_or(false);
+        let flagged_only = arg_bool(args, "flagged_only").unwrap_or(false);
+        // `days` 优先于 `after`：模型算日期常出错，让它直接说「最近 7 天」更可靠。
+        // 两者同时给时**静默以 days 为准**，不报「参数冲突」——报冲突只会让模型
+        // 换个说法再来一次，正是当初 8 连击的成因之一。
+        let days = arg_u32(args, "days").map(|value| value.clamp(1, 365));
+        let since = match days {
+            Some(days) => Some(now_unix() - i64::from(days) * 86_400),
+            None => arg_date(args, "after"),
+        };
+        let until = arg_date(args, "before");
+        // 条件判定必须与 schema 里列出的条件**完全一致**。早期只认四个文本条件，
+        // 模型写「近 7 天未读」（`unread_only` + `after`，schema 允许）必然拿到
+        // 「至少需要一个检索条件」，它不知道缺的是哪一类，只能换说法反复重试。
+        if query_text.is_none()
+            && from.is_none()
+            && subject.is_none()
+            && to.is_none()
+            && since.is_none()
+            && until.is_none()
+            && folder_arg.is_none()
+            && !unread_only
+            && !flagged_only
+        {
+            return Err(CoreError::validation(
+                "至少需要一个检索条件：query / from / to / subject / after / before / \
+days / folder / unread_only / flagged_only",
+            ));
         }
         // `from` 允许写人名：先按实体注册表换成邮箱；换不到就按原文做子串匹配
         // （`from_addr` 里存的是 `Name <addr>`，姓名本身也能命中）。
@@ -372,9 +399,8 @@ where
             from = Some(self.resolve_from_filter(raw).await);
         }
         let limit = arg_u32(args, "limit").unwrap_or(5).clamp(1, 20);
-        let unread_only = arg_bool(args, "unread_only").unwrap_or(false);
 
-        let folders = if let Some(name) = arg_str(args, "folder", 200) {
+        let folders = if let Some(name) = folder_arg {
             let ids = self
                 .db(move |s| {
                     let mut ids = Vec::new();
@@ -407,15 +433,14 @@ where
             text: query_text.unwrap_or_default(),
             accounts: Vec::new(),
             folders,
-            since: arg_date(args, "after"),
-            until: arg_date(args, "before"),
+            since,
+            until,
             has_attachment: None,
             from,
             to,
             subject,
             unread_only,
-            // 星标条件在下一步接线（`email_search` 的 `flagged_only` 参数）。
-            flagged_only: false,
+            flagged_only,
             limit,
             cursor: None,
         };
@@ -444,9 +469,12 @@ where
 
         if messages.is_empty() {
             return Ok((
-                "本地缓存中没有找到匹配的邮件。可以提示用户先同步账户，或换一个关键词。"
+                "本地缓存中 0 命中。可尝试：① 放宽时间窗（例如最近 30 天）；\
+② 去掉 flagged_only / unread_only 这类限定；③ 换发件人或主题关键词；\
+④ 一封都没有时提示用户先同步最近的邮件。\
+**不要用完全相同的参数再查一次**——同样的条件只会得到同样的结果。"
                     .to_string(),
-                "未找到".to_string(),
+                "未找到（0 命中）".to_string(),
             ));
         }
 
