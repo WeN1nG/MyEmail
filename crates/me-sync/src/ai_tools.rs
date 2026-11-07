@@ -360,6 +360,64 @@ fn arg_str(args: &Value, key: &str, max: usize) -> Option<String> {
     Some(truncate_chars(value, max))
 }
 
+/// `email_search` 认识的参数名。
+///
+/// 与 schema 的 `properties` 一一对应（`motive` / `step_id` 是引擎注入的，不算）。
+const EMAIL_SEARCH_ARG_NAMES: &[&str] = &[
+    "query",
+    "from",
+    "to",
+    "subject",
+    "after",
+    "before",
+    "days",
+    "folder",
+    "unread_only",
+    "flagged_only",
+    "has_attachment",
+    "criteria",
+    "limit",
+];
+
+/// 已经被移除的参数，以及它们的替代说法。
+///
+/// `important_only` 曾经是「什么算重要」的预置口径。它被移除是因为
+/// 那等于系统替所有用户决定了「重要」等于哪几条——现在这件事由模型
+/// 写成判据（`criteria`）来完成。
+const RETIRED_EMAIL_ARGS: &[(&str, &str)] = &[(
+    "important_only",
+    "它曾预置了「什么算重要」的一套口径，现在这个判断由你自己做：\
+用 criteria 把你理解的判据逐条写出来（每条一个 label 加一组条件），\
+命中任意一条即算命中",
+)];
+
+/// 拒绝不认识的参数，并点名。
+///
+/// 只说「至少需要一个检索条件」等于让模型瞎猜——它不知道缺的是哪一类，
+/// 只会换个说法再试一次（当初 8 连击的成因之一）。
+fn reject_unknown_email_args(args: &Value) -> Result<(), CoreError> {
+    let Some(map) = args.as_object() else {
+        return Ok(());
+    };
+    for key in map.keys() {
+        if key == "motive" || key == "step_id" {
+            continue;
+        }
+        if let Some((_, hint)) = RETIRED_EMAIL_ARGS.iter().find(|(name, _)| name == key) {
+            return Err(CoreError::validation(format!(
+                "参数「{key}」已经没有了。{hint}"
+            )));
+        }
+        if !EMAIL_SEARCH_ARG_NAMES.contains(&key.as_str()) {
+            return Err(CoreError::validation(format!(
+                "参数「{key}」不认得。可用的是：{}",
+                EMAIL_SEARCH_ARG_NAMES.join(" / ")
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn arg_u32(args: &Value, key: &str) -> Option<u32> {
     args.get(key)?.as_u64().map(|value| value as u32)
 }
@@ -648,94 +706,23 @@ where
             return Err(CoreError::validation("参数不是合法 JSON"));
         }
         let args = &call.arguments;
-        let query_text = arg_str(args, "query", 200);
-        let subject = arg_str(args, "subject", 200);
-        let to = arg_str(args, "to", 320);
-        let mut from = arg_str(args, "from", 320);
-        let folder_arg = arg_str(args, "folder", 200);
-        let unread_only = arg_bool(args, "unread_only").unwrap_or(false);
-        let flagged_only = arg_bool(args, "flagged_only").unwrap_or(false);
-        let important_only = arg_bool(args, "important_only").unwrap_or(false);
-        // `days` 优先于 `after`：模型算日期常出错，让它直接说「最近 7 天」更可靠。
-        // 两者同时给时**静默以 days 为准**，不报「参数冲突」——报冲突只会让模型
-        // 换个说法再来一次，正是当初 8 连击的成因之一。
-        let days = arg_u32(args, "days").map(|value| value.clamp(1, 365));
-        let since = match days {
-            Some(days) => Some(now_unix() - i64::from(days) * 86_400),
-            None => arg_date(args, "after"),
-        };
-        let until = arg_date(args, "before");
-        // 条件判定必须与 schema 里列出的条件**完全一致**。早期只认四个文本条件，
-        // 模型写「近 7 天未读」（`unread_only` + `after`，schema 允许）必然拿到
-        // 「至少需要一个检索条件」，它不知道缺的是哪一类，只能换说法反复重试。
-        if query_text.is_none()
-            && from.is_none()
-            && subject.is_none()
-            && to.is_none()
-            && since.is_none()
-            && until.is_none()
-            && folder_arg.is_none()
-            && !unread_only
-            && !flagged_only
-            && !important_only
-        {
-            return Err(CoreError::validation(
-                "至少需要一个检索条件：query / from / to / subject / after / before / \
-days / folder / unread_only / flagged_only / important_only",
-            ));
-        }
-        // `from` 允许写人名：先按实体注册表换成邮箱；换不到就按原文做子串匹配
-        // （`from_addr` 里存的是 `Name <addr>`，姓名本身也能命中）。
-        if let Some(raw) = from.clone() {
-            from = Some(self.resolve_from_filter(raw).await);
-        }
-        let limit = arg_u32(args, "limit").unwrap_or(5).clamp(1, 20);
 
-        let folders = if let Some(name) = folder_arg {
-            let ids = self
-                .db(move |s| {
-                    let mut ids = Vec::new();
-                    for account in s.list_accounts()? {
-                        for folder in s.list_folders(account.id)? {
-                            if folder.name.eq_ignore_ascii_case(&name) {
-                                ids.push(folder.id);
-                            }
-                        }
-                    }
-                    Ok(ids)
-                })
-                .await?;
-            if ids.is_empty() {
-                return Err(CoreError::validation("没有找到这个文件夹"));
-            }
-            ids
-        } else {
-            Vec::new()
-        };
+        // 判据组：模型把定性需求翻译成的多条判据，取**并集**。
+        //
+        // 判据组与普通条件**互斥**：判据自己带条件，再叠一层普通条件
+        // 会让「重要」变成「重要且最近」——那是另一个问题。
+        let criteria = me_core::ai_plan::parse_criteria(args)?;
+        if !criteria.is_empty() {
+            return self
+                .email_search_by_criteria(conversation, call, &criteria)
+                .await;
+        }
 
-        // 多个条件**取交集**：全文走 FTS 短语，头部字段与未读在 SQL 层 AND。
-        // 之前「多于一个条件就报错」的做法会让模型多绕一轮，用户看到的是
-        // 「AI 说它一次只能搜一个词」。
+        let query = self.build_email_query(args, 5).await?;
         // 卡片上的「命中理由」要在把条件 move 进 SearchQuery 之前留一份。
-        let reason_text = query_text.clone();
-        let reason_subject = subject.clone();
-        let reason_from = from.clone();
-        let query = SearchQuery {
-            text: query_text.unwrap_or_default(),
-            accounts: Vec::new(),
-            folders,
-            since,
-            until,
-            has_attachment: None,
-            from,
-            to,
-            subject,
-            unread_only,
-            flagged_only,
-            important_only,
-            limit,
-            cursor: None,
-        };
+        let reason_text = arg_str(args, "query", 200);
+        let reason_subject = arg_str(args, "subject", 200);
+        let reason_from = arg_str(args, "from", 320);
         let outcome = self.search_mail(query, 20).await?;
         let messages = outcome.messages;
         let folder_names = self.folder_names().await;
@@ -786,6 +773,217 @@ days / folder / unread_only / flagged_only / important_only",
             ));
         }
         Ok((text, format!("检索到 {} 封", messages.len())))
+    }
+
+    /// 按**判据组**检索：每条判据各查一次，结果取并集。
+    ///
+    /// 为什么要单独一条路径：
+    /// - 判据之间是「或」，而 `SearchQuery` 的多个条件是「且」——语义相反，
+    ///   塞进同一个查询会得到完全不同的结果；
+    /// - 每条结果要标注**命中了哪条判据**，用户据此判断模型的理解对不对；
+    /// - 排序按判据在组里的先后：靠前的判据命中时排在前面。
+    ///
+    /// 这是「让模型自己理解需求」的落点：引擎只负责把模型给的判据
+    /// 忠实执行并标出来，**不替模型决定什么算重要**。
+    async fn email_search_by_criteria(
+        &self,
+        conversation: me_core::ai::AiConversationId,
+        call: &AiToolCall,
+        criteria: &[me_core::ai_plan::Criterion],
+    ) -> Result<(String, String), CoreError> {
+        let limit = arg_u32(&call.arguments, "limit").unwrap_or(5).clamp(1, 20) as usize;
+        let folder_names = self.folder_names().await;
+
+        // 每条判据各查一次。按判据顺序累加，后面的判据不覆盖前面的。
+        let mut ranked: Vec<(usize, MessageSummary)> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut per_criterion: Vec<(String, u32)> = Vec::new();
+
+        for (index, criterion) in criteria.iter().enumerate() {
+            let query = self
+                .build_email_query(&criterion.query, limit as u32)
+                .await?;
+            let outcome = self.search_mail(query, 20).await?;
+            per_criterion.push((criterion.label.clone(), outcome.total));
+            for message in outcome.messages {
+                if seen.insert(message.id.0) {
+                    ranked.push((index, message));
+                }
+            }
+        }
+
+        // 排序：先按判据顺序（靠前的判据优先），同一条判据内保持时间倒序。
+        // 稳定排序保证同一判据内的原始顺序不被打乱。
+        ranked.sort_by_key(|(index, _)| *index);
+
+        // 截到 limit，但**每条判据至少留一条**——
+        // 否则第 3 条判据的结果会被前面的判据完全挤掉，用户看不到模型的另一种理解。
+        let mut picked: Vec<(usize, MessageSummary)> = Vec::new();
+        let mut per_label: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (index, message) in ranked.into_iter() {
+            let used = per_label.entry(index).or_insert(0);
+            if *used < 1 || picked.len() < limit {
+                *used += 1;
+                picked.push((index, message));
+            }
+            if picked.len() >= limit + criteria.len() {
+                break;
+            }
+        }
+
+        let cards: Vec<me_core::MailCardRef> = picked
+            .iter()
+            .map(|(index, message)| me_core::MailCardRef {
+                message: message.id,
+                reason: criteria[*index].label.clone(),
+            })
+            .collect();
+        let total = cards.len() as u32;
+        self.emit(Event::AiToolEmailResults {
+            conversation,
+            call_id: call.id.clone(),
+            cards,
+            total,
+        })
+        .await;
+
+        if picked.is_empty() {
+            let detail: Vec<String> = per_criterion
+                .iter()
+                .map(|(label, count)| format!("{label}（{count} 封）"))
+                .collect();
+            return Ok((
+                format!(
+                    "按 {} 条判据检索，本地缓存中 0 命中：{}。\
+可尝试：① 放宽判据里的时间窗；② 去掉某条判据；③ 提示用户先同步最近的邮件。\
+**不要用完全相同的参数再查一次**——同样的条件只会得到同样的结果。",
+                    criteria.len(),
+                    detail.join("、")
+                ),
+                "未找到（0 命中）".to_string(),
+            ));
+        }
+
+        let mut text = format!(
+            "按 {} 条判据检索，命中 {} 封（判据：{}）：\n",
+            criteria.len(),
+            total,
+            per_criterion
+                .iter()
+                .map(|(label, count)| format!("{label} {count} 封"))
+                .collect::<Vec<_>>()
+                .join("、")
+        );
+        for (position, (criterion_index, message)) in picked.iter().enumerate() {
+            text.push_str(&format!(
+                "{}. [命中判据：{}] {}\n",
+                position + 1,
+                criteria[*criterion_index].label,
+                format_message(
+                    position + 1,
+                    message,
+                    folder_names.get(&message.folder).cloned()
+                )
+            ));
+        }
+        Ok((text, format!("命中 {total} 封")))
+    }
+
+    /// 把工具参数翻译成一次 `SearchQuery`。
+    ///
+    /// 普通条件与判据内部的条件走**同一套翻译**——判据只是「一组带名字的条件」，
+    /// 底层没有第二种检索语义。
+    async fn build_email_query(
+        &self,
+        args: &serde_json::Value,
+        default_limit: u32,
+    ) -> Result<SearchQuery, CoreError> {
+        // 未知参数要点名。schema 声明了 `additionalProperties: false`，
+        // 但模型仍可能写出一个不存在的参数（历史上就有 `important_only`）。
+        // 只说「至少需要一个检索条件」等于让模型瞎猜——它不知道缺的是哪一类，
+        // 只会换个说法再试一次。
+        reject_unknown_email_args(args)?;
+        let query_text = arg_str(args, "query", 200);
+        let subject = arg_str(args, "subject", 200);
+        let to = arg_str(args, "to", 320);
+        let mut from = arg_str(args, "from", 320);
+        let folder_arg = arg_str(args, "folder", 200);
+        let unread_only = arg_bool(args, "unread_only").unwrap_or(false);
+        let flagged_only = arg_bool(args, "flagged_only").unwrap_or(false);
+        let has_attachment = arg_bool(args, "has_attachment");
+        // `days` 优先于 `after`：模型算日期常出错，让它直接说「最近 7 天」更可靠。
+        // 两者同时给时**静默以 days 为准**，不报「参数冲突」——报冲突只会让模型
+        // 换个说法再来一次，正是当初 8 连击的成因之一。
+        let days = arg_u32(args, "days").map(|value| value.clamp(1, 365));
+        let since = match days {
+            Some(days) => Some(now_unix() - i64::from(days) * 86_400),
+            None => arg_date(args, "after"),
+        };
+        let until = arg_date(args, "before");
+        // 条件判定必须与 schema 里列出的条件**完全一致**。早期只认四个文本条件，
+        // 模型写「近 7 天未读」（`unread_only` + `after`，schema 允许）必然拿到
+        // 「至少需要一个检索条件」，它不知道缺的是哪一类，只能换说法反复重试。
+        if query_text.is_none()
+            && from.is_none()
+            && subject.is_none()
+            && to.is_none()
+            && since.is_none()
+            && until.is_none()
+            && folder_arg.is_none()
+            && !unread_only
+            && !flagged_only
+            && has_attachment.is_none()
+        {
+            return Err(CoreError::validation(
+                "至少需要一个检索条件：query / from / to / subject / after / before / \
+days / folder / unread_only / flagged_only / has_attachment",
+            ));
+        }
+        // `from` 允许写人名：先按实体注册表换成邮箱；换不到就按原文做子串匹配
+        // （`from_addr` 里存的是 `Name <addr>`，姓名本身也能命中）。
+        if let Some(raw) = from.clone() {
+            from = Some(self.resolve_from_filter(raw).await);
+        }
+        let limit = arg_u32(args, "limit").unwrap_or(default_limit).clamp(1, 20);
+
+        let folders = if let Some(name) = folder_arg {
+            let ids = self
+                .db(move |s| {
+                    let mut ids = Vec::new();
+                    for account in s.list_accounts()? {
+                        for folder in s.list_folders(account.id)? {
+                            if folder.name.eq_ignore_ascii_case(&name) {
+                                ids.push(folder.id);
+                            }
+                        }
+                    }
+                    Ok(ids)
+                })
+                .await?;
+            if ids.is_empty() {
+                return Err(CoreError::validation("没有找到这个文件夹"));
+            }
+            ids
+        } else {
+            Vec::new()
+        };
+
+        Ok(SearchQuery {
+            text: query_text.unwrap_or_default(),
+            accounts: Vec::new(),
+            folders,
+            since,
+            until,
+            has_attachment,
+            from,
+            to,
+            subject,
+            unread_only,
+            flagged_only,
+            limit,
+            cursor: None,
+        })
     }
 
     // -----------------------------------------------------------------------

@@ -20,9 +20,19 @@
 //! | `after:2026-10-01` | 晚于该日期（含边界，按当天 23:59:59 之后） |
 //! | `is:unread` | 仅未读 |
 //! | `is:flagged` | 仅星标 |
-//! | `is:important` | 仅「重要」（星标，或近 7 天未读） |
 //!
 //! **不支持**：`OR`、括号、引号（O29 已拍板 v0.4 不做）。
+//!
+//! # 为什么没有 `is:important`
+//!
+//! 「重要」「紧急」「值得看」是**判断**，不是**数据里的一个字段**。
+//! 本地只有星标、未读、时间这些客观维度，没有「重要性」这一列——
+//! 硬凑一个 `is:important` 等于把某一种口径（当初是「星标或近 7 天未读」）
+//! 写死给所有用户，而那个口径既不来自用户，也未必合用户的心意。
+//!
+//! 用户想要「重要的邮件」时，用能表达**客观维度**的条件组合去筛
+//! （`is:flagged`、`is:unread`、时间窗、主题词），或者直接问 AI——
+//! AI 会把「重要」翻译成具体判据给你看，而不是套一个预设。
 //!
 //! # 设计取舍
 //!
@@ -58,11 +68,6 @@ pub struct ParsedQuery {
     pub unread_only: bool,
     /// 仅星标。
     pub flagged_only: bool,
-    /// 仅「重要」：星标，或近 7 天未读。
-    ///
-    /// 这是 AI 那套「什么算重要」判据的用户侧版本：
-    /// 用户手动搜 `is:important` 得到的，与 AI 回答「哪些邮件重要」是同一套口径。
-    pub important_only: bool,
     /// 无法识别的片段（拼错的字段名、无法解析的日期等），UI 用来提示但不阻断搜索。
     pub unknown: Vec<String>,
 }
@@ -82,7 +87,6 @@ impl ParsedQuery {
             && self.until.is_none()
             && !self.unread_only
             && !self.flagged_only
-            && !self.important_only
     }
 
     /// 自由文本部分的字符数（用于「1～2 字仅匹配头部」的判定）。
@@ -118,9 +122,6 @@ impl ParsedQuery {
             n += 1;
         }
         if self.flagged_only {
-            n += 1;
-        }
-        if self.important_only {
             n += 1;
         }
         n
@@ -186,7 +187,6 @@ pub fn parse_search_syntax(input: &str, today: i64) -> ParsedQuery {
                 "unread" => out.unread_only = true,
                 "read" => out.unread_only = false,
                 "flagged" | "starred" => out.flagged_only = true,
-                "important" => out.important_only = true,
                 _ => out.unknown.push(format!("is:{value}")),
             },
             "before" | "after" => {
@@ -374,18 +374,24 @@ mod tests {
         assert!(p.flagged_only);
     }
 
+    /// `is:important` **不再**是一个条件。
+    ///
+    /// 「重要」是判断，不是数据里的字段。本地没有「重要性」这一列，
+    /// 硬凑一个筛选项等于把某一种口径（当初是「星标或近 7 天未读」）
+    /// 强加给所有用户。它应当像其它拼错的值一样进 `unknown`：
+    /// 搜索照常执行，同时告诉用户这个片段没被认出来。
     #[test]
-    fn is_important_sets_important_only() {
+    fn is_important_is_not_a_filter() {
         let p = parse_search_syntax("is:important", TODAY);
-        assert!(p.important_only);
-        assert!(!p.is_empty());
+        assert!(!p.flagged_only);
+        assert!(!p.unread_only);
+        assert_eq!(p.unknown, vec!["is:important".to_string()]);
     }
 
     #[test]
     fn is_unknown_value_goes_to_unknown() {
         let p = parse_search_syntax("is:whatever", TODAY);
         assert!(!p.flagged_only);
-        assert!(!p.important_only);
         assert_eq!(p.unknown, vec!["is:whatever".to_string()]);
     }
 

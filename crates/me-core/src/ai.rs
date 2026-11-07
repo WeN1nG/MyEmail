@@ -1417,13 +1417,18 @@ done/failed/skipped 并写一句 evidence。只有完全不需要工具时才不
 用户应该能在第一步就看出你有没有理解错。
 11. 需要正文细节时才用 mail_read，用 email_search 结果里的 message_id 指定；同一封邮件一次回复里最多读 3 次。正文未缓存时工具会明确告诉你「未缓存」，此时让用户先打开这封邮件，不要反复重试，也不要根据主题猜正文内容。
 12. 音乐只能操作本地曲库：先 music_search 看到曲名再 music_play；用户说「放首歌」而没指定曲名时，先查状态，多首命中就把候选列出来让用户选，不要自己挑。播放/暂停/切歌/停止用 music_control。\
-13. 用户问「重要的邮件」时按这套判据做，并把判据写进清单第一步：\
-① 已星标；② 未读且 7 天内；③ 主题或发件人命中事项词（面试 / 笔试 / offer / 合同 / 账单 / 发票 / 截止 / 审核 / 退款）。\
-①② 用 email_search 的 important_only 一次查完（它就是「星标 或 近 7 天未读」），\
-不要分两次查再自己合并；③ 需要再补一次关键词检索。\
-排序：星标 > 未读近 3 天 > 有明确截止时间的通知。输出最多 5 封，每封一行：\
-日期 · 发件人 · 主题 · 为什么重要。三类判据都没命中时，明确说「没有发现明显重要的邮件」，\
-不要用无关邮件凑数，也不要因为查不到就反复换关键词重试。";
+13. **用户的定性需求由你自己翻译成判据，引擎不会替你决定。**\
+用户说「重要的邮件」「紧急的事」「该处理的」「最近值得看的」时，这些词在本地数据里\
+没有对应字段——你要先想清楚「在这个邮箱里，什么东西算满足这个词」，再把它写成一条条可执行的判据：\
+① 只能从**本地真实存在的维度**取条件：已星标 / 未读 / 时间范围 / 发件人 / 收件人 / 主题或正文关键词 / 附件 / 文件夹；\
+② 用 email_search 的 criteria 参数把判据逐条列出，每条给它一个**能让人看懂的名字**（如「已星标」「近 7 天未读」「主题含某个关键词」），\
+结果会标注命中了哪一条，用户据此判断你有没有理解错；\
+③ 判据之间是「或」的关系，命中任意一条即算命中；\
+④ **不要凭空扩大用户没提过的维度**（用户只说了某个范围，就不要塞进一堆与之无关的判据），\
+也不要把判据写成一堆互相重复的近似条件；\
+⑤ 判据要写进清单对应步骤，让用户第一眼就能看到你的理解；\
+⑥ 一条都没命中时明确说「按这些判据没找到」，不要用无关邮件凑数，也不要因为查不到就反复换关键词重试。\
+排序按判据在 criteria 里的先后：靠前的判据命中时排在前面。";
 
 /// 固定分隔符。内容里出现同名标记会被 [`escape_context`] 破坏，
 /// 使模型无法把它当作真正的边界。
@@ -1685,11 +1690,14 @@ pub static TOOL_SPECS: LazyLock<Vec<AiToolSpec>> = LazyLock::new(|| {
         AiToolSpec {
             name: AiToolName::EmailSearch,
             description: "检索本地已缓存的邮件摘要（不下载正文、不读附件、不联网）。\
-只返回主题/发件人/日期/文件夹/是否带附件/片段。多个条件按「同时满足」处理。\
+只返回主题/发件人/日期/文件夹/是否带附件/片段。\
 **至少要给一个条件**：query / from / to / subject / after / before / folder / \
-unread_only / flagged_only / important_only / days 任意一个即可（只给时间窗或只给星标也算合法）。\
-用户问「有没有某封邮件」「谁发过…」「最近有什么」「哪些是重要的」时使用；\
-「重要」直接用 important_only 一次查完（已星标，或近 7 天的未读），要更细再按需补查。",
+unread_only / flagged_only / days 任意一个即可（只给时间窗或只给星标也算合法）。\
+普通条件之间按「同时满足」处理。\
+\
+**用户的需求里有定性词时（重要、紧急、待办、值得看的…），不要自己猜一套固定口径**：\
+用 criteria 把你理解的判据逐条写出来，每条一个短名字（label）加一组条件，\
+命中任意一条就算命中。判据名会显示给用户，让他们能看出你有没有理解错。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1703,8 +1711,35 @@ unread_only / flagged_only / important_only / days 任意一个即可（只给�
                              "description": "相对时间窗：最近 N 天。不需要知道今天是几号，优先用它"},
                     "folder": {"type": "string", "maxLength": 200, "description": "文件夹名"},
                     "unread_only": {"type": "boolean", "description": "只要未读"},
-                    "flagged_only": {"type": "boolean", "description": "只要已星标（用户手动标记的重要）"},
-                    "important_only": {"type": "boolean", "description": "只要「重要」：已星标，或近 7 天的未读。回答「哪些邮件重要」时用它一次查完，不用分两次查再合并"},
+                    "flagged_only": {"type": "boolean", "description": "只要已星标（用户自己标记过的）"},
+                    "criteria": {
+                        "type": "array",
+                        "maxItems": 6,
+                        "description": "判据组：每条 = 一个短名字（label）+ 一组条件。\
+命中任意一条即算命中，结果会标注命中了哪条。\
+用于需求里有定性词、而本地没有对应字段时——由你把定性词翻译成可执行的条件，并给每条起个能让人看懂的名字。\
+不要凭空猜用户没提过的判据：条件只能来自本地真实存在的东西（星标/已读/时间/发件人/主题/附件/文件夹）。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "maxLength": 24,
+                                          "description": "这条判据的名字，会显示给用户（如「已星标」「近 7 天未读」）"},
+                                "query": {"type": "string", "maxLength": 200, "description": "全文关键词"},
+                                "from": {"type": "string", "maxLength": 320, "description": "发件人"},
+                                "to": {"type": "string", "maxLength": 320, "description": "收件人"},
+                                "subject": {"type": "string", "maxLength": 200, "description": "主题关键词"},
+                                "days": {"type": "integer", "minimum": 1, "maximum": 365, "description": "相对时间窗：最近 N 天"},
+                                "after": {"type": "string", "description": "起始日期 YYYY-MM-DD"},
+                                "before": {"type": "string", "description": "结束日期 YYYY-MM-DD"},
+                                "folder": {"type": "string", "maxLength": 200, "description": "文件夹名"},
+                                "unread_only": {"type": "boolean", "description": "只要未读"},
+                                "flagged_only": {"type": "boolean", "description": "只要已星标"},
+                                "has_attachment": {"type": "boolean", "description": "有无附件"}
+                            },
+                            "required": ["label"],
+                            "additionalProperties": false
+                        }
+                    },
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}
                 },
                 "additionalProperties": false
@@ -2229,12 +2264,12 @@ pub trait AiMemoryRepo {
 mod tests {
     use super::*;
 
-    /// 提示词不能再给「跳过清单」留合法出口，也必须把「重要」的判据写死。
+    /// 提示词不能再给「跳过清单」留合法出口。
     ///
     /// 旧文案结尾是「一句话能答完的事情不要建清单」，模型据此判断
     /// 「有什么重要的邮件」是一句话 → 不建清单 → 引擎的推进机制完全不生效。
     #[test]
-    fn system_prompt_forces_plan_and_defines_importance() {
+    fn system_prompt_forces_plan() {
         assert!(
             !SYSTEM_PROMPT.contains("不要建清单"),
             "不能再用「不要建清单」豁免：那正是模型跳过清单的依据"
@@ -2243,15 +2278,55 @@ mod tests {
             SYSTEM_PROMPT.contains("plan_update"),
             "P0 阶段仍以 plan_update 为主"
         );
-        // 本地没有 `importance` 字段，模型只能靠这三条推断，缺一条就会瞎猜关键词。
-        // `important_only` 是「星标 或 近 7 天未读」的一体化条件，
-        // 模型用它一次查完，不必分两次查再自己合并。
-        for needle in ["important_only", "7 天内", "星标", "面试"] {
+    }
+
+    /// 提示词**不能**替模型决定「什么算重要」。
+    ///
+    /// 这是本次事故真正要修的东西：早先的提示词直接写死了
+    /// 「重要 = ①已星标 ②未读且7天内 ③主题命中面试/offer/合同…」。
+    /// 那样做只是把用户那一个例子的答案抄进了系统——模型不需要理解需求，
+    /// 换个需求（「紧急的」「该跟进的」）就全错。
+    ///
+    /// 正确的做法是给模型**通用机制**：把定性词翻译成一条条判据，
+    /// 翻译结果要能被用户看见（判据名会显示在清单与结果里）。
+    #[test]
+    fn system_prompt_does_not_hardcode_a_particular_requirement() {
+        // 写死的口径不许再出现。
+        for needle in ["important_only", "面试", "offer", "合同", "发票"] {
             assert!(
-                SYSTEM_PROMPT.contains(needle),
-                "提示词缺少「重要」的判据：{needle}"
+                !SYSTEM_PROMPT.contains(needle),
+                "提示词里不该出现某个具体需求的答案：{needle}"
             );
         }
+        // 通用的机制必须在：判据 + 可用的客观维度 + 判据要可见。
+        for needle in ["criteria", "判据", "已星标", "未读"] {
+            assert!(
+                SYSTEM_PROMPT.contains(needle),
+                "提示词缺少通用机制的要素：{needle}"
+            );
+        }
+        assert!(
+            SYSTEM_PROMPT.contains("本地真实存在的维度"),
+            "提示词要划清边界：判据只能来自本地真实存在的维度"
+        );
+    }
+
+    /// `email_search` 的契约里不能有「重要」这种预置口径。
+    #[test]
+    fn email_search_contract_has_no_prebaked_importance() {
+        let spec = TOOL_SPECS
+            .iter()
+            .find(|spec| spec.name == AiToolName::EmailSearch)
+            .expect("email_search 必须在工具表里");
+        let props = spec.input_schema["properties"].as_object().expect("props");
+        assert!(
+            !props.contains_key("important_only"),
+            "email_search 不能预置「重要」的口径：那等于替模型做判断"
+        );
+        assert!(
+            props.contains_key("criteria"),
+            "email_search 必须提供判据组：模型要能把定性词翻译成条件"
+        );
     }
 
     fn entity(id: i64, kind: AiEntityKind, name: &str, aliases: &[&str], seen: i64) -> AiEntity {

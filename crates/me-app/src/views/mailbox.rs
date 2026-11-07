@@ -771,10 +771,9 @@ fn current_query(state: &UiState) -> SearchQuery {
         to: non_empty(&state.search.to).or_else(|| parsed.to.clone()),
         subject: non_empty(&state.search.subject).or_else(|| parsed.subject.clone()),
         unread_only: state.search.unread_only || parsed.unread_only,
-        // 星标与「重要」只来自速记语法（`is:flagged` / `is:important`）：
-        // 界面上还没有对应的复选框，但用户可以在搜索框里直接写。
+        // 星标只来自速记语法（`is:flagged`）：界面上还没有对应的复选框，
+        // 但用户可以在搜索框里直接写。
         flagged_only: parsed.flagged_only,
-        important_only: parsed.important_only,
         limit: 200,
         cursor: None,
     }
@@ -830,9 +829,8 @@ fn submit_search(state: &mut UiState, commands: &mut Vec<Command>) {
         to: non_empty(&state.search.to).or(parsed.to),
         subject: non_empty(&state.search.subject).or(parsed.subject),
         unread_only: state.search.unread_only || parsed.unread_only,
-        // 星标与「重要」只来自速记语法（`is:flagged` / `is:important`）。
+        // 星标只来自速记语法（`is:flagged`）。
         flagged_only: parsed.flagged_only,
-        important_only: parsed.important_only,
         limit: 200,
         cursor: None,
     };

@@ -211,6 +211,154 @@ impl OnEmpty {
     }
 }
 
+/// 一条**判据**：把用户口语里的定性词翻译成的、可执行的条件组。
+///
+/// 为什么要有这个类型：用户说的是「重要的邮件」「该处理的」「紧急的」，
+/// 这些词在邮件表里**没有对应字段**。模型必须自己决定「重要」等于
+/// 「已星标」还是「近 7 天未读」还是「主题含合同」——这个决定不能由
+/// 引擎代劳（代劳就等于把某一种口径写死，别的需求就用不上了）。
+///
+/// 一条判据 = 一个**人能读懂的名字** + 一组**机器能执行的条件**。
+/// 名字是关键：它出现在清单条与每条结果的「命中理由」里，
+/// 用户据此判断模型到底把「重要」理解成了什么。
+///
+/// 判据是 `email_search` 参数的一部分（`args.criteria`），**不另设计划字段**——
+/// 同一个东西写两遍，模型一定会写歪，而清单条显示的那份会与真正执行的那份对不上。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Criterion {
+    /// 这条判据的名字（≤ 24 字），给人看。
+    #[serde(default)]
+    pub label: String,
+    /// 这条判据对应的检索条件（`email_search` 的参数子集）。
+    #[serde(default)]
+    pub query: serde_json::Value,
+}
+
+impl Criterion {
+    pub fn new(label: &str, query: serde_json::Value) -> Self {
+        Self {
+            label: label.to_string(),
+            query,
+        }
+    }
+
+    /// 判据有没有至少一个可执行条件。
+    ///
+    /// 空条件的判据等于「什么都算」，会让并集退化成全量——
+    /// 那样模型就等于没做判断，比不做判据更糟。
+    pub fn has_condition(&self) -> bool {
+        self.query.as_object().is_some_and(|map| !map.is_empty())
+    }
+}
+
+/// 判据名字的长度上限。
+pub const MAX_CRITERION_LABEL_CHARS: usize = 24;
+/// 一组判据最多几条。
+///
+/// 6 是为了让「重要」这类复合需求能拆成 3–4 条，同时挡住
+/// 「把检索条件列成 20 条」——那说明模型在瞎试，不是在判断。
+pub const MAX_STEP_CRITERIA: usize = 6;
+
+/// 判据里允许出现的条件名。
+///
+/// 与 `EMAIL_SEARCH_CONDITIONS` 同源，但**不含 `limit`**：
+/// 判据是「什么样的邮件算命中」，条数上限不属于判据。
+pub const CRITERION_CONDITIONS: &[&str] = &[
+    "query",
+    "from",
+    "to",
+    "subject",
+    "after",
+    "before",
+    "days",
+    "folder",
+    "unread_only",
+    "flagged_only",
+    "has_attachment",
+];
+
+/// 从 `email_search` 的参数里取出判据组。
+///
+/// 判据藏在 `args.criteria` 里（数组），每项形如
+/// `{"label": "已星标", "flagged_only": true}`：
+/// `label` 是名字，其余键是这一条判据的条件。
+///
+/// 解析失败返回 `Err`（原因写进人话），不静默忽略——
+/// 静默忽略会让模型以为判据生效了，用户看到的是一份**没有兑现的理解**。
+pub fn parse_criteria(args: &serde_json::Value) -> Result<Vec<Criterion>, CoreError> {
+    let Some(raw) = args.get("criteria") else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = raw.as_array() else {
+        return Err(CoreError::validation(
+            "criteria 必须是数组：每项是一个判据对象（{\"label\": \"…\", 条件…}）",
+        ));
+    };
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    if items.len() > MAX_STEP_CRITERIA {
+        return Err(CoreError::validation(format!(
+            "criteria 有 {} 条，上限 {MAX_STEP_CRITERIA} 条：\
+判据多说明你在瞎试，不是在做判断",
+            items.len()
+        )));
+    }
+    let mut out = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(map) = item.as_object() else {
+            return Err(CoreError::validation(format!(
+                "criteria 第 {} 项不是对象：每项应形如 {{\"label\": \"已星标\", \"flagged_only\": true}}",
+                index + 1
+            )));
+        };
+        let label = map
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if label.is_empty() {
+            return Err(CoreError::validation(format!(
+                "criteria 第 {} 项没有 label：\
+给它一个短名字（如「已星标」「近 7 天未读」），用户要靠它判断你有没有理解错",
+                index + 1
+            )));
+        }
+        if label.chars().count() > MAX_CRITERION_LABEL_CHARS {
+            return Err(CoreError::validation(format!(
+                "criteria 第 {} 项的 label 太长（{} 字，上限 {MAX_CRITERION_LABEL_CHARS} 字）",
+                index + 1,
+                label.chars().count()
+            )));
+        }
+        // 名字之外的部分才是条件。
+        let mut query = serde_json::Map::new();
+        for (key, value) in map {
+            if key == "label" {
+                continue;
+            }
+            if !CRITERION_CONDITIONS.contains(&key.as_str()) {
+                return Err(CoreError::validation(format!(
+                    "criteria 第 {} 项（{label}）有条件「{key}」不认得：可用的是 {}",
+                    index + 1,
+                    CRITERION_CONDITIONS.join(" / ")
+                )));
+            }
+            query.insert(key.clone(), value.clone());
+        }
+        if query.is_empty() {
+            return Err(CoreError::validation(format!(
+                "criteria 第 {} 项（{label}）没有检索条件：\
+判据必须写成可执行的条件（如 {{\"flagged_only\": true}}），\
+空条件的判据等于「什么都算」",
+                index + 1
+            )));
+        }
+        out.push(Criterion::new(label, serde_json::Value::Object(query)));
+    }
+    Ok(out)
+}
+
 /// 一步为什么没做成。**结构化**存，UI 与 reflect 都要用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -466,6 +614,9 @@ impl PlanStep {
     ///
     /// `{{step.3.messages.0.message_id}}` 这类引用显示成 `→ 第 3 步结果`：
     /// 原始模板对用户没有意义，反而会把一条清单撑满。
+    ///
+    /// `criteria` 单独渲染成 `判据:已星标 / 近 7 天未读`——
+    /// 那是模型对用户需求的理解，用户最需要看到的就是它。
     pub fn args_digest(&self) -> Option<String> {
         let args = self.args.as_ref()?;
         let mut parts: Vec<String> = Vec::new();
@@ -473,6 +624,12 @@ impl PlanStep {
             serde_json::Value::Object(map) => {
                 for (key, value) in map {
                     if key == "motive" || key == "step_id" {
+                        continue;
+                    }
+                    if key == "criteria" {
+                        if let Some(digest) = criteria_digest(value) {
+                            parts.push(digest);
+                        }
                         continue;
                     }
                     parts.push(format!("{key}:{}", digest_value(value)));
@@ -485,6 +642,24 @@ impl PlanStep {
         }
         Some(truncate_chars(&parts.join(", "), 60))
     }
+}
+
+/// 判据组的摘要：`判据:已星标 / 近 7 天未读`。
+///
+/// 解析失败时不报错——摘要只是给人看的，参数校验另有其人。
+fn criteria_digest(value: &serde_json::Value) -> Option<String> {
+    let items = value.as_array()?;
+    let names: Vec<String> = items
+        .iter()
+        .filter_map(|item| item.get("label").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!("判据:{}", names.join(" / ")))
 }
 
 fn digest_value(value: &serde_json::Value) -> String {
@@ -1160,16 +1335,35 @@ pub enum EmptyAction {
 /// 把一步的检索条件**放宽一档**。
 ///
 /// 0 命中时不该原样重试（结果不会变），也不该让模型瞎猜换个什么词。
-/// 放宽的顺序是「先去掉最严格的限定」：
-/// 1. 星标（`flagged_only`）——用户自己标的，本轮可能还没标；
-/// 2. 主题关键词（`subject`）——比全文更窄；
-/// 3. 时间窗（`after` / `days`）——拉长到 30 天。
+///
+/// **两种放宽方式**，取决于这一步用的是普通条件还是判据组：
+///
+/// - 普通条件（一组 AND 条件）：按「先去掉最严格的限定」逐档放宽——
+///   先丢 `flagged_only`（用户自己标的，本轮可能还没标），
+///   再丢 `subject`（比全文更窄），最后拉长时间窗到 30 天。
+/// - 判据组（多条 OR 条件）：**先去掉最宽的那一条判据**。
+///   判据是模型对需求的翻译，去掉一条等于放弃一种理解；
+///   保留剩下的比放宽剩下的更忠实于模型原本的意图。
+///
+/// 时间窗**只拉长不删掉**：删掉等于把「最近 7 天的未读」变成「所有未读」——
+/// 那是换了一个问题，不是放宽了同一个问题。
 ///
 /// 返回 `None` 表示没有可放宽的条件了（该步到此为止）。
 ///
 /// `motive` 与 `step_id` 原样保留：它们不参与检索，但重试时要靠 `step_id`
 /// 绑回清单里的那一步，丢了就绑不上了。
 pub fn relax_args(args: &serde_json::Value) -> Option<serde_json::Value> {
+    // 判据组：去掉最后一条（最宽的那条）。
+    if let Some(items) = args.get("criteria").and_then(serde_json::Value::as_array)
+        && items.len() > 1
+    {
+        let mut map = args.as_object()?.clone();
+        map.insert(
+            "criteria".to_string(),
+            serde_json::Value::Array(items[..items.len() - 1].to_vec()),
+        );
+        return Some(serde_json::Value::Object(map));
+    }
     let mut map = args.as_object()?.clone();
     // 1) 先丢星标
     if map.remove("flagged_only").is_some() {
@@ -1523,6 +1717,7 @@ pub fn validate_plan_v2(
             }
             if let Some(tool) = step.tool {
                 check_args_against_schema(step.id, tool, args)?;
+                validate_criteria(step.id, tool, args)?;
             }
         }
 
@@ -1564,6 +1759,32 @@ pub fn validate_plan_v2(
     Ok(plan)
 }
 
+/// 校验一组判据。
+///
+/// 判据是模型对定性需求的翻译结果，所以校验的重点不是「格式对不对」，
+/// 而是「它有没有真的在做判断」：
+/// - 每条都要有名字：没有名字的判据用户看不见，模型就等于没说出自己的理解；
+/// - 每条都要有可执行条件：空条件的判据会让并集退化成全量，
+///   那比不判断更糟；
+/// - 条件里的参数名必须在允许集合里：拼错了要到执行期才炸，
+///   那时模型已经花掉一次机会。
+fn validate_criteria(
+    step_id: u8,
+    tool: AiToolName,
+    args: &serde_json::Value,
+) -> Result<(), CoreError> {
+    let criteria = parse_criteria(args)?;
+    if criteria.is_empty() {
+        return Ok(());
+    }
+    if tool != AiToolName::EmailSearch {
+        return Err(CoreError::validation(format!(
+            "第 {step_id} 步的 criteria 只对 email_search 有意义（它是给检索用的）"
+        )));
+    }
+    Ok(())
+}
+
 /// args 里的每个键都必须在该工具的参数表里。
 ///
 /// 这一条专门治「参数名拼错 / 用了该工具没有的参数」：执行期报错是一句笼统的
@@ -1594,8 +1815,10 @@ fn check_args_against_schema(
             )));
         }
     }
+    // 判据组本身就算「给了条件」——每条判据内部都是一组可执行条件。
     if tool == AiToolName::EmailSearch
         && !map.is_empty()
+        && !map.contains_key("criteria")
         && !EMAIL_SEARCH_CONDITIONS
             .iter()
             .any(|key| map.contains_key(*key))
@@ -1609,6 +1832,10 @@ fn check_args_against_schema(
 }
 
 /// `email_search` 里算「条件」的参数。**只给 limit 不算条件**。
+///
+/// `criteria` 是判据组：它内部就是一组条件，所以它也算「给了条件」。
+/// 这里**没有** `important_only`——「什么算重要」由模型自己写成判据，
+/// 引擎不替它决定任何一种口径。
 pub const EMAIL_SEARCH_CONDITIONS: &[&str] = &[
     "query",
     "from",
@@ -1619,8 +1846,8 @@ pub const EMAIL_SEARCH_CONDITIONS: &[&str] = &[
     "folder",
     "unread_only",
     "flagged_only",
-    "important_only",
     "days",
+    "criteria",
 ];
 
 /// 一次重列的输入（来自 SelfCheck，不是来自计划 JSON）。
@@ -2461,6 +2688,28 @@ mod tests {
         );
     }
 
+    /// 判据名要出现在清单条上——那是用户判断模型有没有理解错的唯一依据。
+    #[test]
+    fn args_digest_shows_criteria_labels() {
+        let step = tool_step(
+            1,
+            "查邮件",
+            AiToolName::EmailSearch,
+            json!({
+                "criteria": [
+                    {"label": "已星标", "flagged_only": true},
+                    {"label": "近 7 天未读", "unread_only": true, "days": 7}
+                ]
+            }),
+        );
+        let digest = step.args_digest().expect("有摘要");
+        assert!(digest.contains("判据"), "{digest}");
+        assert!(digest.contains("已星标"), "{digest}");
+        assert!(digest.contains("近 7 天未读"), "{digest}");
+        // 判据的原始条件不该挤进摘要——用户看的是名字，不是 JSON。
+        assert!(!digest.contains("flagged_only"), "{digest}");
+    }
+
     #[test]
     fn plan_v2_roundtrip_keeps_new_fields() {
         let plan = validate_plan_v2(
@@ -2644,6 +2893,117 @@ mod tests {
         assert!(relaxed.get("flagged_only").is_none(), "{relaxed}");
         assert_eq!(relaxed.get("motive").unwrap(), "查邮件", "{relaxed}");
         assert_eq!(relaxed.get("step_id").unwrap(), 2, "{relaxed}");
+    }
+
+    // ---- 判据 ----
+
+    /// 判据组解析：名字 + 条件，逐条分开。
+    #[test]
+    fn criteria_parse_splits_label_from_conditions() {
+        let criteria = parse_criteria(&json!({
+            "criteria": [
+                {"label": "已星标", "flagged_only": true},
+                {"label": "近 7 天未读", "unread_only": true, "days": 7}
+            ]
+        }))
+        .expect("能解析");
+        assert_eq!(criteria.len(), 2);
+        assert_eq!(criteria[0].label, "已星标");
+        assert_eq!(criteria[0].query.get("flagged_only").unwrap(), true);
+        assert_eq!(criteria[1].label, "近 7 天未读");
+        assert_eq!(criteria[1].query.get("days").unwrap(), 7);
+    }
+
+    /// 没有 `criteria` 时就是空组——普通条件走老路。
+    #[test]
+    fn criteria_absent_is_an_empty_group() {
+        assert!(
+            parse_criteria(&json!({ "query": "报告" }))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_criteria(&json!({})).unwrap().is_empty());
+    }
+
+    /// 没有名字的判据要拒：用户看不见它，模型就等于没说出自己的理解。
+    #[test]
+    fn criteria_without_label_is_rejected() {
+        let err = parse_criteria(&json!({
+            "criteria": [{"flagged_only": true}]
+        }))
+        .expect_err("要拒");
+        assert!(err.to_string().contains("label"), "{err}");
+    }
+
+    /// 空条件的判据要拒：它会让并集退化成全量，比不判断更糟。
+    #[test]
+    fn criteria_without_condition_is_rejected() {
+        let err = parse_criteria(&json!({
+            "criteria": [{"label": "随便什么都算"}]
+        }))
+        .expect_err("要拒");
+        assert!(err.to_string().contains("没有检索条件"), "{err}");
+    }
+
+    /// 条件名拼错要拒，并说清可用的是哪些。
+    #[test]
+    fn criteria_with_unknown_condition_is_rejected() {
+        let err = parse_criteria(&json!({
+            "criteria": [{"label": "星标", "starred_only": true}]
+        }))
+        .expect_err("要拒");
+        assert!(err.to_string().contains("starred_only"), "{err}");
+        assert!(err.to_string().contains("flagged_only"), "{err}");
+    }
+
+    /// 判据太多要拒：那说明模型在瞎试，不是在判断。
+    #[test]
+    fn too_many_criteria_is_rejected() {
+        let items: Vec<serde_json::Value> = (0..(MAX_STEP_CRITERIA + 1))
+            .map(|index| json!({"label": format!("判据{index}"), "flagged_only": true}))
+            .collect();
+        let err = parse_criteria(&json!({ "criteria": items })).expect_err("要拒");
+        assert!(err.to_string().contains("上限"), "{err}");
+    }
+
+    /// 判据组的放宽：**去掉最宽的那一条**。
+    ///
+    /// 与普通条件的放宽是两种不同的逻辑：判据是模型对需求的翻译，
+    /// 去掉一条等于放弃一种理解；保留剩下的比放宽剩下的更忠实。
+    #[test]
+    fn relax_drops_the_widest_criterion_first() {
+        let first = relax_args(&json!({
+            "criteria": [
+                {"label": "已星标", "flagged_only": true},
+                {"label": "近 7 天未读", "unread_only": true, "days": 7}
+            ]
+        }))
+        .expect("有可放宽的");
+        let items = first
+            .get("criteria")
+            .and_then(|v| v.as_array())
+            .expect("还有判据");
+        assert_eq!(items.len(), 1, "去掉了一条：{first}");
+        assert_eq!(items[0]["label"], "已星标", "{first}");
+
+        // 只剩一条时没有可放宽的了——不能把最后一条也丢掉，
+        // 那就变成「什么都算」了。
+        assert!(relax_args(&first).is_none());
+    }
+
+    /// 判据组的放宽不能顺手把普通条件也改掉——两组条件互不相干。
+    #[test]
+    fn relax_keeps_criteria_and_other_conditions_apart() {
+        let relaxed = relax_args(&json!({
+            "criteria": [
+                {"label": "A", "flagged_only": true},
+                {"label": "B", "unread_only": true}
+            ],
+            "limit": 5
+        }))
+        .expect("可放宽");
+        assert!(relaxed.get("criteria").is_some(), "{relaxed}");
+        assert_eq!(relaxed.get("limit").unwrap(), 5, "{relaxed}");
     }
 
     // ---- on_empty ----

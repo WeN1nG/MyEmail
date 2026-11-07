@@ -281,7 +281,7 @@ fn stored_plan(store: &Store, conversation: AiConversationId) -> Option<me_core:
 
 ### 步骤 5：提示词（只加第 13 条 + 删豁免，**不动工具名**）
 
-- 新增第 13 条「重要」判据
+- 新增第 13 条：**定性需求的翻译方法**（不写死任何具体口径——见方案 §12）
 - 第 10 条删掉「一句话能答完不要建清单」，但仍以 `plan_update` 为主
 - **不要**在这一步写 `plan_submit`（工具还不存在，见方案 §14）
 
@@ -403,7 +403,7 @@ async fn email_search_accepts_time_window_without_keyword() {
 | 2 契约对齐 | `5d73f5d` | 九条件判定、报错列全、`flagged_only` / `days`、空结果文案可操作 |
 | 3 指纹熔断 | `6d7fdaf` | `ToolBudget.failed` + 剔除 `motive`/`step_id` 的指纹；拦截在计数之前 |
 | 4 空正文守卫 | `2cc524a` | 一次催促 + 引擎兜底摘要 |
-| 5 提示词 | `44e7fd5` | 删豁免、加第 13 条「重要」判据 |
+| 5 提示词 | `44e7fd5` | 删豁免、加第 13 条（**后被通用化改造改写**，见方案 §12 / §19.4） |
 
 **测试 710 → 718（+8），0 failed / 6 ignored；fmt 与 clippy 全程通过。**
 
@@ -442,7 +442,12 @@ P1 的第一件事不是写 `plan_submit`，而是**先把 `PlanStep` 的构造�
 1. **P1**：收敛构造器 → Plan v2 结构 → 工具规格 → 首轮白名单 → 清单条 UI；
 2. **P2**：`SelfCheck` + `reconcile` → `validate_replan` → 错误分级与引擎重试 →
    0 命中放宽 → 阶段预算 → 四个新事件；
-3. **P3**：`is:important` / `important_only` → 跨轮延续 → 清单统计。
+3. **P3**：`is:flagged` → 跨轮延续 → 清单统计。
+
+> **后续修正**：原计划的 P3 第一项是 `is:important` / `important_only`。它被**移除**了——
+> 「什么算重要」不该由系统预置成一套口径，那等于替所有用户做决定。
+> 改成：客观维度（星标、未读、时间…）可筛；主观判断由模型用 `criteria` 翻译成判据。
+> 详见方案 §12 与 §19.4。
 
 每一步一次提交 + 全量门禁。最终 **测试 710 → 777（+67）**，0 failed / 6 ignored。
 

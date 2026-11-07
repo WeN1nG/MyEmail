@@ -306,6 +306,76 @@ fn open() -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
+/// 造一个带账户、收件箱与若干邮件的库，用来验证检索路径。
+///
+/// 走 `me-store` 的公开 port（`create_account` / `upsert_folder` /
+/// `insert_messages`）而不是直接写 SQL：测试不该绕过存储层。
+/// 同步出来的邮件没有正文，但**头部**
+/// （主题、发件人、日期、已读/星标位）齐全，检索用得到。
+///
+/// 邮件每项是 `(主题, 发件人, 日期, 标志位)`。
+fn seed_mail(store: &Store, items: &[(&str, &str, i64, u32)]) -> Vec<me_core::model::MessageId> {
+    let writable = store.writable();
+    let account = me_core::port::AccountRepo::create_account(
+        &writable,
+        &me_core::command::AccountDraft {
+            email: "seed@example.com".to_string(),
+            display_name: None,
+            imap: me_core::model::Endpoint {
+                host: "imap.example.com".to_string(),
+                port: 993,
+                tls: me_core::model::TlsMode::Implicit,
+            },
+            smtp: me_core::model::Endpoint {
+                host: "smtp.example.com".to_string(),
+                port: 465,
+                tls: me_core::model::TlsMode::Implicit,
+            },
+            auth_user: "seed@example.com".to_string(),
+            auth_secret: Some("secret".to_string()),
+            auth_method: me_core::model::AuthMethod::Password,
+            oauth_provider: None,
+            oauth_subject: None,
+            plaintext_tls_ack: false,
+        },
+    )
+    .expect("create account");
+    let folder = me_core::port::FolderRepo::upsert_folder(
+        &writable,
+        account.id,
+        &me_core::port::FolderInfo {
+            name: "INBOX".to_string(),
+            delimiter: Some('/'),
+            attributes: vec!["\\Inbox".to_string()],
+        },
+    )
+    .expect("upsert inbox");
+    let messages: Vec<me_core::model::NewMessage> = items
+        .iter()
+        .map(|(subject, from, date, flags)| me_core::model::NewMessage {
+            uid: None,
+            message_id: None,
+            subject: Some((*subject).to_string()),
+            from: Some(me_core::model::Address::new(None, *from)),
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: Some(*date),
+            date_source: me_core::model::DateSource::Header,
+            size: None,
+            flags: me_core::model::Flags::from_bits(*flags),
+            has_attachment: false,
+            in_reply_to: None,
+            references: Vec::new(),
+        })
+        .collect();
+    // 全限定调用：`AiRepo` 也有 `list_messages`，两个 trait 的方法名撞了。
+    me_core::port::MessageRepo::insert_messages(&writable, account.id, folder.id, &messages, 0)
+        .expect("insert messages")
+        .into_iter()
+        .map(|summary| summary.id)
+        .collect()
+}
+
 async fn wait_for(
     rx: &mut mpsc::Receiver<Event>,
     mut predicate: impl FnMut(&Event) -> bool,
@@ -2520,19 +2590,29 @@ async fn empty_result_widens_the_condition_and_retries() {
     assert_eq!(step.attempts, 2, "放宽那一次也是一次尝试：{step:?}");
 }
 
-/// `important_only` 单独也能检索：它是「星标 或 近 7 天未读」的合体条件，
-/// 不需要再补一个关键词。
+/// 判据组单独也能检索：它是「一组带名字的条件」，不需要再补一个关键词。
+///
+/// 这一条守护的是**通用机制**而不是某个具体口径：
+/// 模型把定性需求（重要/紧急/该跟进的…）翻译成几条判据，
+/// 引擎按判据逐条查、取并集——引擎自己不知道也不需要知道
+/// 「重要」等于哪几条。
 #[tokio::test]
-async fn important_only_alone_is_a_valid_search_condition() {
+async fn criteria_group_alone_is_a_valid_search_condition() {
     let (_dir, store) = open();
     let provider = MockAiProvider::new(vec![
         Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
         Turn::with_tool(tool_call(
             "c1",
             AiToolName::EmailSearch,
-            json!({ "motive": "查重要的邮件", "important_only": true }),
+            json!({
+                "motive": "按判据查邮件",
+                "criteria": [
+                    {"label": "已星标", "flagged_only": true},
+                    {"label": "近 7 天未读", "unread_only": true, "days": 7}
+                ]
+            }),
         )),
-        Turn::text("没有发现明显重要的邮件。"),
+        Turn::text("按这两条判据没找到。"),
     ]);
     let (commands, mut rx) = start_service(&store, provider.clone(), true);
     let conversation = new_conversation(&commands, &mut rx, &store).await;
@@ -2553,7 +2633,7 @@ async fn important_only_alone_is_a_valid_search_condition() {
     // 关键：不该报「至少需要一个检索条件」。
     assert!(
         !message.content.contains("至少需要一个检索条件"),
-        "important_only 本身就是条件：{}",
+        "判据组本身就是条件：{}",
         message.content
     );
     let plan = message.plan.expect("有清单");
@@ -2562,6 +2642,138 @@ async fn important_only_alone_is_a_valid_search_condition() {
         me_core::ai_plan::PlanStatus::Done,
         "这一步要正常走完：{:?}",
         plan.steps[0]
+    );
+}
+
+/// 判据组取**并集**，且每条结果标注命中了哪条判据。
+///
+/// 这是通用机制的核心行为：
+/// - 判据之间是「或」——两条判据各自命中的邮件都要出现；
+/// - 靠前的判据排在前面（判据顺序即优先级）；
+/// - 每封邮件带「命中判据」的名字，用户据此判断模型的理解对不对。
+///
+/// 注意这里刻意用**与事故无关**的判据名（「标记过的」「带附件的」），
+/// 证明这套机制与具体需求无关。
+#[tokio::test]
+async fn criteria_group_unions_results_and_labels_each_hit() {
+    let (_dir, store) = open();
+    let now = me_core::now_unix();
+    let ids = seed_mail(
+        &store,
+        &[
+            // 星标（已读）：命中「标记过的」。
+            ("标记那封", "a@example.com", now - 3600, 0b100),
+            // 未读：命中「未读的」。
+            ("未读那封", "b@example.com", now - 7200, 0b000),
+            // 已读且没星标：两条判据都不该命中它。
+            ("无关那封", "c@example.com", now - 10800, 0b001),
+        ],
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({
+                "motive": "按两条判据查",
+                "criteria": [
+                    {"label": "标记过的", "flagged_only": true},
+                    {"label": "未读的", "unread_only": true}
+                ]
+            }),
+        )),
+        Turn::text("找到两封。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "帮我找出值得优先看的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    // 邮件卡片事件在执行期就发出来了，先接住它。
+    let event = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiToolEmailResults { .. })
+    })
+    .await;
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    // 卡片：两条判据各命中一封，理由就是判据名。
+    let Event::AiToolEmailResults { cards, .. } = event else {
+        panic!("要邮件卡片事件");
+    };
+    assert_eq!(cards.len(), 2, "两条判据各命中一封：{cards:?}");
+    let reasons: Vec<&str> = cards.iter().map(|card| card.reason.as_str()).collect();
+    assert!(
+        reasons.contains(&"标记过的"),
+        "要标注命中了哪条判据：{reasons:?}"
+    );
+    assert!(
+        reasons.contains(&"未读的"),
+        "要标注命中了哪条判据：{reasons:?}"
+    );
+    // 靠前的判据排前面。
+    assert_eq!(cards[0].reason, "标记过的", "判据顺序即优先级：{cards:?}");
+    // 两条判据都不命中的那封不该出现。
+    assert!(
+        !cards.iter().any(|card| card.message == ids[2]),
+        "没命中任何判据的邮件不该出现：{cards:?}"
+    );
+}
+
+/// `important_only` 不再存在：它曾经是「重要 = 星标或近7天未读」这个
+/// 具体口径的产物。留着它就等于系统替所有用户决定了「什么算重要」——
+/// 那正是本次要修掉的东西。
+#[tokio::test]
+async fn important_only_is_no_longer_accepted() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查邮件", "important_only": true }),
+        )),
+        Turn::text("参数不对，我换个方式查。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    // 工具层要拒掉这个参数，并告诉模型正确做法是写判据。
+    let trace = message
+        .tool_trace
+        .iter()
+        .find(|trace| trace.tool == AiToolName::EmailSearch)
+        .expect("要留下 email_search 的轨迹");
+    assert_eq!(trace.status, me_core::ai::AiToolStatus::Error);
+    assert!(
+        trace.summary.contains("important_only"),
+        "要明确点名这个参数没了：{}",
+        trace.summary
+    );
+    assert!(
+        trace.summary.contains("criteria"),
+        "要告诉模型正确的替代做法是写判据：{}",
+        trace.summary
     );
 }
 
@@ -2650,6 +2862,79 @@ async fn the_original_incident_now_produces_a_visible_answer() {
         "要记录为什么不正常：{:?}",
         message.error
     );
+}
+
+/// **通用性回归**：换一个定性词，机制照样跑得通。
+///
+/// 这一条是本次改造的核心断言。早先的实现把「什么算重要」**写死**进系统
+/// （提示词第 13 条 + `important_only` 参数 + `is:important` 速记），
+/// 于是模型不需要理解需求，只需要套模板——换个需求就全错。
+///
+/// 现在定性词由模型自己翻译成判据。这里刻意用与「重要」无关的两个词
+/// （「紧急」「这周该回的」），并给出**完全不同的判据组合**，
+/// 证明系统里没有任何一个预置口径在替模型做决定。
+#[tokio::test]
+async fn any_qualitative_requirement_is_translated_by_the_model() {
+    for (question, criteria) in [
+        (
+            "有什么紧急的",
+            json!([
+                {"label": "今天到的", "days": 1},
+                {"label": "带附件的", "has_attachment": true}
+            ]),
+        ),
+        (
+            "这周该回的",
+            json!([
+                {"label": "我发出的", "from": "me@example.com"},
+                {"label": "本周未读的", "unread_only": true, "days": 7}
+            ]),
+        ),
+    ] {
+        let (_dir, store) = open();
+        let provider = MockAiProvider::new(vec![
+            Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+            Turn::with_tool(tool_call(
+                "c1",
+                AiToolName::EmailSearch,
+                json!({ "motive": "按判据查", "criteria": criteria }),
+            )),
+            Turn::text("按这些判据找过了。"),
+        ]);
+        let (commands, mut rx) = start_service(&store, provider.clone(), true);
+        let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+        commands
+            .send(Command::SendAiMessage {
+                conversation,
+                content: question.to_string(),
+                context: Vec::new(),
+            })
+            .expect("send");
+        let _ = wait_for(&mut rx, |event| {
+            matches!(event, Event::AiMessageCompleted { .. })
+        })
+        .await;
+
+        let message = last_assistant_message(&store, conversation);
+        let trace = message
+            .tool_trace
+            .iter()
+            .find(|trace| trace.tool == AiToolName::EmailSearch)
+            .expect("要有 email_search 的轨迹");
+        assert_eq!(
+            trace.status,
+            me_core::ai::AiToolStatus::Ok,
+            "「{question}」的判据应当能正常执行：{trace:?}"
+        );
+        // 判据名出现在清单条上——用户据此判断模型有没有理解错。
+        let plan = message.plan.expect("有清单");
+        let digest = plan.steps[0].args_digest().unwrap_or_default();
+        assert!(
+            digest.contains("判据"),
+            "「{question}」的判据要显示给用户：{digest}"
+        );
+    }
 }
 
 /// 四个新事件都要发出去：界面靠它们显示尝试角标、自检结论与重列轮次。

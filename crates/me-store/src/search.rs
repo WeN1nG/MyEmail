@@ -168,20 +168,12 @@ fn base_filters(query: &SearchQuery) -> (Vec<String>, Vec<SqlValue>) {
         parts.push("(m.flags & 1) = 0".to_string());
     }
     // `flags & 4` 是 `\Flagged`（`FLAG_FLAGGED = 1 << 2`）。
-    // 「重要」在本地没有独立字段，星标是唯一可靠的用户显式标注。
+    //
+    // 星标是本地**唯一**的显式重要性标注——它由用户自己标，不含任何推测。
+    // 「什么算重要」这种判断不在这里做：本地没有「重要性」这一列，
+    // 硬编码一个口径（曾经是「星标或近 7 天未读」）等于替所有用户做了决定。
     if query.flagged_only {
         parts.push("(m.flags & 4) != 0".to_string());
-    }
-    // 「重要」= 星标 **或** 近 7 天的未读。
-    //
-    // 这是 AI 回答「哪些邮件重要」与用户手输 `is:important` 用的同一套口径
-    // （`SYSTEM_PROMPT` 第 13 条）。7 天写死在 SQL 里：它是「近期」这个
-    // 概念的定义，不是可调参数——调了它，用户与 AI 的答案就对不上了。
-    if query.important_only {
-        parts.push(
-            "((m.flags & 4) != 0 OR ((m.flags & 1) = 0 AND m.date >= CAST(strftime('%s','now') AS INTEGER) - 604800))"
-                .to_string(),
-        );
     }
 
     (parts, values)

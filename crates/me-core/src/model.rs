@@ -1049,15 +1049,9 @@ pub struct SearchQuery {
     pub unread_only: bool,
     /// 只要已星标（`FLAG_FLAGGED`）。与其它条件取交集。
     ///
-    /// 与 `unread_only` 是**两个独立的位**，不是互斥选项：模型问「重要的邮件」时
-    /// 会分别查「星标」与「未读近期」两次，最后合并排序。
+    /// 与 `unread_only` 是**两个独立的位**，不是互斥选项：模型可以分别查
+    /// 「星标」与「未读近期」两次，也可以把它写成一条判据取并集。
     pub flagged_only: bool,
-    /// 只要「重要」：星标，**或**近 7 天的未读。
-    ///
-    /// 这是 AI 回答「哪些邮件重要」与用户手输 `is:important` 用的同一套判据
-    /// （见 `SYSTEM_PROMPT` 第 13 条）。它是**一个条件**，不是两个条件的并集：
-    /// 与其它条件仍然取交集。
-    pub important_only: bool,
     /// 分页大小，后端强制 ≤ 200。
     pub limit: u32,
     /// `(date, id)` 键集游标。
@@ -1114,9 +1108,6 @@ pub struct SavedSearchQuery {
     /// 只要已星标。老数据没有这个键，按 false 读（行为不变）。
     #[serde(default)]
     pub flagged_only: bool,
-    /// 只要「重要」。老数据没有这个键，按 false 读（行为不变）。
-    #[serde(default)]
-    pub important_only: bool,
 }
 
 impl SavedSearchQuery {
@@ -1134,7 +1125,6 @@ impl SavedSearchQuery {
             subject: query.subject.clone(),
             unread_only: query.unread_only,
             flagged_only: query.flagged_only,
-            important_only: query.important_only,
         }
     }
 
@@ -1152,7 +1142,6 @@ impl SavedSearchQuery {
             subject: self.subject.clone(),
             unread_only: self.unread_only,
             flagged_only: self.flagged_only,
-            important_only: self.important_only,
             limit: crate::MAX_PAGE_SIZE,
             cursor: None,
         }
