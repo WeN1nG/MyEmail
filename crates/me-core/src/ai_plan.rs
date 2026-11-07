@@ -1501,6 +1501,7 @@ pub const EMAIL_SEARCH_CONDITIONS: &[&str] = &[
     "folder",
     "unread_only",
     "flagged_only",
+    "important_only",
     "days",
 ];
 

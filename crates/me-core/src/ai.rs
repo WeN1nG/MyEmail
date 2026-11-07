@@ -1418,8 +1418,9 @@ done/failed/skipped 并写一句 evidence。只有完全不需要工具时才不
 11. 需要正文细节时才用 mail_read，用 email_search 结果里的 message_id 指定；同一封邮件一次回复里最多读 3 次。正文未缓存时工具会明确告诉你「未缓存」，此时让用户先打开这封邮件，不要反复重试，也不要根据主题猜正文内容。
 12. 音乐只能操作本地曲库：先 music_search 看到曲名再 music_play；用户说「放首歌」而没指定曲名时，先查状态，多首命中就把候选列出来让用户选，不要自己挑。播放/暂停/切歌/停止用 music_control。\
 13. 用户问「重要的邮件」时按这套判据做，并把判据写进清单第一步：\
-① 已星标（email_search 的 flagged_only）；② 未读且 7 天内（unread_only + days=7）；\
-③ 主题或发件人命中事项词（面试 / 笔试 / offer / 合同 / 账单 / 发票 / 截止 / 审核 / 退款）。\
+① 已星标；② 未读且 7 天内；③ 主题或发件人命中事项词（面试 / 笔试 / offer / 合同 / 账单 / 发票 / 截止 / 审核 / 退款）。\
+①② 用 email_search 的 important_only 一次查完（它就是「星标 或 近 7 天未读」），\
+不要分两次查再自己合并；③ 需要再补一次关键词检索。\
 排序：星标 > 未读近 3 天 > 有明确截止时间的通知。输出最多 5 封，每封一行：\
 日期 · 发件人 · 主题 · 为什么重要。三类判据都没命中时，明确说「没有发现明显重要的邮件」，\
 不要用无关邮件凑数，也不要因为查不到就反复换关键词重试。";
@@ -1686,9 +1687,9 @@ pub static TOOL_SPECS: LazyLock<Vec<AiToolSpec>> = LazyLock::new(|| {
             description: "检索本地已缓存的邮件摘要（不下载正文、不读附件、不联网）。\
 只返回主题/发件人/日期/文件夹/是否带附件/片段。多个条件按「同时满足」处理。\
 **至少要给一个条件**：query / from / to / subject / after / before / folder / \
-unread_only / flagged_only / days 任意一个即可（只给时间窗或只给星标也算合法）。\
+unread_only / flagged_only / important_only / days 任意一个即可（只给时间窗或只给星标也算合法）。\
 用户问「有没有某封邮件」「谁发过…」「最近有什么」「哪些是重要的」时使用；\
-「重要」优先用 flagged_only 查星标，再用 days + unread_only 查近期未读，最后合并排序。",
+「重要」直接用 important_only 一次查完（已星标，或近 7 天的未读），要更细再按需补查。",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1703,6 +1704,7 @@ unread_only / flagged_only / days 任意一个即可（只给时间窗或只给�
                     "folder": {"type": "string", "maxLength": 200, "description": "文件夹名"},
                     "unread_only": {"type": "boolean", "description": "只要未读"},
                     "flagged_only": {"type": "boolean", "description": "只要已星标（用户手动标记的重要）"},
+                    "important_only": {"type": "boolean", "description": "只要「重要」：已星标，或近 7 天的未读。回答「哪些邮件重要」时用它一次查完，不用分两次查再合并"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}
                 },
                 "additionalProperties": false
@@ -2242,7 +2244,9 @@ mod tests {
             "P0 阶段仍以 plan_update 为主"
         );
         // 本地没有 `importance` 字段，模型只能靠这三条推断，缺一条就会瞎猜关键词。
-        for needle in ["flagged_only", "days=7", "星标", "面试"] {
+        // `important_only` 是「星标 或 近 7 天未读」的一体化条件，
+        // 模型用它一次查完，不必分两次查再自己合并。
+        for needle in ["important_only", "7 天内", "星标", "面试"] {
             assert!(
                 SYSTEM_PROMPT.contains(needle),
                 "提示词缺少「重要」的判据：{needle}"

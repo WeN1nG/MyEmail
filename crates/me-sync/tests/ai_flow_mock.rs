@@ -2504,6 +2504,51 @@ async fn empty_result_widens_the_condition_and_retries() {
     assert_eq!(step.attempts, 2, "放宽那一次也是一次尝试：{step:?}");
 }
 
+/// `important_only` 单独也能检索：它是「星标 或 近 7 天未读」的合体条件，
+/// 不需要再补一个关键词。
+#[tokio::test]
+async fn important_only_alone_is_a_valid_search_condition() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查重要的邮件", "important_only": true }),
+        )),
+        Turn::text("没有发现明显重要的邮件。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    // 关键：不该报「至少需要一个检索条件」。
+    assert!(
+        !message.content.contains("至少需要一个检索条件"),
+        "important_only 本身就是条件：{}",
+        message.content
+    );
+    let plan = message.plan.expect("有清单");
+    assert_eq!(
+        plan.steps[0].status,
+        me_core::ai_plan::PlanStatus::Done,
+        "这一步要正常走完：{:?}",
+        plan.steps[0]
+    );
+}
+
 /// 四个新事件都要发出去：界面靠它们显示尝试角标、自检结论与重列轮次。
 #[tokio::test]
 async fn plan_events_are_emitted() {

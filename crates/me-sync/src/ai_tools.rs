@@ -655,6 +655,7 @@ where
         let folder_arg = arg_str(args, "folder", 200);
         let unread_only = arg_bool(args, "unread_only").unwrap_or(false);
         let flagged_only = arg_bool(args, "flagged_only").unwrap_or(false);
+        let important_only = arg_bool(args, "important_only").unwrap_or(false);
         // `days` 优先于 `after`：模型算日期常出错，让它直接说「最近 7 天」更可靠。
         // 两者同时给时**静默以 days 为准**，不报「参数冲突」——报冲突只会让模型
         // 换个说法再来一次，正是当初 8 连击的成因之一。
@@ -676,10 +677,11 @@ where
             && folder_arg.is_none()
             && !unread_only
             && !flagged_only
+            && !important_only
         {
             return Err(CoreError::validation(
                 "至少需要一个检索条件：query / from / to / subject / after / before / \
-days / folder / unread_only / flagged_only",
+days / folder / unread_only / flagged_only / important_only",
             ));
         }
         // `from` 允许写人名：先按实体注册表换成邮箱；换不到就按原文做子串匹配
@@ -730,6 +732,7 @@ days / folder / unread_only / flagged_only",
             subject,
             unread_only,
             flagged_only,
+            important_only,
             limit,
             cursor: None,
         };

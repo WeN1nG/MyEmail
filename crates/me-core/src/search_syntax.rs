@@ -19,6 +19,8 @@
 //! | `before:2026-11-01` | 早于该日期（含边界，按当天 00:00 之前） |
 //! | `after:2026-10-01` | 晚于该日期（含边界，按当天 23:59:59 之后） |
 //! | `is:unread` | 仅未读 |
+//! | `is:flagged` | 仅星标 |
+//! | `is:important` | 仅「重要」（星标，或近 7 天未读） |
 //!
 //! **不支持**：`OR`、括号、引号（O29 已拍板 v0.4 不做）。
 //!
@@ -54,6 +56,13 @@ pub struct ParsedQuery {
     pub until: Option<i64>,
     /// 仅未读。
     pub unread_only: bool,
+    /// 仅星标。
+    pub flagged_only: bool,
+    /// 仅「重要」：星标，或近 7 天未读。
+    ///
+    /// 这是 AI 那套「什么算重要」判据的用户侧版本：
+    /// 用户手动搜 `is:important` 得到的，与 AI 回答「哪些邮件重要」是同一套口径。
+    pub important_only: bool,
     /// 无法识别的片段（拼错的字段名、无法解析的日期等），UI 用来提示但不阻断搜索。
     pub unknown: Vec<String>,
 }
@@ -72,6 +81,8 @@ impl ParsedQuery {
             && self.since.is_none()
             && self.until.is_none()
             && !self.unread_only
+            && !self.flagged_only
+            && !self.important_only
     }
 
     /// 自由文本部分的字符数（用于「1～2 字仅匹配头部」的判定）。
@@ -104,6 +115,12 @@ impl ParsedQuery {
             n += 1;
         }
         if self.unread_only {
+            n += 1;
+        }
+        if self.flagged_only {
+            n += 1;
+        }
+        if self.important_only {
             n += 1;
         }
         n
@@ -168,6 +185,8 @@ pub fn parse_search_syntax(input: &str, today: i64) -> ParsedQuery {
             "is" => match value.to_ascii_lowercase().as_str() {
                 "unread" => out.unread_only = true,
                 "read" => out.unread_only = false,
+                "flagged" | "starred" => out.flagged_only = true,
+                "important" => out.important_only = true,
                 _ => out.unknown.push(format!("is:{value}")),
             },
             "before" | "after" => {
@@ -340,6 +359,34 @@ mod tests {
         let p = parse_search_syntax("is:read", TODAY);
         assert!(!p.unread_only);
         assert!(p.is_empty());
+    }
+
+    #[test]
+    fn is_flagged_sets_flagged_only() {
+        let p = parse_search_syntax("is:flagged", TODAY);
+        assert!(p.flagged_only);
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn is_starred_is_an_alias_for_flagged() {
+        let p = parse_search_syntax("is:starred", TODAY);
+        assert!(p.flagged_only);
+    }
+
+    #[test]
+    fn is_important_sets_important_only() {
+        let p = parse_search_syntax("is:important", TODAY);
+        assert!(p.important_only);
+        assert!(!p.is_empty());
+    }
+
+    #[test]
+    fn is_unknown_value_goes_to_unknown() {
+        let p = parse_search_syntax("is:whatever", TODAY);
+        assert!(!p.flagged_only);
+        assert!(!p.important_only);
+        assert_eq!(p.unknown, vec!["is:whatever".to_string()]);
     }
 
     #[test]

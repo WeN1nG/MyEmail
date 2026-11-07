@@ -532,6 +532,60 @@ fn search_flagged_only_returns_only_starred() {
     assert_eq!(all.total, 3);
 }
 
+/// 「重要」= 星标 **或** 近 7 天的未读。
+///
+/// 这个口径必须与 AI 回答「哪些邮件重要」时用的完全一致，
+/// 否则用户手动搜出来的和 AI 说的对不上。
+#[test]
+fn search_important_returns_starred_or_recent_unread() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+    let now = me_core::now_unix();
+    let messages = vec![
+        // 星标但已读 → 命中（星标）。
+        msg(1, "starred@example.com", "starred", now - 86_400),
+        // 未读且 3 天前 → 命中（近期未读）。
+        msg(2, "recent@example.com", "recent", now - 3 * 86_400),
+        // 未读但 30 天前 → 不命中。
+        msg(3, "old@example.com", "old unread", now - 30 * 86_400),
+        // 已读且不星标 → 不命中。
+        msg(4, "plain@example.com", "plain", now - 86_400),
+    ];
+    let inserted = insert(&store, account, inbox, &messages);
+    let writable = store.writable();
+    writable
+        .apply_local_flags(&[inserted[0].id], FlagOp::Set(Flags::FLAGGED))
+        .unwrap();
+    // 第 4 封标成已读：它近 1 天，本来会因「近期未读」命中，
+    // 标成已读后就不该算重要了。
+    writable
+        .apply_local_flags(&[inserted[3].id], FlagOp::Set(Flags::SEEN))
+        .unwrap();
+
+    let important = writable
+        .search(&SearchQuery {
+            important_only: true,
+            limit: 20,
+            ..Default::default()
+        })
+        .unwrap();
+    let ids: Vec<_> = important.messages.iter().map(|m| m.id).collect();
+    assert!(ids.contains(&inserted[0].id), "星标的邮件要算重要：{ids:?}");
+    assert!(
+        ids.contains(&inserted[1].id),
+        "近 7 天的未读要算重要：{ids:?}"
+    );
+    assert!(
+        !ids.contains(&inserted[2].id),
+        "30 天前的未读不算重要：{ids:?}"
+    );
+    assert!(
+        !ids.contains(&inserted[3].id),
+        "已读且没星标的不算重要：{ids:?}"
+    );
+    assert_eq!(important.total, 2, "只应命中两封：{ids:?}");
+}
+
 #[test]
 fn local_flag_toggles_collapse_to_one_target_state() {
     let (_dir, store) = open_store();
