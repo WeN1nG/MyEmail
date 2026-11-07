@@ -2565,6 +2565,93 @@ async fn important_only_alone_is_a_valid_search_condition() {
     );
 }
 
+/// 端到端回放那次事故：模型完全不配合（第一版的行为）。
+///
+/// 旧行为：8 次 `email_search`、6 次报「至少需要一个检索条件」、正文 13 个换行。
+/// 现在：首轮只给两个计划工具，业务工具根本调不到；模型不配合时引擎合成
+/// 单步清单收场，正文一定有内容，界面上看得到「做了什么」。
+#[tokio::test]
+async fn the_original_incident_now_produces_a_visible_answer() {
+    let (_dir, store) = open();
+    // 模型完全按旧行为来：想直接调业务工具，参数也不给条件。
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(tool_call(
+            "old1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查看重要邮件" }),
+        )),
+        Turn::with_tool(tool_call(
+            "old2",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查看重要邮件，未读优先" }),
+        )),
+        // 引擎催「还没回答」，模型仍然空白。
+        Turn::text("\n\n\n\n\n\n\n\n\n\n\n\n\n"),
+        // 再催一次，还是空白。
+        Turn::text("\n\n\n\n\n\n\n\n\n\n\n\n\n"),
+        // 引擎不再催了（机会用完），模型第三次空白。
+        Turn::text("\n\n\n\n\n\n\n\n\n\n\n\n\n"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有什么重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    // 收集事件直到消息完成（带超时保护，避免脚本不够时死等）。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut completed = false;
+    while std::time::Instant::now() < deadline && !completed {
+        let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+        else {
+            continue;
+        };
+        if matches!(event, Event::AiMessageCompleted { .. }) {
+            completed = true;
+        }
+    }
+    assert!(completed, "这一轮应该正常收尾");
+
+    let message = last_assistant_message(&store, conversation);
+    // 1) 正文不是空白：这是旧事故最刺眼的症状。
+    assert!(
+        message.content.trim().chars().count() > 0,
+        "正文不能是空白（旧事故是 13 个换行）"
+    );
+    // 2) 有一份清单，用户能看到 AI 想做什么。
+    let plan = message.plan.expect("必须有一份清单");
+    assert!(!plan.steps.is_empty(), "清单不能是空的");
+    // 3) 业务工具在 PLAN 阶段**一次都没真正执行**。
+    //
+    // trace 里要有记录（用户要能看到「这次被拦下了」），但状态必须是 Error。
+    let blocked = message
+        .tool_trace
+        .iter()
+        .filter(|trace| trace.tool == AiToolName::EmailSearch)
+        .collect::<Vec<_>>();
+    assert!(
+        !blocked.is_empty(),
+        "模型确实尝试了业务工具：{:?}",
+        message.tool_trace
+    );
+    for trace in &blocked {
+        assert_eq!(
+            trace.summary, "计划阶段不能执行工具",
+            "业务工具不该被真正执行：{trace:?}"
+        );
+    }
+    // 4) 留下了可排查的痕迹。
+    assert!(
+        message.error.is_some(),
+        "要记录为什么不正常：{:?}",
+        message.error
+    );
+}
+
 /// 四个新事件都要发出去：界面靠它们显示尝试角标、自检结论与重列轮次。
 #[tokio::test]
 async fn plan_events_are_emitted() {
