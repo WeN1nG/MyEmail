@@ -104,11 +104,21 @@ def check_exe(report, exe):
             report.fail(f'含本机标识 {marker!r}：{count} 处')
 
     # 绝对路径（panic 位置信息）。发布构建应带 --remap-path-prefix，这里应为 0。
+    #
+    # 顶层目录**允许只有 1 个字符**（`C:\A\...` 这种短盘符下的一级目录很常见）：
+    # 早先写成 `{2,}` 时正好把本机 `C:\A\CodingSpace\...` 的依赖源码路径漏掉了。
     paths = set()
     for match in re.finditer(rb'[A-Za-z]:\\[^\x00\x01-\x1f]{6,90}', data):
         path = match.group(0).decode('utf-8', 'ignore')
-        if re.match(r'^[A-Za-z]:\\[^\\/:*?"<>|]{2,}\\', path):
-            paths.add(path)
+        if not re.match(r'^[A-Za-z]:\\[^\\/:*?"<>|]{1,}\\', path):
+            continue
+        # `C:\Windows\...` 是**每台 Windows 都一样的系统路径**，不携带本机身份。
+        # 命中的是 fontdb 的静态字面量（`C:\Windows\Fonts` + `USERPROFILE` +
+        # `AppData\Local\Microsoft\Windows\Fonts` 在二进制里相邻，被读成一整条），
+        # 属于误报；真正的构建机路径不会落在这里。
+        if path.lower().startswith('c:\\windows\\'):
+            continue
+        paths.add(path)
     if paths:
         report.fail(
             f'含绝对路径 {len(paths)} 条，示例：{sorted(paths)[0]}\n'

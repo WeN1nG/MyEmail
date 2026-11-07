@@ -32,10 +32,31 @@ to_win_path() {
 REPO_WIN="$(to_win_path "$(pwd)")"
 USER_HOME="${USERPROFILE:-$HOME}"
 
-export RUSTFLAGS="--remap-path-prefix=${REPO_WIN}=REDACTED"
-if [ -n "${USER_HOME:-}" ] && [ "$USER_HOME" != "$REPO_WIN" ]; then
-  RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=${USER_HOME}=REDACTED"
+export RUSTFLAGS=""
+# 逐个加前缀，顺便跳过空值与重复项（同一个前缀加两遍没有意义）。
+add_remap() {
+  [ -n "${1:-}" ] || return 0
+  case " $RUSTFLAGS " in
+    *" --remap-path-prefix=$1=REDACTED "*) return 0 ;;
+  esac
+  RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$1=REDACTED"
+}
+
+add_remap "$REPO_WIN"
+add_remap "$USER_HOME"
+
+# **依赖源码**也在二进制里留 panic 位置：`CARGO_HOME` 与 rustup 工具链目录
+# 完全可能不在用户目录下（本机就在 `C:\A\CodingSpace\Tools\Rust\...`）。
+# 只重映射仓库与用户目录是不够的——`ttf-parser` 之类的 crate 会把
+# `...\cargo\registry\src\<镜像>\<crate>-<ver>\src\lib.rs` 原样写进 exe。
+add_remap "$(to_win_path "${CARGO_HOME:-$USER_HOME/.cargo}")"
+SYSROOT="$(rustc --print sysroot 2>/dev/null)"
+if [ -n "$SYSROOT" ]; then
+  add_remap "$(to_win_path "$SYSROOT")"
+  # rustup 的 toolchains / downloads 与 sysroot 同级，上推两级一并盖掉。
+  add_remap "$(to_win_path "$(dirname "$(dirname "$SYSROOT")")")"
 fi
+
 export RUSTFLAGS
 
 JOBS="-j 2"

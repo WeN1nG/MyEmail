@@ -59,10 +59,10 @@ cargo deny check
 bash scripts/build_release.sh
 
 # 打发布包（exe + 同源源码 zip + 发布说明 → dist/<版本>/；会自动拒绝比源码旧的 exe）
-python scripts/pack_dist.py --version 0.3.0
+python scripts/pack_dist.py --version 0.4.0
 
 # 发布前泄露自检（本机标识 / 凭据形态 / 绝对路径 / 本机数据库真实内容），阻塞任何命中
-python scripts/check_leak.py --dist dist/0.3.0
+python scripts/check_leak.py --dist dist/0.4.0
 
 # OAuth 客户端：仅构建期注入，密钥不进仓库
 # 未注入时，可在高级设置写 meta oauth_client_google / oauth_client_microsoft 覆盖 client_id/tenant；

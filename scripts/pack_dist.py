@@ -29,6 +29,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXCLUDE_PREFIXES = ('target/', 'dist/', '.workbuddy/', '.review/', '.git/')
 EXCLUDE_SUFFIXES = ('.exe', '.pdb', '.dll')
 
+# 不该进源码包的**单个文件**：个人工作清单，开头就写着本机仓库绝对路径，
+# 既不是产品源码也不参与构建。`git ls-files --others` 会带上未跟踪的新文件
+# （这是为了不遗漏新建源码），所以这类本地笔记要在这里点名排除。
+EXCLUDE_NAMES = ('优化清单.md',)
+
 
 def tracked_files():
     """git 跟踪 + 未忽略的新文件；NUL 分隔避免中文路径转义。"""
@@ -43,6 +48,8 @@ def tracked_files():
         if not rel:
             continue
         if rel.startswith(EXCLUDE_PREFIXES) or rel.lower().endswith(EXCLUDE_SUFFIXES):
+            continue
+        if rel in EXCLUDE_NAMES:
             continue
         if not os.path.exists(os.path.join(ROOT, rel)):
             continue  # 已删除但仍在索引里的条目
