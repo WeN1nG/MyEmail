@@ -5,17 +5,17 @@
 //! - 流式期间用纯文本直出（每帧解析 Markdown 会卡），完成后解析一次并缓存；
 //! - 工具只展示摘要与邮件卡片，不展示完整正文。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
 use me_core::ai::{
     AiContextMode, AiContextRequest, AiConversation, AiConversationId, AiEntity, AiMessage,
-    AiMessageId, AiMessageStatus, AiModel, AiProviderKind, AiToolPermissions, AiToolTrace,
-    DEFAULT_MAX_INPUT_CHARS, DEFAULT_MAX_OUTPUT_TOKENS, estimate_tokens, next_model_id,
-    truncate_chars,
+    AiMessageId, AiMessageStatus, AiModel, AiProviderKind, AiRole, AiToolName, AiToolPermissions,
+    AiToolStatus, AiToolTrace, DEFAULT_MAX_INPUT_CHARS, DEFAULT_MAX_OUTPUT_TOKENS, MotiveSource,
+    ThinkingBlock, ThinkingSegment, estimate_tokens, next_model_id, truncate_chars,
 };
-use me_core::{Command, MessageId};
+use me_core::{Command, MailCardRef, MessageId};
 
 use crate::state::{Page, ToastKind, UiState};
 use crate::views::richtext::{Block, markdown_to_blocks, show_with_images};
@@ -48,22 +48,39 @@ pub struct PendingContext {
     pub request: AiContextRequest,
 }
 
-#[derive(Debug, Clone)]
-pub struct AiStreamView {
-    pub conversation: AiConversationId,
-    pub seq: u64,
-    pub buffer: String,
-    pub started: Instant,
+/// 正在跑、还没落库的工具调用。
+///
+/// **不进 `AiToolStatus`**：那个枚举是持久化类型，`ToolTraceRow::into_trace`
+/// 按字符串 parse，加 `Running` 会打破「落库的 trace 永远是终态」这条不变量
+/// （`fail_orphan_streaming_messages` 等收尾逻辑都默认它）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveTool {
+    pub call_id: String,
+    pub tool: AiToolName,
+    pub motive: Option<String>,
+    pub motive_source: MotiveSource,
 }
 
 #[derive(Debug, Clone)]
+pub struct AiStreamView {
+    pub conversation: AiConversationId,
+    /// 这条流式消息在库里的 id：Markdown 缓存键、重载去重都靠它。
+    pub message: AiMessageId,
+    pub seq: u64,
+    pub buffer: String,
+    /// 思考按段号分桶。切段由引擎在每次工具调用后自增 segment 完成。
+    pub thinking: BTreeMap<u8, String>,
+    /// 工具跑着的时候显示的活动条，完成后清空、由 `activity` 接手。
+    pub live_tool: Option<LiveTool>,
+    pub started: Instant,
+}
+
+/// 邮件卡片的**摘要缓存**。命中理由不在这里：它随 `MailCardRef` 落在
+/// trace 上，历史回看时也从那里读，两边不能各存一份。
+#[derive(Debug, Clone)]
 pub struct AiCard {
     pub message: MessageId,
-    /// 为什么这封邮件出现在结果里（主题命中 / 发件人命中 / 正文片段命中）。
-    pub reason: String,
     pub subject: String,
-    pub from: String,
-    pub date: Option<i64>,
     pub snippet: String,
 }
 
@@ -160,6 +177,9 @@ pub struct AiPageState {
     /// 卡片对应的完整摘要。AI 页的检索结果可能不在当前邮件列表里，
     /// 阅读窗要能在 AI 页直接打开它（`reader::show_window` 只认摘要）。
     pub card_messages: Vec<me_core::MessageSummary>,
+    /// 流式期间按 call_id 暂存 `MailCardRef`，等 `AiToolCompleted` 到达时
+    /// 挂到对应的 trace 上。事件先于完成事件到达，直接挂会挂不上。
+    pub cards_by_call: HashMap<String, Vec<MailCardRef>>,
     pub entities: Vec<AiEntity>,
     /// 当前这轮的任务清单（来自 `AiPlanUpdated` 或最后一条消息的落库值）。
     pub plan: Option<me_core::ai_plan::Plan>,
@@ -295,6 +315,7 @@ impl AiPageState {
         self.activity.clear();
         self.cards.clear();
         self.card_messages.clear();
+        self.cards_by_call.clear();
         // 切会话时用缓存恢复，而不是清空：流式中的清单还没落库，
         // 清掉就再也找不回来了（切回来时消息里没有它）。
         self.plan = id.and_then(|conversation| self.plans.get(&conversation).cloned());
@@ -328,26 +349,66 @@ impl AiPageState {
     }
 
     /// 流开始。助手消息 id 由服务端落库，UI 不需要持有——终止事件后统一重载。
-    pub fn on_stream_started(&mut self, conversation: AiConversationId) {
+    pub fn on_stream_started(&mut self, conversation: AiConversationId, message: AiMessageId) {
         self.stream = Some(AiStreamView {
             conversation,
+            message,
             seq: 0,
             buffer: String::new(),
+            thinking: BTreeMap::new(),
+            live_tool: None,
             started: Instant::now(),
         });
+        // activity 是流式期间已完成 trace 的内存位，必须清；
+        // cards / card_messages 现在也只在流式期间用，一起清。
         self.activity.clear();
         self.cards.clear();
+        self.card_messages.clear();
+        self.cards_by_call.clear();
     }
 
-    pub fn on_delta(&mut self, conversation: AiConversationId, seq: u64, delta: &str) {
+    /// 增量按 kind 分派到不同 buffer。**两条通道共用 seq**，
+    /// 所以这里只保留最新值，不做各自的缺口判断。
+    pub fn on_delta(
+        &mut self,
+        conversation: AiConversationId,
+        seq: u64,
+        kind: me_core::command::AiDeltaKind,
+        segment: u8,
+        delta: &str,
+    ) {
         let Some(stream) = self.stream.as_mut() else {
             return;
         };
         if stream.conversation != conversation {
             return;
         }
-        stream.buffer.push_str(delta);
+        match kind {
+            me_core::command::AiDeltaKind::Answer => stream.buffer.push_str(delta),
+            me_core::command::AiDeltaKind::Thinking => {
+                stream.thinking.entry(segment).or_default().push_str(delta);
+            }
+        }
         stream.seq = seq;
+    }
+
+    /// 工具开始执行：写入 live_tool，用户不必等到完成才知道 AI 在做什么。
+    pub fn on_tool_started(&mut self, tool: LiveTool) {
+        if let Some(stream) = self.stream.as_mut() {
+            stream.live_tool = Some(tool);
+        }
+    }
+
+    /// 工具完成：撤掉进行中那条，换成持久化的 trace。
+    pub fn on_tool_finished(&mut self, call_id: &str) {
+        if let Some(stream) = self.stream.as_mut()
+            && stream
+                .live_tool
+                .as_ref()
+                .is_some_and(|live| live.call_id == call_id)
+        {
+            stream.live_tool = None;
+        }
     }
 
     pub fn on_finished(&mut self) {
@@ -425,6 +486,42 @@ pub fn sidebar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::
 ///
 /// 设置不占用主区——它是独立弹窗（`settings_modal`），否则点开设置后对话就被顶掉了，
 /// 关掉设置还得再来一次「切页回 AI」才能看到记录。
+/// 已解析的 Markdown 缓存：`(message, 长度, blocks)`。
+type BlocksCache = (AiMessageId, usize, Vec<Block>);
+
+/// 渲染时需要的可变位。
+///
+/// **刻意不含 `&mut UiState`**：`TurnView` 从消息借用，若 ctx 也借 state
+/// 就是自引用借用冲突（现有代码用 `mem::take` 绕的正是这个）。调用方先把
+/// `messages` / `blocks_cache` 移到局部变量，再构造 ctx。
+struct TurnCtx<'a> {
+    blocks_cache: &'a mut Option<BlocksCache>,
+    /// 点卡片「打开邮件」时记下 id，渲染循环外统一发 Command。
+    open_message: &'a mut Option<MessageId>,
+    /// 当前已缓存摘要的卡片（按 message id 查；历史消息可能查不到，需降级）。
+    cards: &'a [AiCard],
+}
+
+/// 一轮 AI 回复的视图。**历史与流式构造同一个视图**，四个区块的顺序
+/// 只在 `render_turn` 里定义一次。
+struct TurnView<'a> {
+    message: &'a AiMessage,
+    /// 工具正在跑（只有流式态会有）。不进持久化枚举。
+    live_tool: Option<&'a LiveTool>,
+    streaming: bool,
+    /// 流式已产出的秒数，用于「生成中…」那一行。
+    elapsed_secs: u64,
+}
+
+fn turn_from_message(message: &AiMessage) -> TurnView<'_> {
+    TurnView {
+        message,
+        live_tool: None,
+        streaming: false,
+        elapsed_secs: 0,
+    }
+}
+
 pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) {
     let Some(conversation_id) = state.ai.selected else {
         ui.vertical_centered(|ui| {
@@ -522,25 +619,71 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                 ui.add_space(24.0);
                 ui.label(RichText::new("正在加载对话…").small().color(Color32::GRAY));
             }
-            // 先把消息取出再渲染：`show_message` 需要 `&mut state`（Markdown 缓存），
-            // 直接迭代会把 `state.ai.messages` 一直借用着。取出的 Vec 随后放回。
+
+            // 六步借用顺序，一步都不能换：
+            // ① 先把所有可变位 / 会被借用的 Vec 移出 state，ctx 就不再借 state；
+            // ② 流式那条构造 owned 视图数据（此时 plans 还能读）；
+            // ③ 再 take messages；
+            // ④ ctx 作用域内渲染历史 + 流式；
+            // ⑤ 放回；⑥ 处理需要 &mut state 的确认条与 Command。
+            let mut blocks_cache = std::mem::take(&mut state.ai.blocks_cache);
+            let cards = std::mem::take(&mut state.ai.cards);
+            let mut open_message: Option<MessageId> = None;
+
+            let stream_message = build_stream_message(&state.ai);
+            let live_tool = state
+                .ai
+                .stream
+                .as_ref()
+                .and_then(|stream| stream.live_tool.as_ref());
+            let elapsed_secs = state
+                .ai
+                .stream
+                .as_ref()
+                .map(|stream| stream.started.elapsed().as_secs())
+                .unwrap_or(0);
+
             let messages = std::mem::take(&mut state.ai.messages);
-            for message in &messages {
-                show_message(state, commands, ui, message);
+            {
+                let mut ctx = TurnCtx {
+                    blocks_cache: &mut blocks_cache,
+                    open_message: &mut open_message,
+                    cards: &cards,
+                };
+                for message in &messages {
+                    // 流式占位行由末尾那条负责渲染，不跳过就会出现两个气泡。
+                    // **只跳过 Streaming**：Failed / Cancelled 是终态，必须照常显示。
+                    if message.status == AiMessageStatus::Streaming {
+                        continue;
+                    }
+                    if message.role == AiRole::User {
+                        show_user_message(ui, message);
+                        continue;
+                    }
+                    let turn = turn_from_message(message);
+                    render_turn(ui, &mut ctx, &turn);
+                }
+                if let Some(message) = &stream_message {
+                    let turn = TurnView {
+                        message,
+                        live_tool,
+                        streaming: true,
+                        elapsed_secs,
+                    };
+                    render_turn(ui, &mut ctx, &turn);
+                }
             }
             state.ai.messages = messages;
-            // 清单放在消息与流式正文之间：它描述「这一轮正在做什么」，
-            // 贴在底部才不会被长对话顶出视野。
-            if let Some(plan) = &state.ai.plan {
-                show_plan(ui, plan);
-            }
+            state.ai.cards = cards;
+            state.ai.blocks_cache = blocks_cache;
+
             show_delete_confirm(state, commands, ui);
-            show_stream(ui, &state.ai);
-            if !state.ai.activity.is_empty() {
-                show_activity(ui, &state.ai.activity);
-            }
-            if !state.ai.cards.is_empty() {
-                show_cards(state, commands, ui);
+            if let Some(id) = open_message {
+                state.selected_message = Some(id);
+                state.reader_open = true;
+                state.open_body = None;
+                state.body_loading = true;
+                commands.push(Command::OpenMessage(id));
             }
         });
 
@@ -622,120 +765,335 @@ fn show_model_picker(
         });
 }
 
-fn show_message(
-    state: &mut UiState,
-    commands: &mut Vec<Command>,
-    ui: &mut egui::Ui,
-    message: &AiMessage,
-) {
-    let is_user = message.role == me_core::ai::AiRole::User;
-    let width = (ui.available_width() * 0.82).max(200.0);
+/// 把流式态包装成一条 `AiMessage`，这样历史与流式能走**同一个** `TurnView`。
+///
+/// 每帧只 clone 一次（流式的那条），历史消息全部零拷贝借用。
+fn build_stream_message(state: &AiPageState) -> Option<AiMessage> {
+    let stream = state.stream.as_ref()?;
+    let max_segment = stream.thinking.keys().next_back().copied().unwrap_or(1);
+    let segments: Vec<ThinkingSegment> = stream
+        .thinking
+        .iter()
+        .map(|(index, text)| ThinkingSegment {
+            index: *index,
+            text: text.clone(),
+            followed_by_tool: *index < max_segment,
+        })
+        .filter(|segment| !segment.text.is_empty())
+        .collect();
+    let thinking = (!segments.is_empty()).then_some(ThinkingBlock {
+        segments,
+        truncated: false,
+    });
+    // 流式中还没落库的那份清单优先取会话缓存（切页回来也还在），
+    // 再退回当前显示位。
+    let plan = state
+        .plans
+        .get(&stream.conversation)
+        .cloned()
+        .or_else(|| state.plan.clone());
+    Some(AiMessage {
+        id: stream.message,
+        conversation: stream.conversation,
+        role: AiRole::Assistant,
+        content: stream.buffer.clone(),
+        context_refs: Vec::new(),
+        status: AiMessageStatus::Streaming,
+        error: None,
+        input_tokens: None,
+        output_tokens: None,
+        tool_trace: state.activity.clone(),
+        plan,
+        thinking,
+        created_at: 0,
+    })
+}
+
+/// 四个区块的顺序只在**这一个函数**里定义：思考 → 清单 → 工具 → 回答。
+/// 每块没有就不画；历史与实时共用它，所以流式结束重载时不会跳变。
+fn render_turn(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
     ui.add_space(6.0);
-    if is_user {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-            egui::Frame::group(ui.style())
-                .fill(ui.visuals().faint_bg_color)
-                .show(ui, |ui| {
-                    ui.set_max_width(width);
-                    ui.label(&message.content);
-                    for reference in &message.context_refs {
-                        ui.label(
-                            RichText::new(format!(
-                                "引用：{}（{}）",
-                                truncate_chars(&reference.subject, 30),
-                                reference.mode.as_str()
-                            ))
-                            .small()
-                            .color(Color32::GRAY),
-                        );
-                    }
-                });
-        });
+    let width = (ui.available_width() * 0.82).max(200.0);
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_max_width(width);
+        if let Some(block) = &turn.message.thinking {
+            show_thinking(ui, block, turn.streaming, turn.message.id);
+        }
+        if let Some(plan) = &turn.message.plan {
+            show_plan(ui, plan);
+        }
+        show_tools(
+            ui,
+            ctx,
+            &turn.message.tool_trace,
+            turn.live_tool,
+            turn.message.id,
+        );
+        show_answer(ui, ctx, turn);
+    });
+}
+
+/// 思考过程。完成态默认折叠，流式中默认展开；不跑 Markdown
+/// （思考里常有未闭合的代码块，硬解析会吞掉半屏）。
+fn show_thinking(ui: &mut egui::Ui, block: &ThinkingBlock, live: bool, message_id: AiMessageId) {
+    if block.segments.is_empty() && !block.truncated {
+        return;
+    }
+    let title = if live {
+        format!("思考中… {} 段", block.segments.len())
     } else {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_max_width(width);
-            if message.content.is_empty() {
-                ui.label(RichText::new("…").color(Color32::GRAY));
+        format!(
+            "思考过程 · {} 段{}",
+            block.segments.len(),
+            if block.truncated {
+                "（已截断）"
             } else {
-                // 先切出 `[结果]` 段落，再按 Markdown 渲染叙述部分。
-                // 缓存键用**叙述长度**：结果段落还在流式增长时，正文没变就不必重排。
-                let (body, result) = match split_result_block(&message.content) {
-                    Some((body, block)) => (body, Some(block)),
-                    None => (message.content.as_str(), None),
-                };
-                let cache_hit = matches!(
-                    &state.ai.blocks_cache,
-                    Some((id, len, _)) if *id == message.id && *len == body.len()
-                );
-                if !cache_hit {
-                    let blocks = markdown_to_blocks(body);
-                    state.ai.blocks_cache = Some((message.id, body.len(), blocks));
+                ""
+            }
+        )
+    };
+    egui::CollapsingHeader::new(title)
+        // 每条消息一个 id：共用一个 salt 会让折叠状态在所有消息之间串。
+        .id_salt(("ai_thinking", message_id.0))
+        .default_open(live)
+        .show(ui, |ui| {
+            for (index, segment) in block.segments.iter().enumerate() {
+                if block.segments.len() > 1 {
+                    ui.label(
+                        RichText::new(format!(
+                            "第 {} 段{}",
+                            segment.index,
+                            if segment.followed_by_tool {
+                                " · 之后调了工具"
+                            } else {
+                                ""
+                            }
+                        ))
+                        .small()
+                        .strong(),
+                    );
                 }
-                if let Some((_, _, blocks)) = &state.ai.blocks_cache {
-                    show_with_images(ui, blocks, None);
-                }
-                match result {
-                    Some(block) => show_result_block(ui, &block),
-                    // 模型漏写 `[结果]` 时用本轮工具回执兜底：只给事实，不假装有结论。
-                    // 不重发请求——用户已经看到正文了，重发要再付一次完整调用。
-                    None if message.status == AiMessageStatus::Complete
-                        && !message.tool_trace.is_empty() =>
-                    {
-                        show_result_fallback(ui, &message.tool_trace);
-                    }
-                    None => {}
+                ui.label(RichText::new(&segment.text).small().color(Color32::GRAY));
+                if index + 1 < block.segments.len() {
+                    ui.separator();
                 }
             }
-            if !message.tool_trace.is_empty() {
-                show_activity(ui, &message.tool_trace);
-            }
-            if message.status == AiMessageStatus::Failed {
-                if let Some(error) = &message.error {
-                    ui.label(RichText::new(error).small().color(Color32::RED));
-                }
-            } else if message.status == AiMessageStatus::Cancelled {
-                ui.label(RichText::new("已停止").small().color(Color32::GRAY));
-            }
-            if let (Some(input), Some(output)) = (message.input_tokens, message.output_tokens) {
+            if block.truncated {
                 ui.label(
-                    RichText::new(format!("{input} 输入 / {output} 输出 tokens"))
+                    RichText::new("思考过程过长，已截断")
                         .small()
                         .color(Color32::GRAY),
                 );
             }
-            if !is_user {
+        });
+}
+
+/// 工具调用区：已完成的 trace + 正在跑的那一条 + 每次检索命中的卡片。
+fn show_tools(
+    ui: &mut egui::Ui,
+    ctx: &mut TurnCtx<'_>,
+    traces: &[AiToolTrace],
+    live_tool: Option<&LiveTool>,
+    message_id: AiMessageId,
+) {
+    if traces.is_empty() && live_tool.is_none() {
+        return;
+    }
+    let total = traces.len() + usize::from(live_tool.is_some());
+    egui::CollapsingHeader::new(format!("工具调用（{total}）"))
+        .id_salt(("ai_tool_activity", message_id.0))
+        // 工具正在跑时展开：用户不必点一下才知道 AI 在做什么。
+        .default_open(live_tool.is_some())
+        .show(ui, |ui| {
+            for trace in traces {
+                let mark = match trace.status {
+                    AiToolStatus::Ok => "✓",
+                    AiToolStatus::Error => "✗",
+                    AiToolStatus::Cancelled => "○",
+                    AiToolStatus::Skipped => "⊘",
+                };
+                let step = match (trace.step_id, trace.attempt) {
+                    (Some(id), Some(n)) if n > 1 => format!("第 {id} 步 · 第 {n} 次 · "),
+                    (Some(id), _) => format!("第 {id} 步 · "),
+                    _ => String::new(),
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "{mark} {step}{} · {} · {} ms",
+                        trace.tool.label(),
+                        trace.summary,
+                        trace.duration_ms
+                    ))
+                    .small(),
+                );
+                let (text, weak) = match trace.motive.as_deref() {
+                    Some(motive) => (format!("动机：{motive}"), false),
+                    None => (format!("动机：{}", me_core::ai::DEFAULT_MOTIVE), true),
+                };
+                let mut label = RichText::new(text).small();
+                if weak || trace.motive_source == MotiveSource::Default {
+                    label = label.color(Color32::GRAY);
+                }
+                ui.label(label);
+                show_trace_cards(ui, ctx, &trace.cards);
+            }
+            if let Some(live) = live_tool {
                 ui.horizontal(|ui| {
-                    if ui.small_button("复制").clicked() {
-                        ui.ctx().copy_text(message.content.clone());
-                    }
-                    let _ = commands;
+                    ui.label(RichText::new(format!("◐ {} · 执行中…", live.tool.label())).small());
                 });
+                let mut label = RichText::new(
+                    live.motive
+                        .as_deref()
+                        .map(|text| format!("动机：{text}"))
+                        .unwrap_or_else(|| format!("动机：{}", me_core::ai::DEFAULT_MOTIVE)),
+                )
+                .small();
+                if live.motive.is_none() || live.motive_source == MotiveSource::Default {
+                    label = label.color(Color32::GRAY);
+                }
+                ui.label(label);
             }
         });
+}
+
+/// 卡片只存 `id + 命中理由`，摘要按 id 去缓存里找。
+/// 历史回看时缓存可能没有（当时那封不在当前列表），降级成一行理由 + 打开按钮，
+/// 不报错也不画空卡片。
+fn show_trace_cards(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, cards: &[MailCardRef]) {
+    for card in cards.iter().take(MAX_CARDS) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if let Some(summary) = ctx.cards.iter().find(|item| item.message == card.message) {
+                ui.label(
+                    RichText::new(truncate_chars(&summary.subject, 50))
+                        .small()
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(truncate_chars(&summary.snippet, 100))
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            } else {
+                ui.label(
+                    RichText::new("（摘要已不在缓存，仍可打开）")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(truncate_chars(&card.reason, 60))
+                        .small()
+                        .color(Color32::from_rgb(0x3B, 0x82, 0xF6)),
+                );
+                if ui.small_button("打开邮件").clicked() {
+                    *ctx.open_message = Some(card.message);
+                }
+            });
+        });
+    }
+    if cards.len() > MAX_CARDS {
+        ui.label(
+            RichText::new(format!("还有 {} 封", cards.len() - MAX_CARDS))
+                .small()
+                .color(Color32::GRAY),
+        );
     }
 }
 
-fn show_stream(ui: &mut egui::Ui, state: &AiPageState) {
-    let Some(stream) = &state.stream else {
-        return;
-    };
-    ui.add_space(6.0);
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        if stream.buffer.is_empty() {
-            ui.label(RichText::new("正在思考…").color(Color32::GRAY));
+/// 回答区：正文、[结果] 块、错误/取消、token 用量、复制按钮。
+fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
+    let message = turn.message;
+    if message.content.is_empty() {
+        if turn.streaming {
+            ui.label(RichText::new("正在生成…").color(Color32::GRAY));
         } else {
-            // 流式期间不跑 Markdown：每帧解析会让滚动卡顿，而且光标位置会跳。
-            ui.label(&stream.buffer);
+            ui.label(RichText::new("…").color(Color32::GRAY));
         }
+    } else if turn.streaming {
+        // 流式期间不跑 Markdown：每帧解析会让滚动卡顿，光标位置也会跳。
+        ui.label(&message.content);
         ui.label(
             RichText::new(format!(
                 "生成中… {}s · 约 {} tokens",
-                stream.started.elapsed().as_secs(),
-                estimate_tokens(&stream.buffer)
+                turn.elapsed_secs,
+                estimate_tokens(&message.content)
             ))
             .small()
             .color(Color32::GRAY),
         );
+    } else {
+        // 先切出 `[结果]` 段落，再按 Markdown 渲染叙述部分。
+        let (body, result) = match split_result_block(&message.content) {
+            Some((body, block)) => (body, Some(block)),
+            None => (message.content.as_str(), None),
+        };
+        let cache_hit = matches!(
+            ctx.blocks_cache.as_ref(),
+            Some((id, len, _)) if *id == message.id && *len == body.len()
+        );
+        if !cache_hit {
+            let blocks = markdown_to_blocks(body);
+            *ctx.blocks_cache = Some((message.id, body.len(), blocks));
+        }
+        if let Some((_, _, blocks)) = ctx.blocks_cache.as_ref() {
+            show_with_images(ui, blocks, None);
+        }
+        match result {
+            Some(block) => show_result_block(ui, &block),
+            // 模型漏写 [结果] 时用本轮工具回执兜底：只给事实，不假装有结论。
+            None if message.status == AiMessageStatus::Complete
+                && !message.tool_trace.is_empty() =>
+            {
+                show_result_fallback(ui, &message.tool_trace);
+            }
+            None => {}
+        }
+    }
+    if message.status == AiMessageStatus::Failed {
+        if let Some(error) = &message.error {
+            ui.label(RichText::new(error).small().color(Color32::RED));
+        }
+    } else if message.status == AiMessageStatus::Cancelled {
+        ui.label(RichText::new("已停止").small().color(Color32::GRAY));
+    }
+    if let (Some(input), Some(output)) = (message.input_tokens, message.output_tokens) {
+        ui.label(
+            RichText::new(format!("{input} 输入 / {output} 输出 tokens"))
+                .small()
+                .color(Color32::GRAY),
+        );
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("复制").clicked() {
+            ui.ctx().copy_text(message.content.clone());
+        }
+    });
+}
+
+/// 用户消息走独立分支：`TurnView` 的四块全是 assistant 语义，
+/// 装不下 `context_refs`（引用快照），硬塞会丢掉「引用：xxx」。
+fn show_user_message(ui: &mut egui::Ui, message: &AiMessage) {
+    let width = (ui.available_width() * 0.82).max(200.0);
+    ui.add_space(6.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+        egui::Frame::group(ui.style())
+            .fill(ui.visuals().faint_bg_color)
+            .show(ui, |ui| {
+                ui.set_max_width(width);
+                ui.label(&message.content);
+                for reference in &message.context_refs {
+                    ui.label(
+                        RichText::new(format!(
+                            "引用：{}（{}）",
+                            truncate_chars(&reference.subject, 30),
+                            reference.mode.as_str()
+                        ))
+                        .small()
+                        .color(Color32::GRAY),
+                    );
+                }
+            });
     });
 }
 
@@ -941,35 +1299,6 @@ fn show_delete_confirm(state: &mut UiState, commands: &mut Vec<Command>, ui: &mu
     }
 }
 
-fn show_activity(ui: &mut egui::Ui, traces: &[AiToolTrace]) {
-    egui::CollapsingHeader::new(format!("工具活动（{}）", traces.len()))
-        .id_salt("ai_tool_activity")
-        .show(ui, |ui| {
-            for trace in traces {
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {} · {} ms",
-                        trace.tool.label(),
-                        trace.summary,
-                        trace.duration_ms
-                    ))
-                    .small(),
-                );
-                // 动机是「为什么调这个工具」。模型没写时显示占位并标灰——
-                // 宁可承认没说明，也不要编一句像模像样的理由。
-                let (text, weak) = match trace.motive.as_deref() {
-                    Some(motive) => (format!("动机：{motive}"), false),
-                    None => (format!("动机：{}", me_core::ai::DEFAULT_MOTIVE), true),
-                };
-                let mut label = RichText::new(text).small();
-                if weak || trace.motive_source == me_core::ai::MotiveSource::Default {
-                    label = label.color(Color32::GRAY);
-                }
-                ui.label(label);
-            }
-        });
-}
-
 /// `[结果]` 段落：状态 / 做了什么 / 关键信息 / 未完成。
 #[derive(Debug, PartialEq, Eq)]
 struct ResultBlock {
@@ -1074,57 +1403,6 @@ fn show_result_fallback(ui: &mut egui::Ui, traces: &[AiToolTrace]) {
 
 /// 一次最多铺几张卡片；多出来的折叠成一句「还有 N 封」。
 const MAX_CARDS: usize = 5;
-
-fn show_cards(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) {
-    let cards = std::mem::take(&mut state.ai.cards);
-    egui::CollapsingHeader::new(format!("检索到的邮件（{}）", cards.len()))
-        .id_salt("ai_email_cards")
-        .default_open(true)
-        .show(ui, |ui| {
-            let mut open: Option<MessageId> = None;
-            for card in cards.iter().take(MAX_CARDS) {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(RichText::new(truncate_chars(&card.subject, 50)).strong());
-                    let date = card
-                        .date
-                        .map(me_core::format_local_datetime)
-                        .unwrap_or_default();
-                    ui.label(
-                        RichText::new(format!("{} · {date}", card.from))
-                            .small()
-                            .color(Color32::GRAY),
-                    );
-                    ui.label(RichText::new(truncate_chars(&card.snippet, 120)).small());
-                    // 命中理由：让用户知道这封为什么被挑出来，而不是只有模型知道。
-                    ui.label(
-                        RichText::new(truncate_chars(&card.reason, 60))
-                            .small()
-                            .color(Color32::from_rgb(0x3B, 0x82, 0xF6)),
-                    );
-                    if ui.small_button("打开邮件").clicked() {
-                        open = Some(card.message);
-                    }
-                });
-            }
-            if cards.len() > MAX_CARDS {
-                let more = cards.len() - MAX_CARDS;
-                ui.label(
-                    RichText::new(format!("还有 {more} 封，去邮件列表看"))
-                        .small()
-                        .color(Color32::GRAY),
-                );
-            }
-            if let Some(id) = open {
-                // **不切页**：阅读窗在 AI 页上原地弹出，关掉之后仍然停在 AI 页。
-                state.selected_message = Some(id);
-                state.reader_open = true;
-                state.open_body = None;
-                state.body_loading = true;
-                commands.push(Command::OpenMessage(id));
-            }
-        });
-    state.ai.cards = cards;
-}
 
 fn show_input(
     state: &mut UiState,
@@ -1796,14 +2074,17 @@ mod tests {
             ..AiPageState::default()
         };
         state.select(Some(AiConversationId(1)));
-        state.on_stream_started(AiConversationId(1));
-        state.on_delta(AiConversationId(1), 1, "部分");
+        state.on_stream_started(AiConversationId(1), AiMessageId(1));
+        state.on_delta(
+            AiConversationId(1),
+            1,
+            me_core::command::AiDeltaKind::Answer,
+            0,
+            "部分",
+        );
         state.cards.push(AiCard {
             message: MessageId(1),
-            reason: "主题命中".to_string(),
             subject: "主题".to_string(),
-            from: "a@example.com".to_string(),
-            date: None,
             snippet: String::new(),
         });
         assert!(state.is_streaming());
@@ -1818,9 +2099,21 @@ mod tests {
     fn deltas_from_another_conversation_are_ignored() {
         let mut state = AiPageState::default();
         state.select(Some(AiConversationId(1)));
-        state.on_stream_started(AiConversationId(1));
-        state.on_delta(AiConversationId(1), 1, "你好");
-        state.on_delta(AiConversationId(2), 2, "不该出现");
+        state.on_stream_started(AiConversationId(1), AiMessageId(1));
+        state.on_delta(
+            AiConversationId(1),
+            1,
+            me_core::command::AiDeltaKind::Answer,
+            0,
+            "你好",
+        );
+        state.on_delta(
+            AiConversationId(2),
+            2,
+            me_core::command::AiDeltaKind::Answer,
+            0,
+            "不该出现",
+        );
         let stream = state.stream.expect("流仍在");
         assert_eq!(stream.buffer, "你好");
         assert_eq!(stream.seq, 1);
@@ -2198,5 +2491,264 @@ mod tests {
         // 切回来：流式期间还没落库，只能靠缓存恢复。
         state.select_ai_conversation(Some(AiConversationId(1)));
         assert!(state.ai.plan.is_some(), "切走再回来，清单不能凭空消失");
+    }
+
+    // ---------------------------------------------------------------------------
+    // 四区块统一渲染器
+    // ---------------------------------------------------------------------------
+
+    /// 跑一帧主区，收集所有绘制文本。
+    fn main_texts(state: &mut UiState) -> Vec<String> {
+        let mut commands = Vec::new();
+        run_frame(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(state, &mut commands, ui);
+            });
+        })
+    }
+
+    fn assistant_message(id: i64, content: &str) -> AiMessage {
+        AiMessage {
+            id: AiMessageId(id),
+            conversation: AiConversationId(1),
+            role: AiRole::Assistant,
+            content: content.to_string(),
+            context_refs: Vec::new(),
+            status: AiMessageStatus::Complete,
+            error: None,
+            input_tokens: None,
+            output_tokens: None,
+            tool_trace: Vec::new(),
+            plan: None,
+            created_at: 0,
+            thinking: None,
+        }
+    }
+
+    fn ready() -> UiState {
+        let mut state = UiState::default();
+        state.ai.conversations = vec![conversation(1)];
+        state.select_ai_conversation(Some(AiConversationId(1)));
+        state.ai.loading = false;
+        state
+    }
+
+    fn one_step_plan(goal: &str) -> me_core::ai_plan::Plan {
+        me_core::ai_plan::Plan {
+            goal: goal.to_string(),
+            ..me_core::ai_plan::Plan::default()
+        }
+    }
+
+    fn sample_trace() -> AiToolTrace {
+        AiToolTrace {
+            call_id: "c1".to_string(),
+            tool: AiToolName::EmailSearch,
+            status: AiToolStatus::Ok,
+            summary: "检索到 2 封".to_string(),
+            duration_ms: 12,
+            motive: Some("查最近的邮件".to_string()),
+            motive_source: MotiveSource::Model,
+            step_id: Some(1),
+            attempt: Some(2),
+            cards: Vec::new(),
+        }
+    }
+
+    /// 四个区块按 思考 → 清单 → 工具 → 回答 排列，顺序只由 render_turn 定义。
+    #[test]
+    fn render_turn_orders_four_blocks() {
+        let mut state = ready();
+        let mut message = assistant_message(10, "这是最终回答");
+        message.thinking = Some(ThinkingBlock {
+            segments: vec![ThinkingSegment {
+                index: 1,
+                text: "想一下".to_string(),
+                followed_by_tool: true,
+            }],
+            truncated: false,
+        });
+        message.plan = Some(one_step_plan("这次的目标"));
+        message.tool_trace = vec![sample_trace()];
+        state.ai.messages.push(message);
+
+        let texts = main_texts(&mut state);
+        let pos = |needle: &str| {
+            texts
+                .iter()
+                .position(|text| text.contains(needle))
+                .unwrap_or_else(|| panic!("缺少 {needle:?}：{texts:?}"))
+        };
+        let thinking = pos("思考过程");
+        let plan = pos("任务清单");
+        let tools = pos("工具调用");
+        let answer = pos("这是最终回答");
+        assert!(
+            thinking < plan && plan < tools && tools < answer,
+            "顺序应为 思考 < 清单 < 工具 < 回答，实得 {thinking}/{plan}/{tools}/{answer}：{texts:?}"
+        );
+    }
+
+    /// 没有的块不画：只有回答时，不该出现另外三个标题。
+    #[test]
+    fn missing_blocks_render_nothing() {
+        let mut state = ready();
+        state.ai.messages.push(assistant_message(11, "只有回答"));
+        let texts = main_texts(&mut state);
+        assert!(texts.iter().any(|t| t.contains("只有回答")));
+        for absent in ["思考过程", "任务清单", "工具调用"] {
+            assert!(
+                !texts.iter().any(|t| t.contains(absent)),
+                "不该出现 {absent}：{texts:?}"
+            );
+        }
+    }
+
+    /// 历史消息各自带自己的清单，不能只显示最后一份。
+    #[test]
+    fn historical_message_shows_its_own_plan() {
+        let mut state = ready();
+        let mut first = assistant_message(12, "第一轮回答");
+        first.plan = Some(one_step_plan("第一轮的目标"));
+        let mut second = assistant_message(13, "第二轮回答");
+        second.plan = Some(one_step_plan("第二轮的目标"));
+        state.ai.messages.push(first);
+        state.ai.messages.push(second);
+
+        let texts = main_texts(&mut state);
+        assert!(
+            texts.iter().any(|t| t.contains("第一轮的目标")),
+            "第一轮清单要能回看：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("第二轮的目标")),
+            "第二轮清单也要在：{texts:?}"
+        );
+    }
+
+    /// 数据库里的 streaming 占位行必须被跳过，否则和 show_stream 拼出两个气泡。
+    #[test]
+    fn streaming_placeholder_produces_single_bubble() {
+        let mut state = ready();
+        let mut placeholder = assistant_message(20, "");
+        placeholder.status = AiMessageStatus::Streaming;
+        state.ai.messages.push(placeholder);
+        state
+            .ai
+            .on_stream_started(AiConversationId(1), AiMessageId(20));
+        state.ai.on_delta(
+            AiConversationId(1),
+            1,
+            me_core::command::AiDeltaKind::Answer,
+            0,
+            "正在写",
+        );
+
+        let texts = main_texts(&mut state);
+        let count = texts.iter().filter(|t| *t == "正在写").count();
+        assert_eq!(count, 1, "只能有一个气泡：{texts:?}");
+        assert!(
+            !texts.iter().any(|t| *t == "…"),
+            "占位行的空正文不该再画一次：{texts:?}"
+        );
+    }
+
+    /// 终态消息不能被上面的过滤误伤。
+    #[test]
+    fn failed_and_cancelled_messages_still_render() {
+        let mut state = ready();
+        let mut failed = assistant_message(21, "失败前的部分内容");
+        failed.status = AiMessageStatus::Failed;
+        failed.error = Some("网络中断".to_string());
+        let mut cancelled = assistant_message(22, "已写了一半");
+        cancelled.status = AiMessageStatus::Cancelled;
+        state.ai.messages.push(failed);
+        state.ai.messages.push(cancelled);
+
+        let texts = main_texts(&mut state);
+        assert!(texts.iter().any(|t| t.contains("失败前的部分内容")));
+        assert!(texts.iter().any(|t| t.contains("已写了一半")));
+        assert!(texts.iter().any(|t| t.contains("网络中断")));
+        assert!(texts.iter().any(|t| t == "已停止"));
+    }
+
+    /// user 消息走独立分支后，引用快照不能丢（E2）。
+    #[test]
+    fn user_context_refs_still_render() {
+        let mut state = ready();
+        let mut message = user_message("帮我看看这封");
+        message.context_refs.push(me_core::ai::AiContextRef {
+            message_id: MessageId(7),
+            subject: "周会纪要".to_string(),
+            from: "a@example.com".to_string(),
+            date: None,
+            mode: AiContextMode::FullBody,
+            excerpt: "正文".to_string(),
+        });
+        state.ai.messages.push(message);
+        let texts = main_texts(&mut state);
+        assert!(texts.iter().any(|t| t.contains("帮我看看这封")));
+        assert!(
+            texts.iter().any(|t| t.contains("引用：周会纪要")),
+            "引用快照丢了：{texts:?}"
+        );
+    }
+
+    /// 工具跑着的时候就要看到「执行中」，不能等完成事件。
+    #[test]
+    fn live_tool_shows_while_running() {
+        let mut state = ready();
+        state
+            .ai
+            .on_stream_started(AiConversationId(1), AiMessageId(30));
+        state.ai.on_tool_started(LiveTool {
+            call_id: "c1".to_string(),
+            tool: AiToolName::EmailSearch,
+            motive: Some("先查一下".to_string()),
+            motive_source: MotiveSource::Model,
+        });
+        let texts = main_texts(&mut state);
+        assert!(
+            texts.iter().any(|t| t.contains("执行中")),
+            "实时工具要有反馈：{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t.contains("先查一下")));
+    }
+
+    /// 思考按段号分桶，流式状态下能显示出来。
+    #[test]
+    fn live_thinking_renders_in_the_thinking_block() {
+        let mut state = ready();
+        state
+            .ai
+            .on_stream_started(AiConversationId(1), AiMessageId(31));
+        state.ai.on_delta(
+            AiConversationId(1),
+            1,
+            me_core::command::AiDeltaKind::Thinking,
+            1,
+            "第一段想法",
+        );
+        state.ai.on_delta(
+            AiConversationId(1),
+            2,
+            me_core::command::AiDeltaKind::Thinking,
+            2,
+            "第二段想法",
+        );
+        state.ai.on_delta(
+            AiConversationId(1),
+            3,
+            me_core::command::AiDeltaKind::Answer,
+            0,
+            "答案",
+        );
+        let texts = main_texts(&mut state);
+        assert!(
+            texts.iter().any(|t| t.contains("思考中")),
+            "流式思考区要出现：{texts:?}"
+        );
+        assert_eq!(state.ai.stream.as_ref().unwrap().thinking.len(), 2);
+        assert_eq!(state.ai.stream.as_ref().unwrap().buffer, "答案");
     }
 }

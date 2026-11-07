@@ -337,6 +337,39 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 self.state
                     .ai
                     .sync_plan_from_messages(conversation, &messages);
+
+                // 历史消息里的 cards 只存了 `id + 命中理由`，摘要要按 id 补回缓存。
+                // 不补的话点历史卡片的「打开邮件」时 reader 在 state.messages 里
+                // 找不到这封（常常不在当前文件夹），回退分支也是空的 → 窗口立刻关。
+                // 用追加去重而不是清空重建：流式期间的实时卡片不能被这里冲掉。
+                for message in &messages {
+                    for trace in &message.tool_trace {
+                        for card in &trace.cards {
+                            if self
+                                .state
+                                .ai
+                                .cards
+                                .iter()
+                                .any(|c| c.message == card.message)
+                            {
+                                continue;
+                            }
+                            if let Ok(Some(summary)) = self.repo.get_message_readonly(card.message)
+                            {
+                                self.state.ai.cards.push(views::ai::AiCard {
+                                    message: card.message,
+                                    subject: summary
+                                        .subject
+                                        .clone()
+                                        .unwrap_or_else(|| "(无主题)".to_string()),
+                                    snippet: summary.snippet.clone().unwrap_or_default(),
+                                });
+                                self.state.ai.card_messages.push(summary);
+                            }
+                        }
+                    }
+                }
+
                 self.state.ai.messages = messages;
                 self.state.ai.loading = false;
             }
@@ -1530,11 +1563,11 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             }
             Event::AiStreamStarted {
                 conversation,
+                message,
                 trimmed_turns,
-                ..
             } => {
                 if self.state.ai.selected == Some(conversation) {
-                    self.state.ai.on_stream_started(conversation);
+                    self.state.ai.on_stream_started(conversation, message);
                     if trimmed_turns > 0 {
                         self.state.toast(
                             ToastKind::Info,
@@ -1547,11 +1580,15 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             Event::AiStreamDelta {
                 conversation,
                 seq,
+                kind,
+                segment,
                 delta,
                 ..
             } => {
                 if self.state.ai.selected == Some(conversation) {
-                    self.state.ai.on_delta(conversation, seq, &delta);
+                    self.state
+                        .ai
+                        .on_delta(conversation, seq, kind, segment, &delta);
                 }
             }
             Event::AiMessageCompleted {
@@ -1599,8 +1636,21 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             Event::AiPlanFinished { .. } => {
                 // 收尾状态由落库的那条消息承载。
             }
-            Event::AiToolStarted { .. } => {
-                // 工具开始不单独展示：完成事件带摘要，活动条一次成型。
+            Event::AiToolStarted {
+                call_id,
+                tool,
+                motive,
+                motive_source,
+                ..
+            } => {
+                // 事件本来就带动机，直接搬进 live_tool：工具跑着的时候
+                // 用户就能看到「为什么调它」，不用等完成事件。
+                self.state.ai.on_tool_started(views::ai::LiveTool {
+                    call_id,
+                    tool,
+                    motive,
+                    motive_source,
+                });
             }
             Event::AiToolWeatherResult { .. } => {
                 // 天气卡片由天气页负责；AI 页只保留文字摘要。
@@ -1613,8 +1663,17 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 duration_ms,
                 motive,
                 motive_source,
+                step_id,
+                attempt,
                 ..
             } => {
+                self.state.ai.on_tool_finished(&call_id);
+                let trace_cards = self
+                    .state
+                    .ai
+                    .cards_by_call
+                    .remove(&call_id)
+                    .unwrap_or_default();
                 self.state.ai.activity.push(me_core::ai::AiToolTrace {
                     call_id,
                     tool,
@@ -1623,35 +1682,37 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                     duration_ms,
                     motive,
                     motive_source,
-                    step_id: None,
-                    attempt: None,
-                    cards: Vec::new(),
+                    step_id,
+                    attempt,
+                    cards: trace_cards,
                 });
             }
             Event::AiToolEmailResults {
                 conversation,
+                call_id,
                 cards,
                 ..
             } => {
                 if self.state.ai.selected == Some(conversation) {
+                    // 命中理由随 trace 走；先按 call_id 暂存，等 Completed 到达再挂上。
+                    self.state.ai.cards_by_call.insert(call_id, cards.clone());
                     let mut built = Vec::new();
+                    let mut summaries = Vec::new();
                     for card in cards {
                         if let Ok(Some(message)) = self.repo.get_message_readonly(card.message) {
+                            // reader 打开邮件时会先找 state.messages，找不到再回退到
+                            // card_messages。AI 检索到的邮件常常不在当前列表里，
+                            // 这份摘要不存下来，「打开邮件」点了就会立刻关窗。
+                            summaries.push(message.clone());
                             built.push(views::ai::AiCard {
                                 message: card.message,
-                                reason: card.reason,
                                 subject: message.subject.unwrap_or_else(|| "(无主题)".to_string()),
-                                from: message
-                                    .from
-                                    .as_ref()
-                                    .map(|address| address.display())
-                                    .unwrap_or_default(),
-                                date: message.date,
                                 snippet: message.snippet.unwrap_or_default(),
                             });
                         }
                     }
                     self.state.ai.cards = built;
+                    self.state.ai.card_messages = summaries;
                 }
             }
             Event::AiMusicCommand {
