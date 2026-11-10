@@ -10,8 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use me_core::CoreError;
 use me_core::port::ReadOnlyRepo;
 use r2d2::Pool;
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::cache::CachePaths;
 use crate::{migrations, storage};
@@ -24,6 +23,42 @@ const READ_POOL_SIZE: u32 = 4;
 
 type SqlitePool = Pool<SqliteConnectionManager>;
 pub(crate) type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
+
+/// 只读连接池的连接工厂。
+///
+/// 为什么自己实现而不用 `r2d2_sqlite`：那个 crate 对 `rusqlite` 的版本要求是
+/// 精确配对的（0.35 → `rusqlite ^0.40`），而 `rusqlite 0.41` 才带上打过补丁的
+/// `libsqlite3-sys 0.39`（RUSTSEC-2026-0459 / CVE-2026-119375：SQLite < 3.54.0
+/// 读 WAL 时可能返回未初始化的页缓存内存）。r2d2_sqlite 一旦没跟上，旧版
+/// `libsqlite3-sys` 就会被它继续拖进依赖树，`cargo deny` 永远红。
+///
+/// 这里的行为与 `SqliteConnectionManager::file(path).with_init(apply_pragmas)`
+/// **完全一致**：`OpenFlags::default()`（读写 + 创建 + URI + NO_MUTEX）打开，
+/// 每次新建连接后套一遍 PRAGMA；`is_valid` 用 `SELECT 1` 探活，
+/// `has_broken` 恒为 false——都是 r2d2_sqlite 的原样语义，不做额外判断。
+#[derive(Debug)]
+pub(crate) struct SqliteConnectionManager {
+    path: PathBuf,
+}
+
+impl r2d2::ManageConnection for SqliteConnectionManager {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> Result<Connection, rusqlite::Error> {
+        let conn = Connection::open_with_flags(&self.path, OpenFlags::default())?;
+        apply_pragmas(&conn)?;
+        Ok(conn)
+    }
+
+    fn is_valid(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch("SELECT 1;")
+    }
+
+    fn has_broken(&self, _: &mut Connection) -> bool {
+        false
+    }
+}
 
 pub(crate) struct StoreInner {
     pub(crate) paths: CachePaths,
@@ -81,10 +116,9 @@ impl Store {
         let conn = migrations::ensure_schema(conn, &paths.db_file())?;
         maybe_checkpoint_wal(&conn, &paths)?;
 
-        let manager = SqliteConnectionManager::file(paths.db_file()).with_init(|conn| {
-            apply_pragmas(conn)?;
-            Ok(())
-        });
+        let manager = SqliteConnectionManager {
+            path: paths.db_file(),
+        };
         let pool = Pool::builder()
             .max_size(READ_POOL_SIZE)
             .build(manager)
@@ -336,5 +370,43 @@ impl ReadOnlyRepo for ReadOnlyStore {
 
     fn count_ai_entities_readonly(&self) -> Result<u32, CoreError> {
         crate::ai::count_entities_readonly(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at_least(version: &str, min: (u32, u32, u32)) -> bool {
+        let mut parts = version
+            .split('.')
+            .map(|part| part.trim().parse::<u32>().unwrap_or(0));
+        let got = (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        );
+        got >= min
+    }
+
+    /// 打包进去的 SQLite 必须 >= 3.54.0。
+    ///
+    /// `cargo deny` 只能看 crate 版本号，而真正决定安全性的是**编进来的 C 源码**：
+    /// 只要有人把 `bundled` 关掉（改成链接系统库），或者降级 `libsqlite3-sys`，
+    /// crate 版本检查都可能看不出来。这条断言直接问运行时，把两种情况都挡住。
+    ///
+    /// 3.54.0 是 RUSTSEC-2026-0459 / CVE-2026-119375 的修复线：旧版在打开
+    /// 「页大小与库不一致的 -wal」时，可能把进程内存里的旧字节当查询结果返回。
+    #[test]
+    fn bundled_sqlite_is_patched_for_cve_2026_119375() {
+        let conn = Connection::open_in_memory().expect("内存库");
+        let version: String = conn
+            .query_row("SELECT sqlite_version()", [], |row| row.get(0))
+            .expect("读版本");
+        assert!(
+            at_least(&version, (3, 54, 0)),
+            "SQLite {version} 低于 3.54.0（RUSTSEC-2026-0459）：\
+确认 rusqlite 的 bundled 特性没被关掉，且 libsqlite3-sys >= 0.39"
+        );
     }
 }

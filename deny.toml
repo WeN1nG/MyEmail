@@ -3,6 +3,13 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # Only fail on unmaintained crates that are direct workspace dependencies.
 # Transitive Linux D-Bus/font crates are tracked upstream.
 unmaintained = "workspace"
+# `libsqlite3-sys` 必须 >= 0.39（打包 SQLite >= 3.54.0）：
+# RUSTSEC-2026-0459 / CVE-2026-119375，旧版打开「页大小与库不一致的 -wal」时
+# 可能把进程内存里的旧字节当查询结果返回。
+# 因此 `r2d2_sqlite` 已被移除——它把 rusqlite 钉死在 ^0.40，会让
+# libsqlite3-sys 0.38 一直被拖进依赖树；连接工厂改为 `me-store/src/db.rs`
+# 里自实现的 `SqliteConnectionManager`（语义与原来完全一致）。
+# 升级 rusqlite 时先跑：cargo tree -i libsqlite3-sys，确认只剩一个 0.39+。
 
 [licenses]
 confidence-threshold = 0.93
