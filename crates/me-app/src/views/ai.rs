@@ -783,7 +783,8 @@ fn build_stream_message(state: &AiPageState) -> Option<AiMessage> {
             text: text.clone(),
             followed_by_tool: *index < max_segment,
         })
-        .filter(|segment| !segment.text.is_empty())
+        // 只有空白的段不画：思考增量也常以换行开头，留着就是一行空行。
+        .filter(|segment| !segment.text.trim().is_empty())
         .collect();
     let thinking = (!segments.is_empty()).then_some(ThinkingBlock {
         segments,
@@ -877,7 +878,11 @@ fn show_thinking(ui: &mut egui::Ui, block: &ThinkingBlock, live: bool, message_i
                         .strong(),
                     );
                 }
-                ui.label(RichText::new(&segment.text).small().color(Color32::GRAY));
+                ui.label(
+                    RichText::new(segment.text.trim())
+                        .small()
+                        .color(Color32::GRAY),
+                );
                 if index + 1 < block.segments.len() {
                     ui.separator();
                 }
@@ -1013,7 +1018,15 @@ fn show_trace_cards(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, cards: &[MailCardR
 /// 回答区：正文、[结果] 块、错误/取消、token 用量、复制按钮。
 fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
     let message = turn.message;
-    if message.content.is_empty() {
+    // **流式与收尾必须对「首尾空白」采取同一口径**。
+    //
+    // 模型在调工具之前会先吐换行（日志里每轮 `text_chars=2~3`，落库的正文
+    // 前面确实挂着 `\n\n\n\n\n\n\n\n\n\n`），流式期间正文按纯文本 `ui.label`
+    // 绘制，这些换行就是真的空行 —— 气泡于是靠空行一路长高，正文出现后上方
+    // 还留一大片空白；而收尾后改走 Markdown 渲染，解析器把开头空行丢掉，
+    // 空白又突然消失。这里统一按 trim 后的文本绘制，两边高度才对得上。
+    let live = message.content.trim();
+    if live.is_empty() {
         if turn.streaming {
             ui.label(RichText::new("正在生成…").color(Color32::GRAY));
         } else {
@@ -1021,7 +1034,7 @@ fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
         }
     } else if turn.streaming {
         // 流式期间不跑 Markdown：每帧解析会让滚动卡顿，光标位置也会跳。
-        ui.label(&message.content);
+        ui.label(live);
         ui.label(
             RichText::new(format!(
                 "生成中… {}s · 约 {} tokens",
@@ -2888,5 +2901,70 @@ mod tests {
         );
         assert_eq!(state.ai.stream.as_ref().unwrap().thinking.len(), 2);
         assert_eq!(state.ai.stream.as_ref().unwrap().buffer, "答案");
+    }
+
+    /// 流式正文里的首尾空白不能变成空行。
+    ///
+    /// 真实数据（本机库里的两条助手消息）正文以 `\n\n\n\n\n\n\n\n\n\n` 开头——
+    /// 模型在调工具前先吐换行，日志里每轮 `text_chars=2~3`。流式期间按纯文本画，
+    /// 这些换行就是真的空行：气泡靠空行长高、正文上方留一片空白，收尾后改走
+    /// Markdown 又被解析器丢掉，空白「自己消失」。这条测试盯的就是这个对不上。
+    #[test]
+    fn streaming_answer_does_not_grow_on_blank_deltas() {
+        let mut state = ready();
+        state
+            .ai
+            .on_stream_started(AiConversationId(1), AiMessageId(40));
+        state.ai.on_delta(
+            AiConversationId(1),
+            1,
+            me_core::command::AiDeltaKind::Answer,
+            0,
+            "\n\n\n\n\n",
+        );
+        let texts = main_texts(&mut state);
+        assert!(
+            texts.iter().any(|t| t.contains("正在生成")),
+            "只有空白增量时必须显示占位，而不是一串空行：{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains('\n')),
+            "空白增量不能被画出来：{texts:?}"
+        );
+
+        state.ai.on_delta(
+            AiConversationId(1),
+            2,
+            me_core::command::AiDeltaKind::Answer,
+            0,
+            "正文",
+        );
+        let texts = main_texts(&mut state);
+        assert!(
+            texts.iter().any(|t| t == "正文"),
+            "正文前面不该挂着空行（trim 后才是正文本身）：{texts:?}"
+        );
+    }
+
+    /// 收尾后同一条消息按 Markdown 画，与流式期间的可见高度口径一致：
+    /// 两者都以「第一个非空白字符」作为正文起点。
+    #[test]
+    fn blank_segments_do_not_render_an_empty_thinking_body() {
+        let mut state = ready();
+        state
+            .ai
+            .on_stream_started(AiConversationId(1), AiMessageId(41));
+        state.ai.on_delta(
+            AiConversationId(1),
+            1,
+            me_core::command::AiDeltaKind::Thinking,
+            0,
+            "\n\n",
+        );
+        let texts = main_texts(&mut state);
+        assert!(
+            !texts.iter().any(|t| t.contains("思考中")),
+            "全空白的思考不该画出标题与空壳：{texts:?}"
+        );
     }
 }
