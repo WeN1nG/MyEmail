@@ -2,7 +2,7 @@
 
 > 事实基线：v0.4.0 / schema **v7**（本需求**不改 schema**）/ 相关代码为 `crates/me-app` + `crates/me-core`
 >
-> **落地状态：已实现**（`cargo test --workspace` 888 passed / 6 ignored，`fmt` + `clippy -D warnings` 通过）。
+> **落地状态：已实现**（`cargo test --workspace` 931 passed / 7 ignored，`fmt` + `clippy -D warnings` 通过）。
 > 落地时与本文有两处偏差，文内已就地标注：`set_scope` 多一个 `playing` 参数（§3.2）、
 > 「不读封面」是多做一步显式跳过而不是只靠 `limit_visual_bytes`（§3.6）。
 > 版本归属见 [doc/versiondoc/版本跟踪.md](../versiondoc/版本跟踪.md) §10（未定版增量）。
@@ -26,7 +26,7 @@
 
 1. **这不是纯 UI 改动。** 播放队列住在音频线程（`PlayerCore.queue`），UI 里的 `MusicState.tracks` 只是扫描结果的副本。只在 `views/music.rs` 过滤渲染，得到的是「列表只剩 3 首、但下一首仍然播第 4 首」的假搜索。
 2. **「歌手」今天没有数据。** `playlist::Track` 只有 `path` / `title`（文件名去扩展名）/ `duration_ms`；标签里的歌手只在**切歌那一刻**由 `tags::read_now_playing` 读一次。要按歌手搜，必须先把 artist 补齐到 `Track` 上——这是本需求里唯一有 IO 成本的部分（§3.6）。
-3. **「裁剪队列」不能是「替换队列」。** 把 `MusicQueue.tracks` 换成搜索结果，索引语义就整体漂移：`MusicState.current`、专辑页、封面纹理、AI 的 `index` 参数全部指错歌。正确做法是保留全库 `tracks`，另加一层**作用域**：scope 决定「哪些」，order 决定「什么顺序」。
+3. **「裁剪队列」不能是「替换队列」。** 把 `MusicQueue.tracks` 换成搜索结果，索引语义就整体漂移：`MusicState.current`、专辑页、封面纹理全部指错歌（AI 侧曾有同样的坑——`music_play` 的 `index` 参数就是曲库序号，2026-11-10 已删除）。正确做法是保留全库 `tracks`，另加一层**作用域**：scope 决定「哪些」，order 决定「什么顺序」。
 4. **视图序号 ≠ 曲库索引。** 搜索态下列表第 1 行可能是曲库第 137 首。编号必须按视图位置算，`Play` 必须传曲库索引；两者只能在一处转换。
 5. **「搜索决定播放列表」是一个隐形状态，必须让它可见。** 用户搜完、点第 2 首、听了 5 首之后音乐停了——如果界面上没有任何东西说明「播放范围只有这 5 首」，这就是 bug 报告。所以 footer 要有范围指示（R8），列表顶部要有「正在播放但不在筛选内」那一行（R9）。
 
