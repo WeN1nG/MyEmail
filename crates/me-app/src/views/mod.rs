@@ -28,11 +28,13 @@ pub fn top_bar(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::Con
         ui.horizontal(|ui| {
             ui.heading(RichText::new("MyEmail").strong());
             ui.separator();
+            // AI 放第一位：这个应用的定位是「AI 是核心」，邮件/日历/天气/音乐
+            // 都是它可调用的数据源，导航顺序要与之对齐。
             for page in [
+                Page::AiChat,
                 Page::Mail,
                 Page::Calendar,
                 Page::Weather,
-                Page::AiChat,
                 Page::Music,
                 Page::Accounts,
                 Page::Settings,
@@ -511,24 +513,39 @@ mod tests {
     ///
     /// 之前左侧栏也画了一套导航，两处信息重复；现在左侧栏已删除，
     /// 顶部栏是唯一的页面切换入口。
+    ///
+    /// 顺序也在这里钉住：**AI 必须第一位**——它是这个应用的主入口，
+    /// 邮件/日历/天气/音乐都是它可调用的数据源。
     #[test]
     fn top_bar_lists_every_page_including_weather() {
         let mut state = UiState::default();
         let texts = top_bar_texts(&mut state);
-        for page in [
+        let expected = [
+            Page::AiChat,
             Page::Mail,
             Page::Calendar,
             Page::Weather,
             Page::Music,
             Page::Accounts,
             Page::Settings,
-        ] {
+        ];
+        for page in expected {
             assert!(
                 texts.iter().any(|text| text == page.label()),
                 "顶部导航栏应包含「{}」，实际 {texts:?}",
                 page.label()
             );
         }
+        let labels: Vec<&str> = expected.iter().map(|page| page.label()).collect();
+        let drawn: Vec<&str> = texts
+            .iter()
+            .map(String::as_str)
+            .filter(|text| labels.contains(text))
+            .collect();
+        assert_eq!(
+            drawn, labels,
+            "导航顺序应与页面顺序一致（AI 在第一位），实际 {texts:?}"
+        );
     }
 
     /// 页面切换入口只在顶部栏，页面上不应再出现重复的导航条目。
