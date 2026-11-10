@@ -880,6 +880,97 @@ where
         }
     }
 
+    /// 每天首次启动时，由 AI 主动开一个会话并生成「今日简报」。
+    ///
+    /// 判定链（任何一步不满足就**静默**返回，启动阶段不弹错误）：
+    /// ① 今天还没发起过（`meta.ai_daily_briefing` 记的是本地日期）；
+    /// ② 有可用模型且已确认隐私、有可用凭证；
+    /// ③ 建一个带日期的会话，先写当日标记，再走正常的一轮请求。
+    ///
+    /// **不插入用户消息**（`insert_user = false`）：这份简报是 AI 主动发的，
+    /// 会话里不该出现一条「用户提问」。提示词只进本轮的 `user_input`，
+    /// 不进历史——用户之后在这个会话里追问时，上下文里有的是简报本身。
+    ///
+    /// 标记写在**发起时**：宁可某天因为网络失败少一份，也不能同一天因为
+    /// 重复触发开出好几个会话；用户仍可在那个会话里手动「重新生成」。
+    pub(crate) async fn handle_daily_ai_briefing(&self) {
+        let now = now_unix();
+        let today = me_core::ai::local_date_key(now);
+        let month_day = me_core::ai::local_month_day(now);
+        if today.is_empty() || month_day.is_empty() {
+            // 本地时区读不出来（几乎不可能）：宁可不发，也不写一个空标记把当天锁死。
+            return;
+        }
+
+        match self
+            .db(|s| s.get_setting(settings_key::AI_DAILY_BRIEFING))
+            .await
+        {
+            Ok(Some(last)) if last.trim() == today => return,
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(error = %err.user_message(), "读取晨间简报标记失败，跳过");
+                return;
+            }
+        }
+
+        let (models, active) = self.models_snapshot();
+        let Some(model) = resolve_model(&models, None, active.as_deref()).cloned() else {
+            return;
+        };
+        let acked = self
+            .inner
+            .ai_state
+            .lock()
+            .map(|state| state.privacy_ack(model.kind))
+            .unwrap_or(false);
+        if !acked {
+            return;
+        }
+        let config = model.to_config();
+        if Self::ai_credential(&model).is_none()
+            && !(model.kind == AiProviderKind::OpenAiCompatible && config.is_loopback())
+        {
+            return;
+        }
+
+        let title = format!("每日简报 · {month_day}");
+        let model_id = model.id.clone();
+        let conversation = match self
+            .db(move |s| s.create_conversation(&title, Some(&model_id), &config))
+            .await
+        {
+            Ok(conversation) => conversation,
+            Err(err) => {
+                tracing::warn!(error = %err.user_message(), "创建晨间简报会话失败");
+                return;
+            }
+        };
+
+        let marker = today.clone();
+        if let Err(err) = self
+            .db(move |s| s.set_setting(settings_key::AI_DAILY_BRIEFING, &marker))
+            .await
+        {
+            tracing::warn!(error = %err.user_message(), "写晨间简报标记失败");
+        }
+
+        tracing::info!(conversation = conversation.id.0, "发起晨间简报");
+        self.emit(Event::AiConversationsChanged).await;
+        self.emit(Event::AiDailyBriefingStarted {
+            conversation: conversation.id,
+        })
+        .await;
+        self.start_ai_turn(
+            conversation.id,
+            me_core::ai::DAILY_BRIEFING_PROMPT.to_string(),
+            Vec::new(),
+            false,
+            false,
+        )
+        .await;
+    }
+
     pub(crate) async fn handle_delete_ai_entity(&self, entity: i64) {
         match self.db(move |s| s.delete_entity(entity)).await {
             Ok(()) => {
@@ -1216,6 +1307,16 @@ where
             .db(move |s| me_core::ai::AiRepo::list_messages(&s, conversation, None, 4))
             .await
             .unwrap_or_default();
+        // **先找到用户消息，再删旧回复**。反过来的话，「由 AI 自己开口」的会话
+        // （每日简报：只有助手消息、没有用户提问）会被删掉最后一条回复却什么都不生成，
+        // 用户点一下「重新生成」简报就凭空消失了。
+        let Some(user) = messages.iter().rev().find(|m| m.role == AiRole::User) else {
+            self.emit_ai_error(CoreError::validation(
+                "这一轮不是由你的提问发起的，没有可重新生成的问题",
+            ))
+            .await;
+            return;
+        };
         if let Some(last) = messages.last()
             && last.role == AiRole::Assistant
         {
@@ -1225,9 +1326,6 @@ where
                 return;
             }
         }
-        let Some(user) = messages.iter().rev().find(|m| m.role == AiRole::User) else {
-            return;
-        };
         let content = user.content.clone();
         let refs = user.context_refs.clone();
         self.start_ai_turn(conversation, content, refs, false, true)

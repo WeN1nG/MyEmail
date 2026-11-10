@@ -158,6 +158,12 @@ pub mod settings_key {
     pub const AI_TOOL_PERMISSIONS: &str = "ai_tool_permissions";
     /// 实体注册表上限。
     pub const AI_MEMORY_MAX_ENTITIES: &str = "ai_memory_max_entities";
+    /// 上一次**发起**晨间简报的本地日期（`YYYY-MM-DD`）。
+    ///
+    /// 只用来回答一个问题：今天是不是已经发起过了。写在**发起时**而不是
+    /// 写成功时——简报是「每天最多一次」的行为，宁可某天因为网络失败少一份，
+    /// 也不能因为重试而在同一天连开几个会话。
+    pub const AI_DAILY_BRIEFING: &str = "ai_daily_briefing";
     /// AI 功能开关（`doc/v03架构设计.md` D26）。
     ///
     /// **预留键，v0.3 未接线**，与 [`FEATURE_CALENDAR`] 同状态：无读取方、

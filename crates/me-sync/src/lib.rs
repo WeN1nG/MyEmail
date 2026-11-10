@@ -1068,6 +1068,10 @@ where
                 let service = self.clone();
                 tokio::spawn(async move { service.handle_clear_ai_entities().await });
             }
+            Command::GenerateDailyAiBriefing => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_daily_ai_briefing().await });
+            }
         }
     }
 

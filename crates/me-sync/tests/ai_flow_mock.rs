@@ -4987,3 +4987,147 @@ async fn repeated_tool_failure_becomes_a_lesson_in_the_next_system_prompt() {
         "教训要写清是什么错：{system}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 晨间简报：AI 每天自己开一个会话
+// ---------------------------------------------------------------------------
+
+/// 每日简报：AI 自己开口，**不插用户消息**，一天只发起一次。
+#[tokio::test]
+async fn daily_briefing_starts_itself_and_only_once_per_day() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "unread_only": true, "days": 7 }),
+        )),
+        Turn::text(
+            "## 未读邮件\n2 封。\n\n## 近三天日程\n没有。\n\n## 近三天天气\n没有。\n\n\
+             ## 今天要注意\n先回这两封。\n\n\
+             [结果]\n状态：已完成\n做了什么：检索未读邮件\n关键信息：2 封\n未完成：无",
+        ),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+
+    commands
+        .send(Command::GenerateDailyAiBriefing)
+        .expect("send");
+    // 先把「AI 主动开口」这一事件接住：界面靠它切到 AI 页。
+    let started = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiDailyBriefingStarted { .. })
+    })
+    .await;
+    let Event::AiDailyBriefingStarted { conversation } = started else {
+        unreachable!()
+    };
+    assert!(wait_for_completion(&mut rx, 30).await, "简报这一轮必须收尾");
+
+    // 1) 会话只有一个，标题带日期，正文落库
+    let conversations = store
+        .writable()
+        .list_conversations(None, 10)
+        .expect("list conversations");
+    assert_eq!(
+        conversations.len(),
+        1,
+        "只能开一个简报会话：{conversations:?}"
+    );
+    assert!(
+        conversations[0].title.starts_with("每日简报 · "),
+        "标题要带日期：{}",
+        conversations[0].title
+    );
+    assert_eq!(conversations[0].id, conversation);
+
+    // 2) **没有用户消息**：这是 AI 主动发起，不是用户的提问
+    let messages = store
+        .writable()
+        .list_messages(conversation, None, 20)
+        .expect("list messages");
+    assert!(
+        messages.iter().all(|m| m.role != me_core::ai::AiRole::User),
+        "简报会话里不该出现用户提问：{messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == me_core::ai::AiRole::Assistant),
+        "要有助手消息"
+    );
+
+    // 3) 模型拿到的是预置提示词（四块内容都在），而不是空请求
+    let bodies = provider.message_bodies.lock().expect("lock").clone();
+    let first = bodies.first().expect("至少一轮请求");
+    for needle in ["未读邮件", "近三天日程", "近三天天气", "今天要注意"] {
+        assert!(first.contains(needle), "提示词缺「{needle}」：{first}");
+    }
+
+    // 4) 当日标记已写：同一天再触发不会有第二个会话
+    let marker = store
+        .writable()
+        .get_setting(me_core::settings_key::AI_DAILY_BRIEFING)
+        .expect("get")
+        .unwrap_or_default();
+    assert_eq!(
+        marker,
+        me_core::ai::local_date_key(me_core::model::now_unix())
+    );
+
+    commands
+        .send(Command::GenerateDailyAiBriefing)
+        .expect("send again");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let conversations = store
+        .writable()
+        .list_conversations(None, 10)
+        .expect("list conversations");
+    assert_eq!(
+        conversations.len(),
+        1,
+        "同一天第二次触发不该再开一个会话：{conversations:?}"
+    );
+}
+
+/// 没有可用模型 / 未确认隐私时静默跳过：启动阶段不该弹错误，也不该写标记
+/// （标记一旦写了，用户当天补上模型也拿不到简报）。
+#[tokio::test]
+async fn daily_briefing_skips_quietly_without_privacy_ack() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![Turn::text("不该被调用")]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), false);
+
+    commands
+        .send(Command::GenerateDailyAiBriefing)
+        .expect("send");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        store
+            .writable()
+            .list_conversations(None, 10)
+            .expect("list")
+            .is_empty(),
+        "没有模型/隐私未确认时不该开会话"
+    );
+    assert!(
+        store
+            .writable()
+            .get_setting(me_core::settings_key::AI_DAILY_BRIEFING)
+            .expect("get")
+            .is_none(),
+        "跳过时不能写当日标记，否则当天的机会就没了"
+    );
+    assert!(
+        provider.message_bodies.lock().expect("lock").is_empty(),
+        "一轮请求都不该发出去"
+    );
+    // 静默：允许有其他事件，但不能有 Error 弹到界面上。
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(event, Event::Error { .. }),
+            "启动阶段不该因为跳过简报弹错误：{event:?}"
+        );
+    }
+}

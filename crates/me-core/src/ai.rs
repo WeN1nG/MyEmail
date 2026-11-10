@@ -1583,6 +1583,64 @@ pub fn time_anchor(now: i64) -> String {
 pub const CONTEXT_BEGIN: &str = "--- BEGIN MAIL CONTEXT ---";
 pub const CONTEXT_END: &str = "--- END MAIL CONTEXT ---";
 
+/// 每天首次启动时，由应用**代替用户**发出的晨间简报提示词。
+///
+/// 这不是用户说的话，是产品预设：它把「未读邮件 / 近三天日程 / 近三天天气 /
+/// 今天的注意事项」一次问清，具体调哪个工具交给模型判断（工具开关是用户配的，
+/// 关掉某一类时模型只能如实说「取不到」）。
+///
+/// 两处刻意写死的约束，别为了「更像用户口吻」删掉：
+/// - **要有事实、要能对账**：写明每块的字段（发件人/主题/时间、时间/标题、
+///   现象/气温），否则模型会写一段没有出处的散文。
+/// - **没数据就说没有**：这份简报在用户还没开口时自己跳出来，编一句
+///   「今天有 3 个会议」用户会当真。
+pub const DAILY_BRIEFING_PROMPT: &str = "\
+（这是应用在每天首次启动时自动发出的「今日简报」请求，不是你我的对话历史。\
+请直接用工具取真实数据，不要追问、不要等我补充信息。）\
+\
+按下面四段给我一份今天的简报，每段都要来自工具回执：\
+\
+一、未读邮件：调用 email_search（unread_only=true，days=7）查未读。\
+按时间倒序最多列 5 封，每封一行「发件人 · 主题 · 时间」+ 一句要点；\
+广告、通知、验证码这类归并成一句「另有 N 封通知类」。一封都没有就直说没有。\
+\
+二、近三天日程：调用 calendar_list 查从今天 00:00 起三天内（含今天）的安排。\
+逐条写「时间 · 标题」，全天事件单独标出；时间冲突、或前后两件事间隔不到半小时，\
+要明确点出来。\
+\
+三、近三天天气：调用 weather_get（days=3，不传 location 就用默认关注地点）。\
+每天一行写天气现象与气温区间，最后一句判断：要不要带伞、要不要添衣。\
+\
+四、今天要注意的事：把上面三块合成 3 到 5 条可执行的建议——\
+先处理哪封邮件、哪个会议不能迟到、几点出门合适。只给判断，不要复述数据。\
+\
+格式：四个小标题「未读邮件 / 近三天日程 / 近三天天气 / 今天要注意」，\
+中文短句，能用列表就用列表。工具取不到数据、或某一类本来就没有时，\
+直接写「没有」并说明原因，绝对不要编造邮件、日程或天气。";
+
+/// 本地日期戳 `YYYY-MM-DD`，用于「每天只做一次」这类持久标记。
+///
+/// 用本地时区而不是 UTC：用户说的「今天」是他所在地的今天，
+/// 用 UTC 会让东八区的用户在早上 8 点前被算成前一天（当天再启动就不发了）。
+pub fn local_date_key(now: i64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(now, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// 本地日期的中文写法 `11月10日`（会话标题用）。
+pub fn local_month_day(now: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    Local
+        .timestamp_opt(now, 0)
+        .single()
+        .map(|dt| format!("{}月{}日", dt.month(), dt.day()))
+        .unwrap_or_default()
+}
+
 /// 去掉控制字符（保留换行与制表符）。
 pub fn strip_control(text: &str) -> String {
     text.chars()
@@ -2931,6 +2989,49 @@ mod tests {
             anchor.contains("不要凭印象猜"),
             "要明确禁止猜日期：{anchor}"
         );
+    }
+
+    /// 日期戳与中文写法必须同源：月/日都取自本地时区的同一时刻。
+    ///
+    /// 不写死「2026-11-10」——测试机时区不可控；这里验的是**格式与一致性**，
+    /// 而时区正确性由 `chrono::Local` 保证。
+    #[test]
+    fn local_date_key_and_month_day_agree() {
+        let now = 1_794_279_900;
+        let key = local_date_key(now);
+        assert_eq!(key.len(), 10, "必须是 YYYY-MM-DD：{key}");
+        assert_eq!(&key[4..5], "-", "{key}");
+        assert_eq!(&key[7..8], "-", "{key}");
+        assert!(
+            key[..4].chars().all(|ch| ch.is_ascii_digit())
+                && key[5..7].chars().all(|ch| ch.is_ascii_digit())
+                && key[8..10].chars().all(|ch| ch.is_ascii_digit()),
+            "只允许数字与两个连字符：{key}"
+        );
+        let month: u32 = key[5..7].parse().expect("月份");
+        let day: u32 = key[8..10].parse().expect("日");
+        assert_eq!(local_month_day(now), format!("{month}月{day}日"));
+    }
+
+    /// 简报提示词要覆盖四块内容并点名四个工具——改提示词时最容易漏掉一块，
+    /// 漏了以后模型只会写剩下的三块，看起来「功能少了」但没有任何报错。
+    #[test]
+    fn daily_briefing_prompt_covers_all_four_blocks() {
+        for needle in [
+            "未读邮件",
+            "近三天日程",
+            "近三天天气",
+            "今天要注意",
+            "email_search",
+            "calendar_list",
+            "weather_get",
+            "不要编造",
+        ] {
+            assert!(
+                DAILY_BRIEFING_PROMPT.contains(needle),
+                "简报提示词缺少「{needle}」"
+            );
+        }
     }
 
     /// `[结果]` 判定要容得下模型加的装饰，否则引擎会重复追加一段。

@@ -330,6 +330,12 @@ pub enum Command {
         entity: i64,
     },
     ClearAiEntities,
+    /// 每天首次启动时发起一份「今日简报」。
+    ///
+    /// **是否真的发**由后端判定（`meta.ai_daily_briefing` 记着上一次发起的日期）：
+    /// 界面只负责「启动后问一次」，重复启动、同一天开两次都不会多出一份。
+    /// 没有可用模型 / 未确认隐私 / 没有 key 时静默跳过——启动阶段不该弹错误。
+    GenerateDailyAiBriefing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -745,6 +751,14 @@ pub enum Event {
     // ---- AI（v0.3）----
     /// 会话列表变化（新建 / 重命名 / 删除 / `updated_at` 变化）。
     AiConversationsChanged,
+    /// 「今日简报」已经发起（会话已建、流马上开始）。
+    ///
+    /// 与 `AiStreamStarted` 分开：那个事件用户主动提问时也会发，界面不能
+    /// 因为收到它就把主区抢过去；只有这个事件才代表「AI 主动开口了」，
+    /// 界面据此切到 AI 页并打开这份简报。
+    AiDailyBriefingStarted {
+        conversation: crate::ai::AiConversationId,
+    },
     /// 流已开始：助手占位消息已插入。`trimmed_turns` 是被裁掉的历史轮数。
     AiStreamStarted {
         conversation: crate::ai::AiConversationId,

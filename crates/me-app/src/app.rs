@@ -59,6 +59,22 @@ pub struct MyEmailApp<R: ReadOnlyRepo + Clone + 'static> {
     applied_theme: Option<ThemeMode>,
     /// 音频线程门面：首次进入音乐页惰性启动，切换页面不停止播放。
     pub player: Option<AudioPlayer>,
+    /// 本次运行是否已经问过「今天要不要发晨间简报」。
+    ///
+    /// **只管一个进程内只问一次**：真正的「今天发过没有」由后端看
+    /// `meta.ai_daily_briefing` 判断——同一天开两次应用只会有一份简报。
+    daily_briefing_requested: bool,
+}
+
+/// AI 主动开口（每日晨间简报）时界面要做的两件事：**切到 AI 页**并**打开这份会话**。
+///
+/// 不切页的话，简报只是会话列表里多出来的一行——用户没点进去就当它没发生。
+///
+/// 抽成自由函数是为了能离屏测：`handle_event` 需要整个 eframe 上下文，测不了。
+fn apply_daily_briefing_event(state: &mut UiState, conversation: me_core::ai::AiConversationId) {
+    views::switch_page(state, Page::AiChat);
+    state.select_ai_conversation(Some(conversation));
+    state.ai_conversations_dirty = true;
 }
 
 impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
@@ -85,6 +101,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             activation,
             applied_theme: None,
             player: None,
+            daily_briefing_requested: false,
         };
         app.refresh_accounts();
         app.refresh_settings();
@@ -917,6 +934,11 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
     // 事件
     // -----------------------------------------------------------------------
 
+    /// AI 主动开口（每日晨间简报）时界面要做的两件事：**切到 AI 页**并**打开这份会话**。
+    ///
+    /// 不切页的话，简报只是会话列表里多出来的一行——用户没点进去就当它没发生。
+    ///
+    /// 单独抽成函数是为了能离屏测：`handle_event` 要整个 eframe 上下文，测不了。
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::SettingsLoaded {
@@ -1565,6 +1587,11 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             Event::AiConversationsChanged => {
                 self.state.ai_conversations_dirty = true;
             }
+            Event::AiDailyBriefingStarted { conversation } => {
+                // AI 主动开口：把主区切到 AI 页并打开这份简报，否则它只是
+                // 会话列表里多出来的一行，用户根本不会注意到。
+                apply_daily_briefing_event(&mut self.state, conversation);
+            }
             Event::AiStreamStarted {
                 conversation,
                 message,
@@ -1761,6 +1788,16 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                     (privacy_ack_anthropic, privacy_ack_openai),
                     entity_count,
                 );
+                // 快照到了说明「有哪些模型、确认没确认隐私」已经确定，这是问
+                // 「今天要不要发晨间简报」的唯一合适时机：早于它，后端还没有
+                // 模型档案，只能静默跳过。
+                //
+                // 没有模型时不问（也不置位）：用户在这次运行里补上模型后，
+                // 下一份快照会再把这次问出来。
+                if !self.daily_briefing_requested && !self.state.ai.models.is_empty() {
+                    self.daily_briefing_requested = true;
+                    self.backend.send(Command::GenerateDailyAiBriefing);
+                }
             }
             Event::AiConnectionTested { ok, detail, .. } => {
                 let text = detail.unwrap_or_default();
@@ -2322,5 +2359,26 @@ mod tests {
             Some("没有可用的音频设备")
         );
         assert_eq!(state.music.tracks.len(), 1, "设备错误不清空已加载的列表");
+    }
+
+    /// AI 主动开口（每日晨间简报）时，界面必须**切到 AI 页并打开那份会话**。
+    ///
+    /// 只建会话不切页的话，简报就只是会话列表里多出来的一行——用户没点进去
+    /// 就当它没发生，等于白做。
+    #[test]
+    fn daily_briefing_event_opens_the_briefing_conversation() {
+        let mut state = UiState {
+            page: Page::Mail,
+            ..Default::default()
+        };
+        apply_daily_briefing_event(&mut state, me_core::ai::AiConversationId(7));
+        assert_eq!(state.page, Page::AiChat, "主区要切到 AI 页");
+        assert_eq!(
+            state.ai.selected,
+            Some(me_core::ai::AiConversationId(7)),
+            "要打开这份简报会话"
+        );
+        assert!(state.ai_conversations_dirty, "会话列表要重拉");
+        assert!(state.ai_messages_dirty, "消息要重拉");
     }
 }
