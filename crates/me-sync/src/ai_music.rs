@@ -57,11 +57,19 @@ where
         let outcome = match tokio::time::timeout(MUSIC_TIMEOUT, rx).await {
             Ok(Ok(outcome)) => outcome,
             // 超时或通道断掉（UI 关窗、线程退出）：都要把等待项清掉。
+            //
+            // 这里必须回**可重试**的错误。以前包成 `MusicOutcome::fail`，落到
+            // `CoreError::Validation` 上，于是被判定「参数不合法」：不重试、
+            // 还会被记进失败指纹——播放器正在扫描曲库卡了 3 秒，这条调用就被
+            // 永久堵死，用户再问一次也救不回来。
             _ => {
                 self.drop_music_pending(call_id);
-                MusicOutcome::fail(
-                    "音乐播放器 3 秒内没有响应：可能正在扫描曲库、没有选择音乐目录，或者音频设备不可用",
-                )
+                // 秒数跟常量走：写死「3 秒」和之前「600 秒」是同一类漂移。
+                return Err(CoreError::timeout(format!(
+                    "音乐播放器 {} 秒内没有响应：可能正在扫描曲库、没有选择音乐目录，\
+或者音频设备不可用",
+                    MUSIC_TIMEOUT.as_secs()
+                )));
             }
         };
 

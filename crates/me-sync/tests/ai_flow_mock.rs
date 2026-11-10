@@ -146,6 +146,11 @@ struct MockAiProvider {
     message_bodies: Mutex<Vec<String>>,
     /// 每轮请求的**系统提示**（用于验证阶段化的补充真的发出去了）。
     systems: Mutex<Vec<String>>,
+    /// 模型**请求调用**的工具序列（跨轮按顺序铺平）。
+    ///
+    /// 回归语料用它断言「这次到底走了哪条路」：只看 `tool_trace` 会漏掉
+    /// 清单类工具与相同时段被拦截的调用，序列才对得上。
+    tool_sequence: Mutex<Vec<String>>,
 }
 
 impl MockAiProvider {
@@ -158,6 +163,7 @@ impl MockAiProvider {
             targets: Mutex::new(Vec::new()),
             message_bodies: Mutex::new(Vec::new()),
             systems: Mutex::new(Vec::new()),
+            tool_sequence: Mutex::new(Vec::new()),
         })
     }
 }
@@ -209,6 +215,15 @@ impl AiProvider for MockAiProvider {
             systems.push(request.system.clone());
         }
         let turn = self.script.lock().expect("script").pop_front();
+        // 记下模型这一轮**想**调什么：序列断言看的是它，不是引擎最终执行了什么
+        // （被阶段拦截、被熔断的调用同样属于「这次的路径」）。
+        if let Some(turn) = turn.as_ref()
+            && let Ok(mut sequence) = self.tool_sequence.lock()
+        {
+            for call in &turn.tool_calls {
+                sequence.push(call.name.as_str().to_string());
+            }
+        }
         Box::pin(async move {
             let Some(turn) = turn else {
                 return Err(CoreError::ai(
@@ -1508,7 +1523,9 @@ async fn blank_answer_falls_back_to_execution_summary() {
         )),
         // 第一次空白：引擎应当催它一次。
         Turn::text("\n\n\n"),
-        // 第二次仍空白：走兜底，不再催（再催就是逼它编）。
+        // 第二次仍空白：再催一次（`MAX_FINAL_RETRIES = 2`）。
+        Turn::text("\n\n\n"),
+        // 第三次仍空白：不再催，直接直出工具正文。
         Turn::text("\n\n\n"),
     ]);
     let (commands, mut rx) = start_service(&store, provider, true);
@@ -1536,14 +1553,18 @@ async fn blank_answer_falls_back_to_execution_summary() {
     .await;
 
     let message = last_assistant_message(&store, conversation);
+    // 2026-11-09 起：工具成功返回过正文，兜底就**直出**它，不再是一句
+    // 「这次没有拿到可用的结果」——数据在手却交不出去是那次事故的核心。
     assert!(
-        message.content.contains("这次没有拿到可用的结果"),
-        "兜底摘要必须以「没拿到结果」开头，实际：{}",
+        message
+            .content
+            .contains("模型没能整理这次的结果，以下是查询原文"),
+        "兜底要直出工具正文，实际：{}",
         message.content
     );
     assert!(
-        message.content.contains("检索近 7 天"),
-        "兜底摘要要列出清单里真正执行过的步骤，实际：{}",
+        message.content.contains("检索近 7 天") || message.content.contains("没有找"),
+        "直出的正文应当是检索工具真正返回的那段，实际：{}",
         message.content
     );
     assert!(
@@ -2098,6 +2119,132 @@ async fn calendar_delete_requests_confirmation_instead_of_deleting() {
     assert!(
         store.writable().get_event(event.id).expect("查").is_some(),
         "用户没确认之前，日程不能被删掉"
+    );
+}
+
+/// 一句话只写一条日程：同名第二次创建要被拦下。
+///
+/// 2026-11-10 的实测现场：模型把「下周四」算成 11-13（周五），复核时又算成
+/// 11-19（周四），**两条都进了库**——用户既没要求两条，也看不出哪条才是真的。
+/// 工具自带的「同标题 ±5 分钟」去重挡不住这种情况：换个日期就绕过去了。
+#[tokio::test]
+async fn second_create_with_the_same_title_is_refused() {
+    use me_core::port::{CalendarRepo, ReadOnlyRepo};
+
+    let (_dir, store) = open();
+    let calendar = store
+        .writable()
+        .ensure_default_calendar()
+        .expect("默认日历");
+
+    let make_call = |id: &str, step: u8, start: &str, end: &str| {
+        tool_call(
+            id,
+            AiToolName::CalendarCreate,
+            json!({
+                "motive": "用户要建下周四下午两点与张总的会",
+                "title": "与张总开会",
+                "start": start,
+                "end": end,
+                "step_id": step,
+            }),
+        )
+    };
+    let plan = tool_call(
+        "plan",
+        AiToolName::PlanSubmit,
+        json!({
+            "motive": "先给出计划再执行",
+            "goal": "建下周四下午两点与张总的会",
+            "steps": [
+                {
+                    "id": 1,
+                    "title": "创建会议日程",
+                    "kind": "tool",
+                    "capability": "calendar",
+                    "tool": "calendar_create",
+                    "args": {
+                        "title": "与张总开会",
+                        "start": "2026-11-13T14:00:00+08:00",
+                        "end": "2026-11-13T15:00:00+08:00"
+                    },
+                    "expect": "日程创建成功"
+                },
+                {
+                    "id": 2,
+                    "title": "再建一次（复核时间）",
+                    "kind": "tool",
+                    "capability": "calendar",
+                    "tool": "calendar_create",
+                    "args": {
+                        "title": "与张总开会",
+                        "start": "2026-11-19T14:00:00+08:00",
+                        "end": "2026-11-19T15:00:00+08:00"
+                    },
+                    "expect": "日程创建成功"
+                }
+            ]
+        }),
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan),
+        Turn::with_tool(make_call(
+            "call_a",
+            1,
+            "2026-11-13T14:00:00+08:00",
+            "2026-11-13T15:00:00+08:00",
+        )),
+        Turn::with_tool(make_call(
+            "call_b",
+            2,
+            "2026-11-19T14:00:00+08:00",
+            "2026-11-19T15:00:00+08:00",
+        )),
+        Turn::text("会已经建好了：2026-11-13 14:00 与张总开会。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "下周四下午两点跟张总开会，一小时".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let series = store
+        .read_only()
+        .list_calendar_series_readonly(&[calendar.id], 0, i64::MAX / 4, 50)
+        .expect("列日程");
+    let same: Vec<_> = series
+        .iter()
+        .filter(|item| item.summary == "与张总开会")
+        .collect();
+    let message = last_assistant_message(&store, conversation);
+    assert_eq!(
+        same.len(),
+        1,
+        "同一句话只该留下一条日程，实际 {}: {:?}",
+        same.len(),
+        same.iter().map(|item| item.start_utc).collect::<Vec<_>>()
+    );
+    // 第二次被拒的原因要能被模型读懂（它得据此决定「改」还是「放弃」）。
+    assert!(
+        message
+            .tool_trace
+            .iter()
+            .any(|trace| trace.summary.contains("不再重复创建")),
+        "被拦下的那次要留下说明：{:?}",
+        message
+            .tool_trace
+            .iter()
+            .map(|trace| trace.summary.clone())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -2765,6 +2912,89 @@ async fn criteria_group_unions_results_and_labels_each_hit() {
     );
 }
 
+/// `must` 框范围、`boost` 定顺序：这是「优先处理」不再退化成时间窗的落点。
+///
+/// 2026-11-10 实测里「优先处理」的卡片理由全是「近 7 天」——因为当时只有并集，
+/// 命中的先后无法表达「先看哪封」。现在：
+/// - must（近 30 天）取交集：范围外的邮件即使命中 boost 也不出现；
+/// - boost（已星标）只加分：范围内命中的排前面，没命中的仍然出现。
+#[tokio::test]
+async fn criteria_must_narrows_scope_and_boost_only_orders() {
+    let (_dir, store) = open();
+    let now = me_core::now_unix();
+    let day = 86_400;
+    let ids = seed_mail(
+        &store,
+        &[
+            // 范围内 + 已星标：该排第一。
+            ("星标且在范围内", "a@example.com", now - 3600, 0b100),
+            // 范围内、没星标：该出现，但排在后面。
+            ("普通但在范围内", "b@example.com", now - 7200, 0b001),
+            // 已星标但在范围外（40 天前）：must 应把它挡在外面。
+            ("星标但太久", "c@example.com", now - 40 * day, 0b100),
+        ],
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({
+                "motive": "先框范围再按优先级排",
+                "criteria": [
+                    {"label": "近 30 天", "mode": "must", "days": 30},
+                    {"label": "已星标", "mode": "boost", "flagged_only": true}
+                ]
+            }),
+        )),
+        Turn::text("范围内星标的排前面。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "最近一个月里，优先看星标的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let event = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiToolEmailResults { .. })
+    })
+    .await;
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let Event::AiToolEmailResults { cards, .. } = event else {
+        panic!("要邮件卡片事件");
+    };
+    assert_eq!(cards.len(), 2, "范围外的那封不能被 boost 拉进来：{cards:?}");
+    assert!(
+        !cards.iter().any(|card| card.message == ids[2]),
+        "must 是硬范围：旧邮件不该出现"
+    );
+    assert_eq!(
+        cards[0].message, ids[0],
+        "范围内命中 boost 的排第一：{cards:?}"
+    );
+    assert_eq!(
+        cards[0].reason, "已星标",
+        "卡片理由取命中的那条判据：{cards:?}"
+    );
+    assert_eq!(
+        cards[1].message, ids[1],
+        "没命中 boost 的仍然出现，只是排后面：{cards:?}"
+    );
+
+    // 模型侧的回执要点明范围与排序依据，否则它无法判断这次是否按理解执行。
+    let message = last_assistant_message(&store, conversation);
+    let trace = message.tool_trace.first().expect("有轨迹");
+    assert_eq!(trace.summary, "命中 2 封", "{trace:?}");
+}
+
 /// `important_only` 不再存在：它曾经是「重要 = 星标或近7天未读」这个
 /// 具体口径的产物。留着它就等于系统替所有用户决定了「什么算重要」——
 /// 那正是本次要修掉的东西。
@@ -2963,21 +3193,25 @@ async fn final_phase_tool_call_is_not_executed_but_asked_for_the_answer() {
     assert!(completed, "这一轮应该正常收尾");
 
     let message = last_assistant_message(&store, conversation);
-    // 1) 收尾阶段那次 plan_update **没有被执行**。
-    assert!(
-        !message
-            .tool_trace
-            .iter()
-            .any(|trace| trace.call_id == "final_phase_update"),
-        "收尾阶段的工具调用不该被执行：{:?}",
-        message.tool_trace
+    // 1) 收尾阶段那次 plan_update **没有被执行**，但留下了痕迹。
+    //
+    // 2026-11-09 之前这里连 trace 都没有：事后无法区分「模型想调工具被丢弃」
+    // 与「模型什么都没输出」，只能靠 `thinking` 猜。
+    let dropped = message
+        .tool_trace
+        .iter()
+        .find(|trace| trace.call_id == "final_phase_update")
+        .expect("被丢弃的调用要留下 trace，否则事后无法判断发生了什么");
+    assert_eq!(
+        dropped.status,
+        me_core::ai::AiToolStatus::Skipped,
+        "收尾阶段的工具调用不该被执行：{dropped:?}"
     );
-    // 2) 引擎追问了一次「直接给答复」，模型随后给出了答复。
+    // 2) 引擎追问了一次，并且明确指出「不要再更新清单」。
     let bodies = provider.message_bodies.lock().unwrap().clone();
     assert!(
-        bodies
-            .iter()
-            .any(|body| body.contains("现在是收尾阶段，不需要再调用工具")),
+        bodies.iter().any(|body| body.contains("不要再更新清单")
+            || body.contains("现在是收尾阶段，不需要再调用工具")),
         "引擎要追问一次：{bodies:?}"
     );
     // 3) 收尾阶段的系统提示里明说了「不许调工具」。
@@ -3001,12 +3235,13 @@ async fn final_phase_tool_call_is_not_executed_but_asked_for_the_answer() {
     );
 }
 
-/// 收尾阶段模型连续两次都想调工具：引擎只追问一次，之后直接收场。
+/// 收尾阶段模型连续两次都想调工具：**只放行一次记账**，之后收回。
 ///
 /// 每次追问都是一次模型往返，而请求密度顶上去会撞限流线——
-/// 2026-11-07 的事故就是这么把整轮对话拖垮的。
+/// 2026-11-07 的事故就是这么把整轮对话拖垮的。所以补答预算封顶，
+/// 而 `plan_update` 这个出口也只开一次。
 #[tokio::test]
-async fn final_phase_tool_call_is_nagged_only_once() {
+async fn final_phase_bookkeeping_is_allowed_at_most_once() {
     let (_dir, store) = open();
     let provider = MockAiProvider::new(vec![
         Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
@@ -3026,6 +3261,7 @@ async fn final_phase_tool_call_is_nagged_only_once() {
                 }]
             }),
         )),
+        // 这一次会被**放行执行**：上一轮观测到了「想记账」，出口开一次。
         Turn::with_tool(tool_call(
             "final_2",
             AiToolName::PlanUpdate,
@@ -3037,6 +3273,10 @@ async fn final_phase_tool_call_is_nagged_only_once() {
                 }]
             }),
         )),
+        // 出口用完之后收回工具，模型只能给答复。
+        Turn::text(
+            "近 7 天共 2 封投递提醒。\n\n[结果]\n状态：已完成\n做了什么：检索了近 7 天的邮件\n关键信息：共 2 封\n未完成：无",
+        ),
     ]);
     let (commands, mut rx) = start_service(&store, provider.clone(), true);
     let conversation = new_conversation(&commands, &mut rx, &store).await;
@@ -3063,20 +3303,56 @@ async fn final_phase_tool_call_is_nagged_only_once() {
     assert!(completed, "这一轮应该正常收尾");
 
     let bodies = provider.message_bodies.lock().unwrap().clone();
+    // 只数**追问那句话**：每条 body 都带着前面所有消息，用宽泛的
+    // `contains("不要再更新清单")` 会把切收尾阶段的提示也数进去。
     let nudges = bodies
         .iter()
-        .filter(|body| body.contains("现在是收尾阶段，不需要再调用工具"))
+        .filter(|body| {
+            body.contains("清单已经由引擎记好了，不要再更新清单。请直接把最终答复写给用户")
+        })
         .count();
-    assert_eq!(nudges, 1, "只追问一次：{bodies:?}");
+    assert!(
+        nudges <= 2,
+        "追问次数要封顶（`MAX_FINAL_RETRIES = 2`），实际 {nudges}：{bodies:?}"
+    );
 
     let message = last_assistant_message(&store, conversation);
-    assert!(
-        !message
+    let trace = |call_id: &str| {
+        message
             .tool_trace
             .iter()
-            .any(|trace| trace.call_id == "final_1" || trace.call_id == "final_2"),
-        "收尾阶段的工具调用不该被执行：{:?}",
+            .find(|trace| trace.call_id == call_id)
+    };
+    // 第一次：没下发工具，记录下来但不执行。
+    assert_eq!(
+        trace("final_1").map(|trace| trace.status),
+        Some(me_core::ai::AiToolStatus::Skipped),
+        "第一次应当被丢弃：{:?}",
         message.tool_trace
+    );
+    // 第二次：出口开过一次——请求里**只下发了 plan_update** 这一个工具。
+    //
+    // 为什么看请求而不是看 trace：清单类工具成功时不写 trace（既有展示约定，
+    // 否则活动区会被「更新清单」刷满）；而它想改的内容（把已 done 的步标 done、
+    // 覆盖引擎写下的 evidence）本来就该被 `validate_plan` 挡住。
+    // 放行它的目的是把「想记账」这个念头消费掉，不是让它改写事实。
+    assert!(
+        trace("final_2").is_none(),
+        "放行的那次不该再被记成跳过：{:?}",
+        message.tool_trace
+    );
+    let names = provider.tool_names.lock().unwrap().clone();
+    assert!(
+        names
+            .iter()
+            .any(|round| round.len() == 1 && round[0] == "plan_update"),
+        "观测到想记账后，收尾期要只下发 plan_update：{names:?}"
+    );
+    // 答复仍然保留。
+    assert!(
+        message.content.contains("近 7 天共 2 封投递提醒"),
+        "答复要保留：{}",
+        message.content
     );
 }
 
@@ -3794,4 +4070,920 @@ async fn time_window_search_gives_cards_a_readable_reason() {
             card.reason
         );
     }
+}
+
+/// 2026-11-09 的事故回归：用户只说「天气怎么样」，不能因为没地点就查不出结果。
+///
+/// 当时 `weather_get` 在既没有 `location` 也没有 `location_id` 时直接返回
+/// 「请提供城市名（location）或已保存地点的 location_id」，而用户其实早就把
+/// 双流设成了默认地点——`is_default` 只被拼进「，默认」三个字，没有参与任何决策。
+#[tokio::test]
+async fn weather_without_a_location_falls_back_to_the_default_one() {
+    use me_core::port::WeatherRepo;
+    use me_core::weather::{
+        CurrentWeather, DailyForecast, PROVIDER_QWEATHER, WeatherKind, WeatherLocationCandidate,
+        WeatherSnapshot,
+    };
+
+    let (_dir, store) = open();
+
+    // 库里有一个默认关注地点：双流。
+    let location = store
+        .writable()
+        .insert_weather_location(&WeatherLocationCandidate {
+            provider: PROVIDER_QWEATHER.to_string(),
+            provider_location_id: "101270106".to_string(),
+            name: "双流".to_string(),
+            admin1: Some("四川省".to_string()),
+            admin2: Some("成都".to_string()),
+            country: Some("中国".to_string()),
+            latitude: 30.57324,
+            longitude: 103.92271,
+            timezone: "Asia/Shanghai".to_string(),
+        })
+        .expect("插入地点");
+    store
+        .writable()
+        .set_default_weather_location(location.id)
+        .expect("设为默认");
+
+    // 快照还在有效期内：不会联网，也就不用配置凭证。
+    let now = me_core::now_unix();
+    store
+        .writable()
+        .save_weather_snapshot(
+            location.id,
+            &WeatherSnapshot {
+                provider: PROVIDER_QWEATHER.to_string(),
+                fetched_at: now,
+                expires_at: now + 3600,
+                current: CurrentWeather {
+                    observed_at: now,
+                    temp_c: 16.0,
+                    feels_like_c: 13.0,
+                    humidity_percent: 48,
+                    wind_scale: 3,
+                    wind_dir: "北风".to_string(),
+                    wind_speed_kmh: 13.0,
+                    precip_mm: 0.0,
+                    pressure_hpa: 1010.0,
+                    visibility_km: 20.0,
+                    cloud_percent: 80,
+                    kind: WeatherKind::Cloudy,
+                    text: "阴".to_string(),
+                },
+                hourly: Vec::new(),
+                daily: vec![DailyForecast {
+                    date: "2026-11-09".to_string(),
+                    sunrise: Some("07:20".to_string()),
+                    sunset: Some("18:05".to_string()),
+                    temp_max_c: 18.0,
+                    temp_min_c: 9.0,
+                    precip_mm: 0.0,
+                    kind: WeatherKind::Cloudy,
+                    text: "阴".to_string(),
+                    icon_day: "104".to_string(),
+                    icon_night: "154".to_string(),
+                    text_night: "阴".to_string(),
+                }],
+            },
+        )
+        .expect("写入快照");
+
+    let provider = MockAiProvider::new(vec![
+        // 1) 计划：只写一步，**故意不带地点**——事故现场就是这样。
+        Turn::with_tool(tool_call(
+            "plan",
+            AiToolName::PlanSubmit,
+            json!({
+                "motive": "用户没说地点，直接查天气",
+                "goal": "查询天气情况",
+                "steps": [{
+                    "id": 1,
+                    "title": "查询天气",
+                    "kind": "tool",
+                    "capability": "weather",
+                    "tool": "weather_get",
+                    "args": { "days": 3 },
+                    "expect": "拿到当前与近三天天气"
+                }]
+            }),
+        )),
+        // 2) 执行：weather_get 只带 days，不带 location / location_id。
+        Turn::with_tool(tool_call(
+            "weather",
+            AiToolName::WeatherGet,
+            json!({ "days": 3, "motive": "查询默认关注地点的天气" }),
+        )),
+        Turn::text(
+            "双流当前 16°C，阴。\n\n[结果]\n状态：已完成\n做了什么：查询默认关注地点双流的天气\n关键信息：16°C，阴\n未完成：无",
+        ),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "天气怎么样".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let trace = message
+        .tool_trace
+        .iter()
+        .find(|trace| trace.tool == AiToolName::WeatherGet)
+        .expect("要真的调用 weather_get");
+    assert_eq!(
+        trace.status,
+        me_core::ai::AiToolStatus::Ok,
+        "没指定地点不该报错：{trace:?}"
+    );
+    assert!(
+        trace.summary.contains("双流"),
+        "应当落到默认地点双流：{trace:?}"
+    );
+    assert!(
+        message.content.contains("双流"),
+        "答复里要写明查的是默认地点：{}",
+        message.content
+    );
+    // trace 里要留下**实际传的参数**：计划里写的是 `{}`，执行时传的是
+    // `{days:3}`——两者不一致时，事后只能靠这个字段对齐（2026-11-09 之前没有）。
+    assert!(
+        trace
+            .args
+            .as_deref()
+            .is_some_and(|args| args.contains("days")),
+        "trace 要记下实际参数：{trace:?}"
+    );
+    // `motive` 不进 args：它是「为什么调」，不是业务参数。
+    assert!(
+        !trace.args.as_deref().unwrap_or_default().contains("motive"),
+        "args 要剔除 motive：{trace:?}"
+    );
+    // 清单这一步是真完成，不是「失败被标 done」。
+    let plan = message.plan.as_ref().expect("应当有清单");
+    assert_eq!(plan.steps[0].status, me_core::ai_plan::PlanStatus::Done);
+    assert!(
+        plan.steps[0].failure.is_none(),
+        "{:?}",
+        plan.steps[0].failure
+    );
+}
+
+/// 无进展闸：连续几轮只记账、不拿业务数据，就该提前收尾。
+///
+/// 催促各有各的上限（计划 2 次、重交 2 次、重列 2 次、补答 2 次），但它们是
+/// **并列**的：一段对话可以在几个阶段之间来回蹭，每轮都是一次模型往返 +
+/// 400ms 强制间隔。这条闸只看「这一轮有没有真的拿到业务数据」，
+/// 是唯一能同时压住所有催促路径的那一条。
+#[tokio::test]
+async fn stalled_progress_stops_the_loop_early() {
+    let (_dir, store) = open();
+    // 每轮都说话（所以不会走「空正文」那条催促），但只调清单类工具。
+    let stall = |id: &str| Turn {
+        text: "第 1 步仍在执行中，等待工具回执。".to_string(),
+        thinking: String::new(),
+        tool_calls: vec![tool_call(
+            id,
+            AiToolName::PlanUpdate,
+            json!({
+                "motive": "标记为执行中",
+                "steps": [{
+                    "id": 1,
+                    "title": "检索近 7 天的邮件",
+                    "status": "running",
+                    "evidence": "尚未返回"
+                }]
+            }),
+        )],
+        error: None,
+        hold: false,
+    };
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        stall("stall-1"),
+        stall("stall-2"),
+        stall("stall-3"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看我的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    assert!(
+        message
+            .error
+            .as_deref()
+            .is_some_and(|text| text.contains("没有拿到新的工具结果")),
+        "要留下提前收尾的痕迹：{:?}",
+        message.error
+    );
+    // 三轮空转之后必须停：没有第 4 次模型往返。
+    assert!(
+        provider.message_bodies.lock().unwrap().len() <= 4,
+        "达到上限就该收尾，不该继续追问"
+    );
+    // 一次业务工具都没调过——这正是「没进展」的定义。
+    assert!(
+        !message
+            .tool_trace
+            .iter()
+            .any(|trace| trace.tool == AiToolName::EmailSearch),
+        "这一轮本来就没查过邮件：{:?}",
+        message.tool_trace
+    );
+}
+
+// ===========================================================================
+// 回归语料（第三批）
+// ===========================================================================
+//
+// 前两批加了很多闸，但一直是「跑得过测试」而说不出「跑了几轮、走了哪条路」。
+// 这里把常见路径固化成脚本，每条断言四件事：
+//
+//   1. **总轮数**——模型往返几次（每轮一次请求 + 400ms 强制间隔）
+//   2. **工具序列**——模型请求调用的顺序（不是引擎最终执行了什么）
+//   3. **最终正文含关键字段**——用户到底有没有拿到数据
+//   4. **清单终态与 `[结果]` 说同一件事**——最容易复发的那类矛盾
+//
+// 第 4 条是重点：清单全绿而正文自称「部分完成」（或反过来）在 2026-11-09
+// 出过两次。语料里的模型回答**故意不写 `[结果]`**，让引擎去合成——
+// 这样测的是引擎的口径，而不是测试自己写的文案。
+
+/// 一条语料的期望。
+struct Expect {
+    name: &'static str,
+    /// 模型请求调用的工具序列（按时间顺序）。
+    tools: &'static [&'static str],
+    /// 总轮数上限。
+    max_rounds: usize,
+    /// 最终正文必须出现的字段。
+    contains: &'static [&'static str],
+}
+
+/// 等到这一轮收尾（完成或失败都算收尾）。
+async fn wait_for_completion(rx: &mut mpsc::Receiver<Event>, seconds: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Some(Event::AiMessageCompleted { .. })) | Ok(Some(Event::AiStreamFailed { .. })) => {
+                return true;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => return false,
+            Err(_) => {}
+        }
+    }
+    false
+}
+
+/// 跑一条语料并断言四件事。
+async fn run_case(
+    store: &Store,
+    turns: Vec<Turn>,
+    input: &str,
+    expect: Expect,
+) -> me_core::ai::AiMessage {
+    let provider = MockAiProvider::new(turns);
+    let (commands, mut rx) = start_service(store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: input.to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    assert!(
+        wait_for_completion(&mut rx, 30).await,
+        "[{}] 这一轮没有收尾",
+        expect.name
+    );
+
+    let message = last_assistant_message(store, conversation);
+
+    // 1) 轮数
+    let rounds = provider.message_bodies.lock().unwrap().len();
+    assert!(
+        rounds <= expect.max_rounds,
+        "[{}] 用了 {rounds} 轮，上限 {}",
+        expect.name,
+        expect.max_rounds
+    );
+
+    // 2) 工具序列（前缀匹配）
+    //
+    // 用前缀而不是全等：工具失败之后引擎会走「自检 → 重列」，那里会多出
+    // 一次 `plan_submit`。那是补救路径，不是主路径跑偏——语料要钉的是
+    // 「这次走了哪条主路」，不是「一次都不许补救」。
+    let tools = provider.tool_sequence.lock().unwrap().clone();
+    let expected: Vec<String> = expect.tools.iter().map(|name| name.to_string()).collect();
+    assert!(
+        tools.starts_with(&expected),
+        "[{}] 工具序列不对：期望以 {expected:?} 开头，实际 {tools:?}",
+        expect.name
+    );
+
+    // 3) 正文关键字段
+    for needle in expect.contains {
+        assert!(
+            message.content.contains(needle),
+            "[{}] 正文里没有「{needle}」：{}",
+            expect.name,
+            message.content
+        );
+    }
+
+    // 4) 清单终态与 [结果] 一致
+    if let Some(plan) = message.plan.as_ref() {
+        let (done, total) = plan.progress();
+        let plan_ok = done == total && !plan.any_failed();
+        assert!(
+            message.content.contains("[结果]"),
+            "[{}] 有清单就必须有 [结果] 段落：{}",
+            expect.name,
+            message.content
+        );
+        let claimed_ok = message.content.contains("状态：已完成");
+        assert_eq!(
+            claimed_ok,
+            plan_ok,
+            "[{}] 清单与 [结果] 说的不是一回事：清单 {done}/{total} 失败={}，正文：{}",
+            expect.name,
+            plan.any_failed(),
+            message.content
+        );
+    }
+    message
+}
+
+/// 手写一份单步计划。`plan_submit_for` 覆盖不到的参数组合（例如
+/// `music_state` 无参数）用它。
+fn plan_for(
+    tool: AiToolName,
+    capability: &str,
+    title: &str,
+    args: serde_json::Value,
+) -> AiToolCall {
+    tool_call(
+        "plan",
+        AiToolName::PlanSubmit,
+        json!({
+            "motive": "先给出计划再执行",
+            "goal": "完成用户这一次的请求",
+            "steps": [{
+                "id": 1,
+                "title": title,
+                "kind": "tool",
+                "capability": capability,
+                "tool": tool.as_str(),
+                "args": args,
+                "expect": "拿到结果"
+            }]
+        }),
+    )
+}
+
+/// 一个「标准现场」：库里有一个（或两个）关注地点，快照在有效期内。
+///
+/// 快照有效意味着**不会联网**，语料因此不依赖网络与凭证。
+fn seed_weather_place(
+    store: &Store,
+    name: &str,
+    admin2: &str,
+    temp_c: f64,
+    make_default: bool,
+) -> me_core::weather::WeatherLocationId {
+    use me_core::port::WeatherRepo;
+    use me_core::weather::{
+        CurrentWeather, DailyForecast, PROVIDER_QWEATHER, WeatherKind, WeatherLocationCandidate,
+        WeatherSnapshot,
+    };
+
+    let location = store
+        .writable()
+        .insert_weather_location(&WeatherLocationCandidate {
+            provider: PROVIDER_QWEATHER.to_string(),
+            provider_location_id: format!("id-{name}"),
+            name: name.to_string(),
+            admin1: Some("四川省".to_string()),
+            admin2: Some(admin2.to_string()),
+            country: Some("中国".to_string()),
+            latitude: 30.5,
+            longitude: 104.0,
+            timezone: "Asia/Shanghai".to_string(),
+        })
+        .expect("插入地点");
+    if make_default {
+        store
+            .writable()
+            .set_default_weather_location(location.id)
+            .expect("设为默认");
+    }
+    let now = me_core::now_unix();
+    store
+        .writable()
+        .save_weather_snapshot(
+            location.id,
+            &WeatherSnapshot {
+                provider: PROVIDER_QWEATHER.to_string(),
+                fetched_at: now,
+                expires_at: now + 3600,
+                current: CurrentWeather {
+                    observed_at: now,
+                    temp_c,
+                    feels_like_c: temp_c - 3.0,
+                    humidity_percent: 48,
+                    wind_scale: 3,
+                    wind_dir: "北风".to_string(),
+                    wind_speed_kmh: 13.0,
+                    precip_mm: 0.0,
+                    pressure_hpa: 1010.0,
+                    visibility_km: 20.0,
+                    cloud_percent: 80,
+                    kind: WeatherKind::Cloudy,
+                    text: "阴".to_string(),
+                },
+                hourly: Vec::new(),
+                daily: vec![DailyForecast {
+                    date: "2026-11-09".to_string(),
+                    sunrise: Some("07:20".to_string()),
+                    sunset: Some("18:05".to_string()),
+                    temp_max_c: temp_c + 2.0,
+                    temp_min_c: temp_c - 7.0,
+                    precip_mm: 0.0,
+                    kind: WeatherKind::Cloudy,
+                    text: "阴".to_string(),
+                    icon_day: "104".to_string(),
+                    icon_night: "154".to_string(),
+                    text_night: "阴".to_string(),
+                }],
+            },
+        )
+        .expect("写入快照");
+    location.id
+}
+
+/// 语料 1：天气·用户没说地点，但有默认关注地点。
+///
+/// 走「默认兜底」：不该报错、不该问用户、也不该放弃。
+#[tokio::test]
+async fn corpus_weather_falls_back_to_the_default_place() {
+    let (_dir, store) = open();
+    seed_weather_place(&store, "双流", "成都", 16.0, true);
+
+    let turns = vec![
+        Turn::with_tool(plan_for(
+            AiToolName::WeatherGet,
+            "weather",
+            "查询天气",
+            json!({}),
+        )),
+        Turn::with_tool(tool_call(
+            "weather",
+            AiToolName::WeatherGet,
+            json!({ "days": 3, "motive": "查询默认地点的天气" }),
+        )),
+        // 故意不写 [结果]：由引擎合成，这样测的是引擎口径。
+        Turn::text("双流现在 16°C，阴。"),
+    ];
+    let message = run_case(
+        &store,
+        turns,
+        "天气怎么样",
+        Expect {
+            name: "weather-default",
+            tools: &["plan_submit", "weather_get"],
+            max_rounds: 3,
+            contains: &["16", "阴", "[结果]", "状态：已完成"],
+        },
+    )
+    .await;
+    assert!(
+        message.content.contains("双流"),
+        "答复要写明查的是哪个地点：{}",
+        message.content
+    );
+}
+
+/// 语料 2：天气·用户明确说了城市。
+///
+/// 与语料 1 成对：**说了地点就用说的那个，不再问**。两条一起才说明
+/// 「默认兜底」不是「无脑用默认」。
+///
+/// 注：`weather_locations` 的第一条恒为默认（`is_default = count == 0`），
+/// 所以「多个关注地点且全都不是默认」不可构造；真正的多候选只发生在
+/// 联网按名字搜索时，离线语料覆盖不到。
+#[tokio::test]
+async fn corpus_weather_uses_the_named_place() {
+    let (_dir, store) = open();
+    seed_weather_place(&store, "双流", "成都", 16.0, true);
+    seed_weather_place(&store, "自贡", "自贡", 19.0, false);
+
+    let turns = vec![
+        Turn::with_tool(plan_for(
+            AiToolName::WeatherGet,
+            "weather",
+            "查询自贡的天气",
+            json!({ "location": "自贡" }),
+        )),
+        Turn::with_tool(tool_call(
+            "weather",
+            AiToolName::WeatherGet,
+            json!({ "location": "自贡", "days": 1, "motive": "用户点名要自贡" }),
+        )),
+        Turn::text("自贡现在 19°C，阴。"),
+    ];
+    let message = run_case(
+        &store,
+        turns,
+        "自贡天气怎么样",
+        Expect {
+            name: "weather-named",
+            tools: &["plan_submit", "weather_get"],
+            max_rounds: 3,
+            contains: &["自贡", "19", "[结果]", "状态：已完成"],
+        },
+    )
+    .await;
+    assert!(
+        !message.content.contains("哪一个"),
+        "用户已经说了地点，不该再问：{}",
+        message.content
+    );
+}
+
+/// 语料 3：邮件·0 命中。
+///
+/// 0 命中是**合法的业务结果**，不是失败：清单要记完成，`[结果]` 也要说完成。
+#[tokio::test]
+async fn corpus_mail_empty_result_is_not_a_failure() {
+    let (_dir, store) = open();
+
+    let turns = vec![
+        Turn::with_tool(plan_for(
+            AiToolName::EmailSearch,
+            "mail",
+            "检索近 7 天的未读邮件",
+            json!({ "days": 7, "unread_only": true }),
+        )),
+        Turn::with_tool(tool_call(
+            "search",
+            AiToolName::EmailSearch,
+            json!({ "days": 7, "motive": "查最近一周的未读" }),
+        )),
+        Turn::text("近 7 天没有符合条件的邮件。"),
+    ];
+    run_case(
+        &store,
+        turns,
+        "最近一周有什么未读邮件",
+        Expect {
+            name: "mail-empty",
+            tools: &["plan_submit", "email_search"],
+            max_rounds: 3,
+            contains: &["没有", "[结果]", "状态：已完成"],
+        },
+    )
+    .await;
+}
+
+/// 语料 4：邮件·多条件命中。
+#[tokio::test]
+async fn corpus_mail_with_results_reports_the_count() {
+    let (_dir, store) = open();
+    seed_mail(
+        &store,
+        &[
+            ("周报", "boss@example.com", 1_800_000_000, 0),
+            ("报价单", "sales@example.com", 1_800_000_100, 0),
+            ("复盘", "team@example.com", 1_800_000_200, 0),
+        ],
+    );
+
+    let turns = vec![
+        Turn::with_tool(plan_for(
+            AiToolName::EmailSearch,
+            "mail",
+            "检索最近的邮件",
+            json!({ "days": 30 }),
+        )),
+        Turn::with_tool(tool_call(
+            "search",
+            AiToolName::EmailSearch,
+            json!({ "days": 30, "motive": "查最近 30 天" }),
+        )),
+        Turn::text("最近 30 天有 3 封邮件，包括周报、报价单和复盘。"),
+    ];
+    run_case(
+        &store,
+        turns,
+        "最近有什么邮件",
+        Expect {
+            name: "mail-results",
+            tools: &["plan_submit", "email_search"],
+            max_rounds: 3,
+            contains: &["3 封", "[结果]", "状态：已完成"],
+        },
+    )
+    .await;
+}
+
+/// 语料 5：日历·删除**只发确认卡，不直接删**。
+#[tokio::test]
+async fn corpus_calendar_delete_only_asks_for_confirmation() {
+    use me_core::calendar::{CalendarEventDraft, CalendarSource};
+    use me_core::port::CalendarRepo;
+
+    let (_dir, store) = open();
+    let calendar = store
+        .writable()
+        .ensure_default_calendar()
+        .expect("默认日历");
+    let event = store
+        .writable()
+        .create_event(
+            &CalendarEventDraft {
+                calendar_id: calendar.id,
+                summary: "周五复盘".to_string(),
+                description: None,
+                location: None,
+                start_utc: 1_800_000_000,
+                end_utc: 1_800_003_600,
+                all_day: false,
+                timezone: None,
+                rrule: None,
+                exdates: Vec::new(),
+                reminders: Vec::new(),
+            },
+            None,
+            CalendarSource::Ai,
+        )
+        .expect("建日程");
+
+    let turns = vec![
+        Turn::with_tool(plan_for(
+            AiToolName::CalendarDelete,
+            "calendar",
+            "删除周五的复盘",
+            json!({ "event_id": event.id.0 }),
+        )),
+        Turn::with_tool(tool_call(
+            "delete",
+            AiToolName::CalendarDelete,
+            json!({ "event_id": event.id.0, "motive": "用户要删掉它" }),
+        )),
+        Turn::text("已经请你确认删除，确认前这条还在。"),
+    ];
+    let message = run_case(
+        &store,
+        turns,
+        "删掉周五的复盘",
+        Expect {
+            name: "calendar-delete",
+            tools: &["plan_submit", "calendar_delete"],
+            max_rounds: 3,
+            contains: &["确认"],
+        },
+    )
+    .await;
+    // 没有真的删：事件还在库里。
+    let still_there = store
+        .writable()
+        .get_event(event.id)
+        .expect("读日程")
+        .is_some();
+    assert!(still_there, "确认前不能真删：{}", message.content);
+}
+
+/// 语料 6：音乐·播放器没有响应（超时）。
+///
+/// 桥接层必须把它变成一句**可读的工具错误**，整轮不能因此失败——
+/// 否则「播放器正在扫曲库」会把一条正常的对话打成失败。
+#[tokio::test]
+async fn corpus_music_timeout_is_a_readable_tool_error() {
+    let (_dir, store) = open();
+
+    let turns = vec![
+        Turn::with_tool(plan_for(
+            AiToolName::MusicState,
+            "music",
+            "查看播放状态",
+            json!({}),
+        )),
+        Turn::with_tool(tool_call(
+            "music",
+            AiToolName::MusicState,
+            json!({ "motive": "用户想知道在放什么" }),
+        )),
+        Turn::text("播放器没有响应，可能还在扫描曲库。"),
+        // 工具失败会多走一次「自检 → 收尾」，所以这里要多备一轮。
+        Turn::text("播放器没有响应，可能还在扫描曲库。"),
+        Turn::text("播放器没有响应，可能还在扫描曲库。"),
+    ];
+    run_case(
+        &store,
+        turns,
+        "现在在放什么歌",
+        Expect {
+            name: "music-timeout",
+            tools: &["plan_submit", "music_state"],
+            // 失败路径固定多一轮自检：plan → execute → reflect → final。
+            max_rounds: 5,
+            contains: &["没有响应", "[结果]"],
+        },
+    )
+    .await;
+}
+
+/// 语料 7：`criteria` 与普通条件混写 → 计划期就被点名，改完才放行。
+///
+/// 2026-11-09 之前这条是**静默失败**：执行期看到 `criteria` 就整条走判据路径，
+/// 顶层的 `days` / `query` 一个都不用、也不报错，用户拿到的结果比预期宽。
+/// 这条语料钉的是「混写进不了执行阶段」。
+#[tokio::test]
+async fn corpus_criteria_mixed_with_plain_conditions_is_rejected_then_fixed() {
+    let (_dir, store) = open();
+
+    let mixed = tool_call(
+        "plan-mixed",
+        AiToolName::PlanSubmit,
+        json!({
+            "motive": "先给出计划再执行",
+            "goal": "找出重要的邮件",
+            "steps": [{
+                "id": 1,
+                "title": "找重要邮件",
+                "kind": "tool",
+                "capability": "mail",
+                "tool": "email_search",
+                "args": {
+                    "days": 7,
+                    "criteria": [{ "label": "已星标", "flagged_only": true }]
+                },
+                "expect": "拿到结果"
+            }]
+        }),
+    );
+    let fixed = plan_for(
+        AiToolName::EmailSearch,
+        "mail",
+        "找重要邮件",
+        json!({ "days": 7 }),
+    );
+
+    let turns = vec![
+        // 第一次：混写，必须被计划期拒掉。
+        Turn::with_tool(mixed),
+        // 第二次：改成单一条件，放行。
+        Turn::with_tool(fixed),
+        Turn::with_tool(tool_call(
+            "search",
+            AiToolName::EmailSearch,
+            json!({ "days": 7, "motive": "找最近 7 天的邮件" }),
+        )),
+        Turn::text("最近 7 天没有符合条件的邮件。"),
+    ];
+    let provider = MockAiProvider::new(turns);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "有没有重要的邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    assert!(wait_for_completion(&mut rx, 30).await, "这一轮没有收尾");
+
+    // 序列里必须有**两次** `plan_submit`：第一次被拒、第二次才通过。
+    let tools = provider.tool_sequence.lock().unwrap().clone();
+    assert_eq!(
+        tools.iter().filter(|name| *name == "plan_submit").count(),
+        2,
+        "混写的计划必须被拒一次：{tools:?}"
+    );
+
+    let message = last_assistant_message(&store, conversation);
+
+    // 拒绝理由要点名混写：只说「参数不对」的话，模型会原样再交一次。
+    // 理由在 tool_result 里（不是 user 消息），所以看 trace。
+    let rejected = message
+        .tool_trace
+        .iter()
+        .find(|trace| trace.tool == AiToolName::PlanSubmit)
+        .expect("被拒的 plan_submit 必须留下 trace");
+    assert_eq!(
+        rejected.status,
+        me_core::ai::AiToolStatus::Error,
+        "混写的计划必须是失败态：{rejected:?}"
+    );
+    assert!(
+        rejected.summary.contains("混写") || rejected.summary.contains("criteria"),
+        "拒绝理由要说清是混写：{rejected:?}"
+    );
+
+    // 最终仍然拿到结果（说明纠正之后流程能继续）。
+    assert!(
+        message.content.contains("[结果]"),
+        "纠正后应当能收尾：{}",
+        message.content
+    );
+}
+
+/// 反复出现的失败要沉淀成「教训」，在**下一轮**就随系统提示回灌。
+///
+/// 模型不会跨轮学习：同一个参数错误换个会话会原样重犯。提示词里叮嘱
+/// 「别犯同样的错」没用（它看不见自己上次怎么错的），只有把历史事实喂回去才有用。
+/// 这条测试守的是「引擎负责记，模型负责避」这条分工。
+#[tokio::test]
+async fn repeated_tool_failure_becomes_a_lesson_in_the_next_system_prompt() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![Turn::text("知道了。")]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    // 先落一条「上一轮同一种失败出现了两次」的助手消息。
+    // 引擎只认已落库的事实，不读内存里的计数。
+    let failed = |call_id: &str, summary: &str| me_core::ai::AiToolTrace {
+        call_id: call_id.to_string(),
+        tool: AiToolName::CalendarCreate,
+        status: me_core::ai::AiToolStatus::Error,
+        summary: summary.to_string(),
+        duration_ms: 1,
+        args: None,
+        motive: None,
+        motive_source: Default::default(),
+        step_id: None,
+        attempt: None,
+        cards: Vec::new(),
+    };
+    let writable = store.writable();
+    let message = writable
+        .begin_assistant_message(conversation)
+        .expect("插入助手消息");
+    writable
+        .finish_assistant_message(
+            message,
+            "失败了",
+            me_core::ai::AiMessageStatus::Complete,
+            None,
+            &[
+                failed("c1", "第 1 步的日程时间不合法：开始时间必须早于结束时间"),
+                failed("c2", "第 3 步的日程时间不合法：开始时间必须早于结束时间"),
+            ],
+            None,
+            None,
+            None,
+        )
+        .expect("落库");
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "帮我看下这周的安排".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let systems = provider.systems.lock().expect("lock").clone();
+    let system = systems.first().expect("有请求");
+    assert!(
+        system.contains("以往踩过的坑"),
+        "反复失败要回灌成教训：{system}"
+    );
+    assert!(
+        system.contains("calendar_create"),
+        "教训要点名是哪个工具：{system}"
+    );
+    // 归一化后步号不同也应归为同一类——否则永远凑不出「反复」。
+    assert!(
+        system.contains("时间不合法"),
+        "教训要写清是什么错：{system}"
+    );
 }

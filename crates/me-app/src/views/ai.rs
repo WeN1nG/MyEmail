@@ -1352,7 +1352,9 @@ const RESULT_FIELDS: [&str; 4] = ["状态：", "做了什么：", "关键信息�
 /// 把回复切成「叙述」与「`[结果]` 段落」。
 ///
 /// 四条判定规则（都有对应单测）：
-/// 1. 只认**独占一行**的 `[结果]`，两侧空白允许；
+/// 1. 只认**独占一行**的 `[结果]`，两侧空白与少量 Markdown 装饰（`**` `###`）允许
+///    ——判定与引擎共用 [`me_core::ai::is_result_block_line`]，否则模型写粗体时
+///    引擎会重复追加一段、UI 又切不出来，用户看到两个互相矛盾的结论；
 /// 2. 跳过 fenced code 区间——用户在聊 Markdown 时，示例里的 `[结果]` 不是真段落；
 /// 3. 四行字段一个都解析不出来时返回 `None`，整段当正文，绝不吞掉内容；
 /// 4. 四行字段**之后**的剩余内容单独返回（`tail`），不能丢——模型把
@@ -1367,7 +1369,7 @@ fn split_result_block(content: &str) -> Option<ResultSplit<'_>> {
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed.trim_start().starts_with("```") {
             in_code = !in_code;
-        } else if !in_code && trimmed.trim() == "[结果]" {
+        } else if !in_code && me_core::ai::is_result_block_line(trimmed) {
             marker = Some((offset, offset + trimmed.len()));
             break;
         }
@@ -2682,6 +2684,7 @@ mod tests {
             status: AiToolStatus::Ok,
             summary: "检索到 2 封".to_string(),
             duration_ms: 12,
+            args: None,
             motive: Some("查最近的邮件".to_string()),
             motive_source: MotiveSource::Model,
             step_id: Some(1),

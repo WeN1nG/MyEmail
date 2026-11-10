@@ -126,6 +126,15 @@ pub struct MusicState {
     pub analyzer: crate::audio::spectrum::SpectrumAnalyzer,
     /// 本帧产生的音频命令，由 app 统一转交给音频线程。
     pub pending: Vec<crate::audio::AudioCommand>,
+    /// 曲目搜索的输入框内容。**纯 UI 状态，不落库**：持久化会让下次启动只剩几行。
+    pub search_query: String,
+    /// 搜索匹配哪个字段（歌曲名 / 歌手）。
+    pub search_field: crate::audio::playlist::MatchField,
+    /// 命中集合（曲库索引）；`None` = 未搜索（全库）。
+    ///
+    /// **派生缓存**：只在输入 / 类型 / 曲库 / 标签补全变化时重算（`apply_search`），
+    /// 绝不每帧算——2000 首的 `to_lowercase` 每帧各来一遍是白烧 CPU。
+    pub matches: Option<Vec<usize>>,
     /// AI 音乐工具等待中的操作；`None` = 没有待回执的调用。
     pub ai_pending: Option<PendingAiMusic>,
 }
@@ -150,6 +159,9 @@ impl Default for MusicState {
             cover_texture: None,
             analyzer: crate::audio::spectrum::SpectrumAnalyzer::new(),
             pending: Vec::new(),
+            search_query: String::new(),
+            search_field: crate::audio::playlist::MatchField::default(),
+            matches: None,
             ai_pending: None,
         }
     }
@@ -158,6 +170,58 @@ impl Default for MusicState {
 impl MusicState {
     pub fn current_track(&self) -> Option<&crate::audio::playlist::Track> {
         self.current.and_then(|index| self.tracks.get(index))
+    }
+
+    /// 当前是否处于「搜索结果即播放范围」的状态。
+    pub fn is_searching(&self) -> bool {
+        self.matches.is_some()
+    }
+
+    /// 列表要画多少行（搜索态 = 命中数，否则 = 曲库数）。
+    pub fn view_len(&self) -> usize {
+        self.matches
+            .as_ref()
+            .map_or(self.tracks.len(), |matches| matches.len())
+    }
+
+    /// 视图位置 → 曲库索引。**全项目唯一一处**做这个转换；
+    /// 别处一律只谈曲库索引，否则「点 A 播 B」。
+    pub fn view_index(&self, position: usize) -> Option<usize> {
+        match &self.matches {
+            Some(matches) => matches.get(position).copied(),
+            None => (position < self.tracks.len()).then_some(position),
+        }
+    }
+
+    /// 重算命中集合，并在**结果真的变了**时把作用域同步给音频线程。
+    ///
+    /// 返回是否变化：随机模式下每 tick 无脑重发 `SetScope` 会让 `play_order`
+    /// 反复重洗，「下一首」的顺序就抖了。
+    pub fn apply_search(&mut self) -> bool {
+        // 曲库为空时不进入「搜索态」：否则 footer 会显示「0 / 0 首」，
+        // 看起来像「搜了但没结果」，而实际是还没选目录。
+        let next = if self.tracks.is_empty() || self.search_query.trim().is_empty() {
+            None
+        } else {
+            Some(crate::views::music::match_tracks(
+                &self.tracks,
+                &self.search_query,
+                self.search_field,
+            ))
+        };
+        if self.matches == next {
+            return false;
+        }
+        self.matches = next;
+        self.pending
+            .push(crate::audio::AudioCommand::SetScope(self.matches.clone()));
+        true
+    }
+
+    /// 清空搜索并恢复全库播放范围。
+    pub fn clear_search(&mut self) {
+        self.search_query.clear();
+        self.apply_search();
     }
 
     /// 进度条显示值：拖动时用本地值，否则用音频线程回传的位置。

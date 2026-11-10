@@ -4,11 +4,11 @@
 
 **用 Rust 从零实现的多账户原生邮件客户端**
 
-*自研 HTML 排版引擎 · 自研 SSE 流式解码 · 分层架构 · 710 个测试全绿*
+*自研 HTML 排版引擎 · 自研 SSE 流式解码 · 分层架构 · 931 个测试全绿*
 
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-000?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-000?logo=rust)](https://www.rust-lang.org/)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Tests](https://img.shields.io/badge/tests-710%20passed-2ea66f)
+![Tests](https://img.shields.io/badge/tests-931%20passed-2ea66f)
 ![Deps](https://img.shields.io/badge/WebView-0%20%C2%B7%20JS%20engine-0-8b5cf6)
 
 </div>
@@ -306,7 +306,9 @@ MYEMAIL_GOOGLE_CLIENT_ID=xxx MYEMAIL_MICROSOFT_CLIENT_ID=xxx cargo build --relea
 | [doc/项目大纲.md](doc/项目大纲.md) | 目标、需求、选型理由、决策记录 |
 | [doc/技术栈选用.md](doc/技术栈选用.md) | 逐项选型与**不引入**清单 |
 | [doc/可行性分析.md](doc/可行性分析.md) | 风险登记与 Spike 门禁 |
-| [doc/AI模块设计.md](doc/AI模块设计.md) | AI 工具契约与安全边界设计 |
+| [doc/AI设计/AI模块设计.md](doc/AI设计/AI模块设计.md) | AI 工具契约与安全边界设计 |
+| [doc/AI设计/AI工具调用优化.md](doc/AI设计/AI工具调用优化.md) | 工具调用链的缺陷清单、根因与三批改法（P0/P1/P2） |
+| [doc/AI设计/TestAI工具调用.md](doc/AI设计/TestAI工具调用.md) | AI 人工验收用例（32 条对话脚本：输入 / 期望 / 失败判定 / 日志判据） |
 | [CLAUDE.md](CLAUDE.md) | 面向 AI 助手的分层规则与行为不变量 |
 
 ---

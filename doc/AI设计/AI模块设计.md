@@ -254,14 +254,14 @@ plan = [
 
 | 工具 | 参数 | 作用 | 状态 |
 | --- | --- | --- | --- |
-| `weather_get` | `location?` / `location_id?` / `days?` / `hours?` | 取一份天气摘要 | 已实现 |
-| `weather_locations` | 无 | 列出已保存地点（名称 + id + 是否默认） | 待建 |
+| `weather_get` | `location?` / `location_id?` / `days?` / `hours?` | 取一份天气摘要；两个地点参数都不给时按默认关注地点查（2026-11-09 起） | 已实现 |
+| `weather_locations` | 无 | 列出已保存地点（名称 + id + 是否默认）；**不做城市名解析**，别拿它替 `weather_get` 找候选 | 已实现 |
 
 #### 任务清单模板
 
 | 需求类型 | 步骤模板 |
 | --- | --- |
-| 单地点天气 | 解析地点 → （多候选则让用户选）→ 取数 → 归纳 |
+| 单地点天气 | 解析地点 →（没给地点就用默认关注地点；多候选才让用户选）→ 取数 → 归纳 |
 | 多地点对比 | 逐个取数（≤3 个）→ 并列对比 → 结论 |
 | 出行建议 | 取天气 → 结合日程（跨模块）→ 建议 |
 
@@ -442,7 +442,7 @@ plan = [
 
 | 工具 | 入参 | 语义 |
 | --- | --- | --- |
-| `plan_update` | `goal` 或 `steps[]`（`id` / `capability` / `title` / `status` / `evidence`） | **全量替换**当前清单；幂等 |
+| `plan_update` | `goal` 或 `steps[]`（`id` / `capability` / `title` / `status` / `evidence`；`title` 可省略，省略时沿用原值） | **全量替换**当前清单；幂等 |
 
 校验规则（`me-sync` 侧，违规整条拒绝并回 `is_error`，清单不变）：
 

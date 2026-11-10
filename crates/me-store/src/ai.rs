@@ -122,6 +122,9 @@ struct ToolTraceRow {
     status: String,
     summary: String,
     duration_ms: u32,
+    /// 2026-11-09 起才有：这次调用实际传的参数（已截断）。老行读成 `None`。
+    #[serde(default)]
+    args: Option<String>,
     /// 老行没有这两个字段：`#[serde(default)]` 让它们读成 `None` / `model`。
     #[serde(default)]
     motive: Option<String>,
@@ -145,6 +148,7 @@ impl ToolTraceRow {
             status: trace.status.as_str().to_string(),
             summary: trace.summary.clone(),
             duration_ms: trace.duration_ms,
+            args: trace.args.clone(),
             motive: trace.motive.clone(),
             motive_source: trace.motive_source.as_str().to_string(),
             step_id: trace.step_id,
@@ -160,6 +164,7 @@ impl ToolTraceRow {
             status: AiToolStatus::parse(&self.status)?,
             summary: self.summary,
             duration_ms: self.duration_ms,
+            args: self.args,
             motive: self.motive,
             // 未知来源按「模型说的」处理：老数据没有这个字段，而它的 motive 本来就是
             // 模型写的；真缺失时 motive 也是 None，界面不会误显示成默认值。
@@ -897,6 +902,32 @@ impl AiRepo for WritableStore {
             )
             .store()?;
         Ok(fixed as u32)
+    }
+
+    fn recent_tool_traces(&self, limit: u32) -> Result<Vec<AiToolTrace>, CoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock();
+        // 只取**有轨迹**的消息：绝大多数行是空的，`tool_trace IS NOT NULL`
+        // 让这次扫描只看真正调过工具的轮次。
+        let mut stmt = conn
+            .prepare(
+                "SELECT tool_trace FROM ai_messages \
+                 WHERE tool_trace IS NOT NULL AND tool_trace NOT IN ('', '[]') \
+                 ORDER BY id DESC LIMIT ?1",
+            )
+            .store()?;
+        let rows = stmt
+            .query_map(params![limit], |row| row.get::<_, String>(0))
+            .store()?;
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row.store()?;
+            let traces: Vec<ToolTraceRow> = parse_list(Some(raw));
+            out.extend(traces.into_iter().filter_map(|trace| trace.into_trace()));
+        }
+        Ok(out)
     }
 }
 

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{
-    Metadata, MetadataOptions, MetadataRevision, StandardTagKey, StandardVisualKey, Value,
+    Limit, Metadata, MetadataOptions, MetadataRevision, StandardTagKey, StandardVisualKey, Value,
 };
 use symphonia::core::probe::Hint;
 
@@ -53,6 +53,43 @@ pub struct NowPlaying {
     pub cover: Option<CoverImage>,
 }
 
+/// 扫描补齐用的轻量标签：只有标题与歌手，**不含封面**。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackTags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+}
+
+/// 读一个文件的标题与歌手，**不读封面**。
+///
+/// 曲库补齐阶段逐首调用（几千次），所以不能走 [`read_now_playing`]：
+/// 后者会解码内嵌封面（最长边 640、上限 8 MB），几千次图片解码足以卡住。
+///
+/// 「不读封面」做了两道保险：`limit_visual_bytes = 0`（少读数据）**且**
+/// 解析时直接跳过 visual 标签（不依赖 symphonia 对 0 的解释——实测它仍会把
+/// 64×64 的内嵌图读出来，所以不能只靠 limit）。
+///
+/// 与 `read_now_playing` 是两条路径，**不要合并**：一个是切歌时的一次性富信息，
+/// 一个是扫描时的高频轻信息。
+pub fn read_track_info(path: &Path) -> TrackTags {
+    let tags = read_tags_with(path, scan_options(), false);
+    TrackTags {
+        title: tags.title,
+        artist: tags.artist,
+    }
+}
+
+/// 扫描补齐用的解析选项：封面预算 0（只要标签文本）。
+///
+/// 抽成函数是为了**让测试用同一份选项**断言「封面真的没被读进来」，
+/// 而不是悄悄把几千张封面读进内存。
+fn scan_options() -> MetadataOptions {
+    MetadataOptions {
+        limit_visual_bytes: Limit::Maximum(0),
+        ..Default::default()
+    }
+}
+
 /// 读一个文件的标签与封面；任何失败都只是"这一项没有"，从不返回错误。
 pub fn read_now_playing(path: &Path) -> NowPlaying {
     let tags = read_tags(path);
@@ -79,6 +116,14 @@ struct Tags {
 }
 
 fn read_tags(path: &Path) -> Tags {
+    let options = MetadataOptions {
+        limit_visual_bytes: Limit::Maximum(MAX_COVER_BYTES),
+        ..Default::default()
+    };
+    read_tags_with(path, options, true)
+}
+
+fn read_tags_with(path: &Path, options: MetadataOptions, want_picture: bool) -> Tags {
     let mut tags = Tags::default();
     let Ok(file) = File::open(path) else {
         return tags;
@@ -88,10 +133,6 @@ fn read_tags(path: &Path) -> Tags {
     if let Some(ext) = path.extension().and_then(OsStr::to_str) {
         hint.with_extension(ext);
     }
-    let options = MetadataOptions {
-        limit_visual_bytes: symphonia::core::meta::Limit::Maximum(MAX_COVER_BYTES),
-        ..Default::default()
-    };
     let Ok(mut probed) =
         symphonia::default::get_probe().format(&hint, stream, &FormatOptions::default(), &options)
     else {
@@ -101,21 +142,21 @@ fn read_tags(path: &Path) -> Tags {
     // MP3 的 ID3v2 在探测阶段就被读出来了，FLAC/OGG 的标签挂在容器里，
     // 两处都看一遍，先到先得。
     if let Some(metadata) = probed.metadata.get() {
-        apply_metadata(&metadata, &mut tags);
+        apply_metadata(&metadata, &mut tags, want_picture);
     }
     let metadata = probed.format.metadata();
-    apply_metadata(&metadata, &mut tags);
+    apply_metadata(&metadata, &mut tags, want_picture);
     tags
 }
 
-fn apply_metadata(metadata: &Metadata<'_>, tags: &mut Tags) {
+fn apply_metadata(metadata: &Metadata<'_>, tags: &mut Tags, want_picture: bool) {
     let Some(revision) = metadata.current() else {
         return;
     };
-    apply_revision(revision, tags);
+    apply_revision(revision, tags, want_picture);
 }
 
-fn apply_revision(revision: &MetadataRevision, tags: &mut Tags) {
+fn apply_revision(revision: &MetadataRevision, tags: &mut Tags, want_picture: bool) {
     for tag in revision.tags() {
         // 只关心字符串标签；数值/二进制类型（时长、封面指针等）与展示无关。
         let Value::String(value) = &tag.value else {
@@ -136,7 +177,7 @@ fn apply_revision(revision: &MetadataRevision, tags: &mut Tags) {
         }
     }
 
-    if tags.picture.is_none() {
+    if want_picture && tags.picture.is_none() {
         // 优先正封面；没有标注用途就退而取第一张。
         let pick = revision
             .visuals()
@@ -321,5 +362,23 @@ mod tests {
         assert_eq!(now.album.as_deref(), Some("测试专辑"));
         let cover = now.cover.expect("应解析出内嵌封面");
         assert_eq!((cover.width, cover.height), (64, 64));
+    }
+
+    #[test]
+    fn scan_reader_takes_text_but_no_cover() {
+        const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/tagged.mp3");
+        let dir = temp_dir();
+        let path = dir.path().join("tagged.mp3");
+        std::fs::write(&path, FIXTURE).expect("write");
+
+        let info = read_track_info(&path);
+        assert_eq!(info.title.as_deref(), Some("测试曲目"));
+        assert_eq!(info.artist.as_deref(), Some("测试艺术家"));
+
+        // 钉住「补齐阶段不读封面」：同一个文件，用扫描选项解析出来的 Tags
+        // 必须没有 picture，且解码进内存的字节数为 0。
+        let tags = read_tags_with(&path, scan_options(), false);
+        assert!(tags.picture.is_none(), "补齐阶段不许把封面读进内存");
+        assert_eq!(tags.title.as_deref(), Some("测试曲目"), "文本标签照常");
     }
 }

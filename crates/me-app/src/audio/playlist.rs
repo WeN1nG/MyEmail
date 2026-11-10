@@ -30,8 +30,40 @@ pub struct Track {
     pub path: PathBuf,
     /// 显示名：文件名去掉扩展名。
     pub title: String,
+    /// 标签里的标题；补齐后优先显示它（空 = 还没读到或文件没有标签）。
+    pub tag_title: Option<String>,
+    /// 歌手：先是文件名推断，标签补齐后以标签为准。
+    pub artist: Option<String>,
     /// 时长（毫秒）；`None` = 尚未探测或探测失败。
     pub duration_ms: Option<u64>,
+}
+
+impl Track {
+    /// 列表/摘要用的曲名：标签标题优先，回退文件名。
+    ///
+    /// 与专辑页的 `tags::display_title` 是同一套取值顺序，否则同一首歌两处两个名字。
+    pub fn label(&self) -> &str {
+        self.tag_title.as_deref().unwrap_or(&self.title)
+    }
+}
+
+/// 搜索匹配哪个字段。`Any` 只给 AI 用（曲库语义）；界面只有歌曲名 / 歌手两个选项。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchField {
+    Any,
+    #[default]
+    Title,
+    Artist,
+}
+
+/// 后台补齐的单曲信息（一次打开文件拿全：时长 + 标签标题 + 歌手）。
+#[derive(Debug, Clone, Default)]
+pub struct TrackInfo {
+    /// 曲库索引。
+    pub index: usize,
+    pub duration_ms: Option<u64>,
+    pub tag_title: Option<String>,
+    pub artist: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,13 +124,37 @@ pub fn scan_dir_with(root: &Path, limits: ScanLimits) -> ScanResult {
     found.sort_by(|a, b| a.0.cmp(&b.0));
     result.tracks = found
         .into_iter()
-        .map(|(_, path)| Track {
-            title: display_title(&path),
-            duration_ms: None,
-            path,
+        .map(|(_, path)| {
+            let title = display_title(&path);
+            let artist = infer_artist(&title);
+            Track {
+                path,
+                title,
+                tag_title: None,
+                artist,
+                duration_ms: None,
+            }
         })
         .collect();
     result
+}
+
+/// 从「艺术家 - 歌名」式文件名里推断歌手。
+///
+/// 扫描阶段不读标签（几千次文件 IO + 解析），先吃文件名这条免费线索；
+/// 真正的标签由 `audio::tags::read_track_info` 后台补齐并**覆盖**它。
+///
+/// 排除 `01 - Intro` 这类：左侧是纯编号时不是歌手。
+fn infer_artist(title: &str) -> Option<String> {
+    let (left, _) = title.split_once(" - ")?;
+    let artist = left.trim();
+    if artist.chars().count() < 2 {
+        return None;
+    }
+    if artist.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(artist.to_string())
 }
 
 pub fn has_audio_extension(path: &Path) -> bool {
@@ -224,5 +280,40 @@ mod tests {
         assert!(!has_audio_extension(Path::new("a.mp3.txt")));
         assert!(!has_audio_extension(Path::new("a")));
         assert!(!has_audio_extension(Path::new("a.m4a")), "不在 v0.3 范围");
+    }
+
+    #[test]
+    fn artist_is_inferred_from_file_name_when_possible() {
+        assert_eq!(infer_artist("周杰伦 - 晴天"), Some("周杰伦".to_string()));
+        assert_eq!(infer_artist("AB - C"), Some("AB".to_string()), "两字符也认");
+        assert_eq!(infer_artist("A - B"), None, "单字符太短，多半不是歌手");
+        assert_eq!(infer_artist("01 - Intro"), None, "编号不是歌手");
+        assert_eq!(infer_artist("晴天"), None, "没有分隔符就没有线索");
+        assert_eq!(infer_artist(" - 无名"), None, "左侧为空");
+        assert_eq!(infer_artist("周杰伦-晴天"), None, "要求两侧带空格");
+    }
+
+    #[test]
+    fn scan_fills_filename_artist_and_leaves_tag_fields_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("周杰伦 - 晴天.mp3"), b"x").expect("write");
+        let result = scan_dir_with(dir.path(), ScanLimits::default());
+        let track = &result.tracks[0];
+        assert_eq!(track.title, "周杰伦 - 晴天");
+        assert_eq!(track.artist.as_deref(), Some("周杰伦"));
+        assert_eq!(track.tag_title, None, "标签留给后台补齐");
+        assert_eq!(track.label(), "周杰伦 - 晴天", "没有标签标题时回退文件名");
+    }
+
+    #[test]
+    fn label_prefers_the_tag_title() {
+        let track = Track {
+            path: PathBuf::from("01. intro.mp3"),
+            title: "01. intro".to_string(),
+            tag_title: Some("前奏".to_string()),
+            artist: None,
+            duration_ms: None,
+        };
+        assert_eq!(track.label(), "前奏");
     }
 }

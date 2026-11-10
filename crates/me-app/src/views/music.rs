@@ -8,23 +8,42 @@ use eframe::egui::{self, Align, Align2, Color32, CornerRadius, FontId, Layout, R
 use me_core::{Command, MusicOrder};
 
 use crate::audio::AudioCommand;
+use crate::audio::playlist::{MatchField, Track};
 use crate::state::UiState;
 
-/// 按标题匹配曲目，返回**曲库里的索引**（不是命中序号）。
+/// 按指定字段匹配曲目，返回**曲库里的索引**（不是命中序号）。
 ///
-/// AI 的 `music_search` / `music_play` 与界面搜索框共用这一份：两边各写一遍，
+/// 界面搜索框、AI 的 `music_search` / `music_play` 共用这一份：两边各写一遍，
 /// 匹配规则迟早会分叉，用户看到「搜索有、AI 说没有」。
-pub fn find_tracks(tracks: &[crate::audio::playlist::Track], query: &str) -> Vec<usize> {
+///
+/// - `Title`：匹配标签标题（没有标签就回退文件名）；
+/// - `Artist`：匹配歌手（先看标签，扫描期是文件名推断）；
+/// - `Any`：两者任一命中。AI 用这一档——它的 `query` 是曲库语义，
+///   不该因为用户在界面上选了「歌手」就搜不到歌名。
+pub fn match_tracks(tracks: &[Track], query: &str, field: MatchField) -> Vec<usize> {
     let needle = query.trim().to_lowercase();
     if needle.is_empty() {
-        return Vec::new();
+        return Vec::new(); // 空词不命中全部（与 AI 侧一致）
     }
     tracks
         .iter()
         .enumerate()
-        .filter(|(_, track)| track.title.to_lowercase().contains(&needle))
+        .filter(|(_, track)| {
+            let title = track.label().to_lowercase();
+            let artist = track.artist.as_deref().unwrap_or_default().to_lowercase();
+            match field {
+                MatchField::Title => title.contains(&needle),
+                MatchField::Artist => artist.contains(&needle),
+                MatchField::Any => title.contains(&needle) || artist.contains(&needle),
+            }
+        })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// AI 侧入口：曲库语义（标题或歌手命中）。
+pub fn find_tracks(tracks: &[Track], query: &str) -> Vec<usize> {
+    match_tracks(tracks, query, MatchField::Any)
 }
 
 const ROW_HEIGHT: f32 = 24.0;
@@ -69,6 +88,10 @@ pub fn sidebar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::
     dir_row(state, commands, ui);
     status_line(state, ui);
     ui.separator();
+    // 搜索区必须画在 `list_height` 之前：`available_height()` 是现算的，
+    // 顺序写反会把 footer 顶掉，进而让面板尺寸每帧涨一点（egui 会持久化）。
+    search_bar(state, ui);
+    ui.separator();
 
     // 列表占满剩余高度，底部「共 N 首 · 顺序」固定贴底。
     let footer_height = 30.0;
@@ -81,6 +104,50 @@ pub fn sidebar(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::
 
     ui.separator();
     footer(state, commands, ui);
+}
+
+/// 搜索框 + 搜索类型。实时过滤：输入即算，没有「搜索」按钮。
+fn search_bar(state: &mut UiState, ui: &mut egui::Ui) {
+    let mut query = state.music.search_query.clone();
+    let hint = match state.music.search_field {
+        MatchField::Artist => "搜索歌手",
+        _ => "搜索歌曲名",
+    };
+    let width = ui.available_width();
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut query)
+            .hint_text(hint)
+            .desired_width(width),
+    );
+    if response.changed() {
+        state.music.search_query = query.clone();
+        state.music.apply_search();
+    }
+    if response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) && !query.is_empty() {
+        state.music.clear_search();
+    }
+
+    // 类型 chips 用 `horizontal_wrapped` 自然流式排：窄侧栏（160 px）放不下就换行，
+    // **不要**按 `available_width` 手工减固定宽——那会漏掉 `item_spacing`，
+    // 每帧把侧栏撑宽几像素，是 CLAUDE.md 记过的正反馈缺陷。
+    ui.horizontal_wrapped(|ui| {
+        for field in [MatchField::Title, MatchField::Artist] {
+            let label = if field == MatchField::Artist {
+                "歌手"
+            } else {
+                "歌曲名"
+            };
+            let selected = state.music.search_field == field;
+            if ui
+                .selectable_label(selected, RichText::new(label).small())
+                .clicked()
+                && !selected
+            {
+                state.music.search_field = field;
+                state.music.apply_search();
+            }
+        }
+    });
 }
 
 fn dir_row(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) {
@@ -144,11 +211,31 @@ fn status_line(state: &UiState, ui: &mut egui::Ui) {
 
 fn footer(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{} 首", state.music.tracks.len()))
-                .small()
-                .color(Color32::GRAY),
-        );
+        // 搜索态下这里同时是「播放范围」的唯一解释与退出路径：
+        // 播完搜索结果就停，界面必须说清为什么。
+        let searching = state.music.is_searching();
+        let count = if searching {
+            format!(
+                "{} / {} 首",
+                state.music.view_len(),
+                state.music.tracks.len()
+            )
+        } else {
+            format!("{} 首", state.music.tracks.len())
+        };
+        let color = if searching { ACCENT } else { Color32::GRAY };
+        let text = RichText::new(count).small().color(color);
+        if searching {
+            if ui
+                .selectable_label(false, text)
+                .on_hover_text("播放范围：仅搜索结果。点击恢复全部")
+                .clicked()
+            {
+                state.music.clear_search();
+            }
+        } else {
+            ui.label(text);
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             for (order, label) in [
                 (MusicOrder::Shuffle, "随机"),
@@ -218,13 +305,33 @@ fn track_list(state: &mut UiState, ui: &mut egui::Ui) {
         return;
     }
 
+    // 画在 ScrollArea **外面**：跟着列表滚走的话，它看起来就像结果里的第一行。
+    pinned_row(state, ui);
+
+    let view_len = state.music.view_len();
+    if view_len == 0 {
+        // 曲库里有歌、只是没命中：不能复用「这个目录里没有音频文件」的文案。
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            ui.label(RichText::new("没有匹配的曲目").small().color(Color32::GRAY));
+            if ui.small_button("清除搜索").clicked() {
+                state.music.clear_search();
+            }
+        });
+        return;
+    }
+
     let mut clicked = None;
     egui::ScrollArea::vertical()
         .id_salt("music_tracks")
         .auto_shrink([false, false])
-        .show_rows(ui, ROW_HEIGHT, state.music.tracks.len(), |ui, range| {
-            for index in range {
-                if track_row(state, ui, index) {
+        .show_rows(ui, ROW_HEIGHT, view_len, |ui, range| {
+            for position in range {
+                // 唯一一处「视图位置 → 曲库索引」。
+                let Some(index) = state.music.view_index(position) else {
+                    continue;
+                };
+                if track_row(state, ui, index, position) {
                     clicked = Some(index);
                 }
             }
@@ -238,17 +345,55 @@ fn track_list(state: &mut UiState, ui: &mut egui::Ui) {
     }
 }
 
-fn track_row(state: &UiState, ui: &mut egui::Ui, index: usize) -> bool {
-    let track = &state.music.tracks[index];
+/// 「正在播放但不匹配当前搜索」那一行。
+///
+/// 队列里它被钉在首位（`MusicQueue` 的作用域模型），列表里却不在命中集合内；
+/// 不显示的话用户会以为列表漏了正在响的那首。只读、不计入命中数、不可点。
+fn pinned_row(state: &UiState, ui: &mut egui::Ui) -> bool {
+    let Some(current) = state.music.current else {
+        return false;
+    };
+    if !state.music.is_searching()
+        || state
+            .music
+            .matches
+            .as_ref()
+            .is_some_and(|matches| matches.contains(&current))
+    {
+        return false;
+    }
+    let Some(track) = state.music.tracks.get(current) else {
+        return false;
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(GUTTER_WIDTH);
+        ui.label(RichText::new("▶").small().color(ACCENT));
+        ui.label(
+            RichText::new("正在播放 · 不在筛选内")
+                .small()
+                .color(Color32::GRAY),
+        );
+        ui.add(egui::Label::new(RichText::new(track.label()).small().color(ACCENT)).truncate());
+    })
+    .response
+    .on_hover_text("这首不属于当前搜索结果，但仍在播放；下一首从结果集第一首继续");
+    true
+}
+
+/// 一行曲目。`index` 是**曲库索引**（播放用），`position` 是**视图位置**（编号用）。
+fn track_row(state: &UiState, ui: &mut egui::Ui, index: usize, position: usize) -> bool {
+    let Some(track) = state.music.tracks.get(index) else {
+        return false;
+    };
     let is_current = state.music.current == Some(index);
-    let mut text = RichText::new(format!("{:02}. {}", index + 1, track.title));
+    let mut text = RichText::new(format!("{:02}. {}", position + 1, track.label()));
     if is_current {
         text = text.color(ACCENT).strong();
     }
 
-    let show_duration = ui.available_width() >= NARROW_SIDEBAR;
+    let show_right = ui.available_width() >= NARROW_SIDEBAR;
     let base = ui.available_width() - GUTTER_WIDTH;
-    let width = if show_duration {
+    let width = if show_right {
         (base - DURATION_WIDTH).max(80.0)
     } else {
         base.max(80.0)
@@ -277,13 +422,26 @@ fn track_row(state: &UiState, ui: &mut egui::Ui, index: usize) -> bool {
             );
             ui.painter().rect_filled(bar, CornerRadius::same(1), ACCENT);
         }
-        if show_duration {
+        if show_right {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let duration = track
-                    .duration_ms
-                    .map(format_time)
-                    .unwrap_or_else(|| "—".to_string());
-                ui.label(RichText::new(duration).small().color(Color32::GRAY));
+                // 歌手模式下右列显示歌手：否则搜出 5 行同名曲目，用户看不出为什么命中。
+                let (value, tooltip) = match state.music.search_field {
+                    MatchField::Artist => (
+                        track.artist.clone().unwrap_or_else(|| "—".to_string()),
+                        "歌手",
+                    ),
+                    _ => (
+                        track
+                            .duration_ms
+                            .map(format_time)
+                            .unwrap_or_else(|| "—".to_string()),
+                        "时长",
+                    ),
+                };
+                ui.add(
+                    egui::Label::new(RichText::new(value).small().color(Color32::GRAY)).truncate(),
+                )
+                .on_hover_text(tooltip);
             });
         }
     });
@@ -667,16 +825,25 @@ fn transport_row(width: f32) -> (f32, [f32; 3]) {
     (offset, widths)
 }
 
+/// 传输按钮的可用性：`(播放/暂停, 上一首/下一首)`。
+///
+/// 搜索无命中时 `next/prev` 都是 `None`（按下去会直接停播，看起来像坏了），
+/// 必须单独禁用；播放/暂停不能连坐——正在响的歌还得能停。
+fn transport_enabled(state: &UiState) -> (bool, bool) {
+    let usable = !state.music.tracks.is_empty() && state.music.device_error.is_none();
+    (usable, usable && state.music.view_len() > 0)
+}
+
 /// 传输控件：按钮组水平居中于 `rect`（也就是进度条正下方），状态小字另起一行。
 fn transport(state: &mut UiState, ui: &mut egui::Ui, rect: Rect) {
-    let enabled = !state.music.tracks.is_empty() && state.music.device_error.is_none();
+    let (usable, can_step) = transport_enabled(state);
     let row_height = CONTROLS_HEIGHT.min(rect.height());
     let (offset, widths) = transport_row(rect.width());
 
     ui.spacing_mut().item_spacing.x = BUTTON_GAP;
     ui.horizontal(|ui| {
         ui.add_space(offset);
-        if icon_button(ui, Icon::Prev, egui::vec2(widths[0], row_height), enabled).clicked() {
+        if icon_button(ui, Icon::Prev, egui::vec2(widths[0], row_height), can_step).clicked() {
             state.music.pending.push(AudioCommand::Prev);
         }
         let icon = if state.music.playing {
@@ -684,10 +851,10 @@ fn transport(state: &mut UiState, ui: &mut egui::Ui, rect: Rect) {
         } else {
             Icon::Play
         };
-        if icon_button(ui, icon, egui::vec2(widths[1], row_height), enabled).clicked() {
+        if icon_button(ui, icon, egui::vec2(widths[1], row_height), usable).clicked() {
             state.music.pending.push(AudioCommand::Toggle);
         }
-        if icon_button(ui, Icon::Next, egui::vec2(widths[2], row_height), enabled).clicked() {
+        if icon_button(ui, Icon::Next, egui::vec2(widths[2], row_height), can_step).clicked() {
             state.music.pending.push(AudioCommand::Next);
         }
     });
@@ -902,16 +1069,22 @@ mod tests {
             Track {
                 path: PathBuf::from("a.mp3"),
                 title: "Blue Moon".to_string(),
+                tag_title: None,
+                artist: None,
                 duration_ms: None,
             },
             Track {
                 path: PathBuf::from("b.mp3"),
                 title: "blue 的夜".to_string(),
+                tag_title: None,
+                artist: None,
                 duration_ms: None,
             },
             Track {
                 path: PathBuf::from("c.mp3"),
                 title: "晴天".to_string(),
+                tag_title: None,
+                artist: None,
                 duration_ms: None,
             },
         ];
@@ -940,11 +1113,15 @@ mod tests {
             Track {
                 path: PathBuf::from("C:/music/one.mp3"),
                 title: "第一首".into(),
+                tag_title: None,
+                artist: None,
                 duration_ms: Some(65_000),
             },
             Track {
                 path: PathBuf::from("C:/music/two.flac"),
                 title: "第二首".into(),
+                tag_title: None,
+                artist: None,
                 duration_ms: Some(3_725_000),
             },
         ];
@@ -1358,6 +1535,233 @@ mod tests {
             })
             .collect();
         assert_eq!(plays, vec![1], "点击第二行应请求播放索引 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // 搜索（作用域）
+    // -----------------------------------------------------------------------
+
+    fn search(state: &mut UiState, query: &str, field: MatchField) {
+        state.music.search_query = query.to_string();
+        state.music.search_field = field;
+        state.music.apply_search();
+    }
+
+    /// 在侧栏里点一下包含 `needle` 的那一行（先布局拿坐标，再送 press/release）。
+    fn click_sidebar_text(state: &mut UiState, commands: &mut Vec<Command>, needle: &str) {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 700.0));
+        let make_input = |time: f64, events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let first = ctx.run(make_input(0.0, Vec::new()), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| sidebar(state, commands, ui));
+        });
+        let mut out = FrameOutput::default();
+        for clipped in &first.shapes {
+            collect(&clipped.shape, &mut out);
+        }
+        let (x, y) = out.find(needle).unwrap_or_else(|| panic!("没画 {needle}"));
+        let pos = egui::pos2(x + 2.0, y + 6.0);
+
+        for (time, pressed) in [(0.1, true), (0.2, false)] {
+            let events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ];
+            let _ = ctx.run(make_input(time, events), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| sidebar(state, commands, ui));
+            });
+        }
+    }
+
+    #[test]
+    fn search_filters_the_visible_list_and_the_footer() {
+        let mut state = state_with_tracks();
+        state.music.current = None; // 隔离：这一条只验证「列表只剩命中行」
+        search(&mut state, "第二", MatchField::Title);
+        assert_eq!(state.music.matches.as_deref(), Some(&[1][..]));
+
+        let mut commands = Vec::new();
+        let out = run_frame(&mut state, 240.0, 700.0, |state, ui| {
+            sidebar(state, &mut commands, ui);
+        });
+        assert!(out.has("第二首"), "命中的行照常渲染");
+        assert!(!out.has("第一首"), "未命中的行不画");
+        assert!(out.has("1 / 2 首"), "footer 要说明「播放范围仅 1 首」");
+    }
+
+    #[test]
+    fn search_hint_follows_the_field() {
+        let mut state = state_with_tracks();
+        let mut commands = Vec::new();
+        let out = run_frame(&mut state, 240.0, 700.0, |state, ui| {
+            sidebar(state, &mut commands, ui);
+        });
+        assert!(out.has("搜索歌曲名"), "默认按歌曲名搜");
+
+        state.music.search_field = MatchField::Artist;
+        let out = run_frame(&mut state, 240.0, 700.0, |state, ui| {
+            sidebar(state, &mut commands, ui);
+        });
+        assert!(out.has("搜索歌手"));
+    }
+
+    #[test]
+    fn artist_field_matches_only_the_artist() {
+        let mut state = state_with_tracks();
+        state.music.tracks[1].artist = Some("周杰伦".into());
+
+        search(&mut state, "周杰伦", MatchField::Artist);
+        assert_eq!(state.music.matches.as_deref(), Some(&[1][..]));
+
+        search(&mut state, "周杰伦", MatchField::Title);
+        assert_eq!(
+            state.music.matches.as_deref(),
+            Some(&[][..]),
+            "歌名里没有这三个字"
+        );
+
+        assert_eq!(
+            find_tracks(&state.music.tracks, "周杰伦"),
+            vec![1],
+            "AI 侧是 Any：歌手或歌名命中都算"
+        );
+    }
+
+    #[test]
+    fn empty_results_have_their_own_hint() {
+        let mut state = state_with_tracks();
+        search(&mut state, "不存在的歌", MatchField::Title);
+
+        let mut commands = Vec::new();
+        let out = run_frame(&mut state, 240.0, 700.0, |state, ui| {
+            sidebar(state, &mut commands, ui);
+        });
+        assert!(out.has("没有匹配的曲目"));
+        assert!(
+            !out.has("这个目录里没有找到音频文件"),
+            "有歌但没命中，不能复用「目录里没有音频」的文案"
+        );
+    }
+
+    #[test]
+    fn pinned_row_reports_the_playing_track_outside_the_results() {
+        let mut state = state_with_tracks(); // current = 0
+        search(&mut state, "第二", MatchField::Title);
+
+        let mut commands = Vec::new();
+        let out = run_frame(&mut state, 240.0, 700.0, |state, ui| {
+            sidebar(state, &mut commands, ui);
+        });
+        assert!(out.has("正在播放 · 不在筛选内"), "否则用户以为列表漏歌");
+        assert!(out.has("第一首"), "被钉住的那首仍要出现在列表区");
+    }
+
+    #[test]
+    fn pinned_row_is_absent_when_the_playing_track_matches() {
+        let mut state = state_with_tracks();
+        search(&mut state, "第一", MatchField::Title);
+
+        let mut commands = Vec::new();
+        let out = run_frame(&mut state, 240.0, 700.0, |state, ui| {
+            sidebar(state, &mut commands, ui);
+        });
+        assert!(!out.has("不在筛选内"), "当前曲目就在结果里，不必另起一行");
+    }
+
+    #[test]
+    fn clicking_a_filtered_row_plays_the_library_index() {
+        let mut state = state_with_tracks();
+        search(&mut state, "第二", MatchField::Title);
+        state.music.pending.clear();
+
+        let mut commands = Vec::new();
+        click_sidebar_text(&mut state, &mut commands, "第二首");
+
+        let plays: Vec<usize> = state
+            .music
+            .pending
+            .iter()
+            .filter_map(|command| match command {
+                AudioCommand::Play { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(plays, vec![1], "视图第 1 行 → 曲库索引 1，不是 0");
+    }
+
+    #[test]
+    fn stepping_is_disabled_only_when_nothing_matches() {
+        let mut state = state_with_tracks();
+        assert_eq!(transport_enabled(&state), (true, true));
+
+        state.music.matches = Some(Vec::new());
+        assert_eq!(
+            transport_enabled(&state),
+            (true, false),
+            "空结果：还能暂停，但不能切歌（切了就是停播）"
+        );
+
+        state.music.device_error = Some("没有设备".into());
+        assert_eq!(transport_enabled(&state), (false, false));
+    }
+
+    /// 回归：搜索区加进侧栏后，内容宽度不许在帧间漂移（egui 会持久化面板尺寸，
+    /// 一旦某帧被撑宽就再也回不去）。
+    #[test]
+    fn sidebar_content_does_not_drift_across_frames() {
+        let mut state = state_with_tracks();
+        search(&mut state, "第一", MatchField::Title);
+        state.music.search_field = MatchField::Artist;
+
+        let mut commands = Vec::new();
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(240.0, 700.0));
+        let mut rights = Vec::new();
+        for frame in 0..3 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(frame as f64 * 0.1),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::SidePanel::left("sidebar")
+                        .resizable(true)
+                        .default_width(240.0)
+                        .show(ctx, |ui| sidebar(&mut state, &mut commands, ui));
+                },
+            );
+            let mut out = FrameOutput::default();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut out);
+            }
+            let right = out
+                .text_rects
+                .iter()
+                .map(|(_, rect)| rect.right())
+                .fold(f32::MIN, f32::max);
+            rights.push(right);
+        }
+        for pair in rights.windows(2) {
+            assert!(
+                (pair[0] - pair[1]).abs() < 0.5,
+                "内容宽度在帧间漂移：{rights:?}"
+            );
+        }
+        assert!(
+            rights[0] <= 241.5,
+            "内容不该超出侧栏（240 + 1px 描边容差）：{rights:?}"
+        );
     }
 
     #[test]

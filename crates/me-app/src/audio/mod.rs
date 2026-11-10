@@ -21,7 +21,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use backend::{AudioBackend, AudioError, BackendFactory, RodioBackend};
-use playlist::{ScanLimits, Track};
+use playlist::{ScanLimits, Track, TrackInfo};
 use spectrum::{SpectrumFrame, SpectrumSink};
 use std::sync::Arc;
 
@@ -48,6 +48,11 @@ pub enum AudioCommand {
     /// 毫秒。
     Seek(u64),
     SetOrder(MusicOrder),
+    /// 把播放队列裁剪到这些曲库索引（`None` = 全库）。
+    ///
+    /// 只影响「下一首 / 上一首 / 自动续播走哪些歌」，**不改变正在播放的曲目**。
+    /// 这是曲目搜索的落点：界面只在命中集合变化时下发一次。
+    SetScope(Option<Vec<usize>>),
     Stop,
 }
 
@@ -69,8 +74,10 @@ pub enum AudioEvent {
         skipped: usize,
         truncated: bool,
     },
-    /// 批量补全的时长：`(曲目索引, 毫秒)`。
-    Durations(Vec<(usize, u64)>),
+    /// 批量补全的曲目信息（时长 + 标签标题 + 歌手）。
+    ///
+    /// 一次打开文件拿三样：分开两条事件会让每首文件开两次，扫描期白白翻倍 IO。
+    TrackInfo(Vec<TrackInfo>),
     Error(String),
     /// 轻量状态快照：UI 每帧只取最新一条。
     State(AudioState),
@@ -165,6 +172,16 @@ impl PlayerCore {
             AudioCommand::Prev => self.prev(&mut events),
             AudioCommand::Seek(ms) => self.seek(Duration::from_millis(ms), &mut events),
             AudioCommand::SetOrder(order) => self.queue.set_order(order, &mut self.rng),
+            AudioCommand::SetScope(scope) => {
+                // 「正在播放」由 `loaded` 判定：非空队列的游标永远有值，
+                // 那是游标不是播放状态，拿它顶替会把第 0 首钉进搜索结果。
+                let playing = if self.loaded {
+                    self.queue.current_index()
+                } else {
+                    None
+                };
+                self.queue.set_scope(scope, playing, &mut self.rng);
+            }
             AudioCommand::Stop => self.stop(),
         }
         events
@@ -216,9 +233,12 @@ impl PlayerCore {
             self.playing = true;
             return;
         }
-        match self.queue.current_index() {
+        let target = self
+            .queue
+            .current_index()
+            .or_else(|| self.queue.first_index());
+        match target {
             Some(index) => self.play_index(index, events),
-            None if !self.queue.is_empty() => self.play_index(0, events),
             None => {
                 self.error = Some("列表为空，请先选择音乐目录".to_string());
                 events.push(AudioEvent::Error(self.error.clone().unwrap_or_default()));
@@ -270,6 +290,9 @@ impl PlayerCore {
     fn finish_playback(&mut self) {
         self.playing = false;
         self.position = self.duration.unwrap_or_default();
+        // 曲源已经放到末尾：`loaded` 必须落回 false，否则下一次 Toggle 会去
+        // `resume()` 一个已结束的 source，表现为「按播放没反应」。
+        self.loaded = false;
     }
 
     fn on_finished(&mut self, events: &mut Vec<AudioEvent>) {
@@ -289,9 +312,13 @@ impl PlayerCore {
                 return;
             };
             if !self.queue.select(current) {
-                self.playing = false;
-                self.loaded = false;
-                return;
+                // 作用域外的定点播放（AI 报的曲库序号、重扫竞态）：临时钉到队首播。
+                // **不改作用域** —— 界面写着「5 首」时，队列不能偷偷变成全库。
+                if !self.queue.pin(current) {
+                    self.playing = false;
+                    self.loaded = false;
+                    return;
+                }
             }
             let Some(path) = self.queue.current_path().map(|p| p.to_path_buf()) else {
                 self.playing = false;
@@ -338,12 +365,25 @@ impl PlayerCore {
             let Some(path) = self.queue.path_at(index).map(|p| p.to_path_buf()) else {
                 continue;
             };
-            if let Some(duration) = self.backend.probe_duration(&path) {
-                done.push((index, duration.as_millis() as u64));
+            // 每首两次打开（rodio 解码器拿时长 + symphonia 拿标签），都只读文件头，
+            // 第二次基本命中页缓存；`PROBE_BATCH` 维持 8，避免一次探测拖住命令响应。
+            let duration_ms = self
+                .backend
+                .probe_duration(&path)
+                .map(|duration| duration.as_millis() as u64);
+            let tags = tags::read_track_info(&path);
+            if duration_ms.is_none() && tags.title.is_none() && tags.artist.is_none() {
+                continue;
             }
+            done.push(TrackInfo {
+                index,
+                duration_ms,
+                tag_title: tags.title,
+                artist: tags.artist,
+            });
         }
         if !done.is_empty() {
-            events.push(AudioEvent::Durations(done));
+            events.push(AudioEvent::TrackInfo(done));
         }
     }
 }
@@ -624,20 +664,22 @@ mod tests {
         assert!(core.state().playing);
     }
 
+    /// 首尾相通：最后一首放完回到第一首（列表循环），不是停在那里。
     #[test]
-    fn last_track_finishing_stops_playback() {
-        let dir = audio_dir(&["only.mp3"]);
+    fn last_track_finishing_wraps_to_the_first() {
+        let dir = audio_dir(&["a.mp3", "b.mp3"]);
         let (backend, state) = mock();
         let mut core = core_with(backend);
         core.handle(AudioCommand::LoadDirectory(dir.path().to_path_buf()));
         core.handle(AudioCommand::Play {
-            index: 0,
-            path: dir.path().join("only.mp3"),
+            index: 1,
+            path: dir.path().join("b.mp3"),
         });
 
         state.lock().expect("lock").finished = true;
         core.tick();
-        assert!(!core.state().playing, "队列末尾停止，不循环");
+        assert_eq!(core.state().current, Some(0), "末尾之后回到第一首");
+        assert!(core.state().playing, "循环播放下不该停");
     }
 
     #[test]
@@ -748,16 +790,73 @@ mod tests {
         core.handle(AudioCommand::LoadDirectory(dir.path().to_path_buf()));
 
         let events = core.tick();
-        let durations: Vec<(usize, u64)> = events
+        let infos: Vec<TrackInfo> = events
             .iter()
             .filter_map(|e| match e {
-                AudioEvent::Durations(list) => Some(list.clone()),
+                AudioEvent::TrackInfo(list) => Some(list.clone()),
                 _ => None,
             })
             .flatten()
             .collect();
-        assert_eq!(durations.len(), 3);
-        assert!(durations.iter().all(|(_, ms)| *ms == 90_000));
+        assert_eq!(infos.len(), 3);
+        assert!(infos.iter().all(|info| info.duration_ms == Some(90_000)));
+        assert!(
+            infos
+                .iter()
+                .all(|info| info.artist.is_none() && info.tag_title.is_none()),
+            "假 mp3 没有标签，不该编造出歌手"
+        );
+    }
+
+    #[test]
+    fn scope_keeps_next_inside_the_search_results() {
+        let dir = audio_dir(&["a.mp3", "b.mp3", "c.mp3", "d.mp3"]);
+        let (backend, _state) = mock();
+        let mut core = core_with(backend);
+        core.handle(AudioCommand::LoadDirectory(dir.path().to_path_buf()));
+
+        core.handle(AudioCommand::Play {
+            index: 1,
+            path: dir.path().join("b.mp3"),
+        });
+        core.handle(AudioCommand::SetScope(Some(vec![1, 3])));
+
+        assert_eq!(core.state().current, Some(1), "正在播的那首留在原地");
+        core.handle(AudioCommand::Next);
+        assert_eq!(core.state().current, Some(3), "跳过集合外的 c");
+        core.handle(AudioCommand::Next);
+        assert_eq!(
+            core.state().current,
+            Some(1),
+            "集合末尾回到集合首项，绝不跑到集合外"
+        );
+        assert!(core.state().playing);
+    }
+
+    /// 作用域外的定点播放（AI 报曲库序号）要能播，且**不能**把作用域放宽。
+    #[test]
+    fn play_outside_scope_pins_without_widening_the_scope() {
+        let dir = audio_dir(&["a.mp3", "b.mp3", "c.mp3"]);
+        let (backend, state) = mock();
+        let mut core = core_with(backend);
+        core.handle(AudioCommand::LoadDirectory(dir.path().to_path_buf()));
+        core.handle(AudioCommand::SetScope(Some(vec![0, 1])));
+
+        core.handle(AudioCommand::Play {
+            index: 2,
+            path: dir.path().join("c.mp3"),
+        });
+        assert!(core.state().playing, "点名的那首必须真的播起来");
+        assert_eq!(core.state().current, Some(2));
+        assert_eq!(
+            state.lock().expect("lock").loaded.last(),
+            Some(&dir.path().join("c.mp3"))
+        );
+
+        core.handle(AudioCommand::SetScope(Some(vec![0, 1])));
+        assert_eq!(core.state().current, Some(2), "钉住的那首仍是当前曲目");
+        core.handle(AudioCommand::Next);
+        assert_eq!(core.state().current, Some(0), "下一首回到命中集合开头");
     }
 
     #[test]

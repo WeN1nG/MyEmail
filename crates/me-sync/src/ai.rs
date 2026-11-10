@@ -67,11 +67,40 @@ const MAX_REPLAN_REJECTIONS: u32 = 2;
 /// 已经表明的意图合成一份最简计划继续往下走。清单不完美总比整轮失败好。
 const MAX_PLAN_SUBMIT_REJECTIONS: u32 = 2;
 
-/// 收尾阶段模型仍想调工具时，最多追问几次「直接给答复」。
+/// 收尾期最多补几次：**两种情形共用这一份预算**。
 ///
-/// 只给一次：再问就是同一句话，而每一次追问都是一次模型往返——
-/// 请求密度顶上去会撞限流线（2026-11-07 的事故就是这么收场的）。
-const MAX_FINAL_TOOL_NUDGES: u32 = 1;
+/// 情形一：模型在收尾期发来工具调用（这一阶段没下发工具，只能丢弃）；
+/// 情形二：模型一个字都没写。
+///
+/// 以前是两个独立计数器（`final_tool_nudges` / `blank_retries`），各给 1 次，
+/// 而且**互斥**——一轮里带了工具调用就走不到空正文那条分支。于是「模型把
+/// `plan_update` 写成标签」这种成因下，把空正文的次数从 1 抬到 2 完全无效。
+/// 合并之后只有一份预算，日志也只记一个数。
+///
+/// 上限 2：催两次仍不开口，就直出工具正文（见 `fallback_answer`），
+/// 不再逼它编——每一次追问都是一次模型往返，次数顶上去会撞限流线。
+const MAX_FINAL_RETRIES: u32 = 2;
+
+/// 连续多少轮「没拿到新的业务工具结果」就提前收尾。
+///
+/// 现有催促各有各的上限（计划 2 次、重交 2 次、重列 2 次、补答 2 次），
+/// 但它们是**并列**的：一段对话可以在几个阶段之间来回蹭，每一轮都是一次
+/// 模型往返 + 400ms 强制间隔。1 步任务最坏能烧到十几轮，用户只看到转圈。
+///
+/// 这条闸只看一件事：**这一轮有没有真的拿到业务数据**。
+/// 只调清单（`plan_update` / `plan_submit`）、复读、空转都不算进展。
+/// 达到上限就收尾走兜底——反正继续问下去也不会变好。
+///
+/// 为什么是 3：收尾期的两次补答（`MAX_FINAL_RETRIES`）要先跑完，
+/// 所以阈值必须 ≥ 3，否则这条闸会把「再给模型一次机会」直接掐掉。
+const MAX_NO_PROGRESS_ROUNDS: u32 = 3;
+
+/// 请求预算里预留给 `system` 提示与工具 schema 的字符数。
+///
+/// `max_input_chars` 是**整次请求**的上限，而 [`me_core::ai::compact_tool_results`]
+/// 只看得到 `messages`：system 提示（约 3–4k）与十几个工具的 schema（约 6–8k）
+/// 不在这份列表里，不减掉就会把实际请求顶到模型上限之上。
+const SCHEMA_RESERVE_CHARS: usize = 12_000;
 
 /// 每个阶段的时间上限（秒）。
 ///
@@ -111,10 +140,12 @@ const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(300), Duration::from
 /// 主动留间隔比撞上 429 再退避更省：撞上意味着那一轮已经白费了。
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(400);
 
-/// 调用过工具却一个字没说时，最多催它写正文几次。
+/// 兜底直出工具正文时的总长上限。
 ///
-/// 只给一次：再催就是逼它编内容。第二次仍然空白就走引擎兜底摘要。
-const MAX_BLANK_RETRIES: u32 = 1;
+/// 4000 字符大约是「三天天气预报」或「十封邮件列表」的量级：
+/// 够用户看懂结果，又不至于把一条消息撑成一屏读不完的长文。
+const FALLBACK_DELIVERY_CHARS: usize = 4000;
+
 /// delta 节流：≥50 ms 或 ≥2 KB 发一次。
 const DELTA_INTERVAL: Duration = Duration::from_millis(50);
 const DELTA_BATCH_BYTES: usize = 2048;
@@ -122,6 +153,16 @@ const DELTA_BATCH_BYTES: usize = 2048;
 const MAX_CONCURRENT_STREAMS: usize = 2;
 /// 历史取多少条参与构建（再按字符预算裁剪）。
 const HISTORY_FETCH: u32 = 100;
+
+/// 统计跨轮教训时往回看多少条**带轨迹**的消息。
+///
+/// 40 条大约相当于「最近几天的所有工具轮次」：太少凑不出「反复」，
+/// 太多会把几个月前的旧坑翻出来，而工具契约早就改过了。
+const LESSON_SCAN_MESSAGES: u32 = 40;
+/// 一次最多回灌几条教训。
+///
+/// 4 条是注意力上限：再多就等于又在提示词里堆规则，模型只会记住前两条。
+const MAX_LESSONS: usize = 4;
 
 /// 会话内 AI 状态（进程级，不落库）。
 ///
@@ -160,6 +201,12 @@ struct StreamSetup {
     /// 跨轮延续靠它：用户说「继续」时，模型看到的是「还剩哪几步」，
     /// 而不是从零开始重新规划——那会让用户以为自己前面做的白费了。
     resumable: Option<me_core::ai_plan::Plan>,
+    /// 请求体预算（来自模型档案的「最长输入」）。
+    ///
+    /// `build_chat_request` 只用它裁**历史**；工具循环里追加的 `tool_result`
+    /// 走的是另一条路径，必须在这里也有一份，否则「所有工具都成功、
+    /// 最后一轮请求被 400」会一直存在。
+    input_budget: usize,
 }
 
 impl Default for AiState {
@@ -1130,6 +1177,7 @@ where
                         replay_only,
                         user_input: content.clone(),
                         resumable,
+                        input_budget: model.max_input_chars as usize,
                     },
                 )
                 .await;
@@ -1266,6 +1314,18 @@ where
         me_core::ai::select_entities(&recent, query, me_core::ai::MAX_ENTITY_CONTEXT)
     }
 
+    /// 跨轮教训：从最近几轮的工具轨迹里统计「同一类失败反复出现」。
+    ///
+    /// 数据源是既有的 `ai_messages.tool_trace`，不新建表——
+    /// 「统计」不该再生一份真相，否则两份会不一致。
+    async fn ai_lessons(&self) -> Vec<me_core::ai::ToolLesson> {
+        let traces = self
+            .db(|store| store.recent_tool_traces(LESSON_SCAN_MESSAGES))
+            .await
+            .unwrap_or_default();
+        me_core::ai::summarize_lessons(&traces, MAX_LESSONS)
+    }
+
     // -----------------------------------------------------------------------
     // 工具循环
     // -----------------------------------------------------------------------
@@ -1284,6 +1344,7 @@ where
             replay_only,
             user_input,
             mut resumable,
+            input_budget,
         } = setup;
         let started = Instant::now();
         let permit = self
@@ -1384,7 +1445,24 @@ where
         // 本轮的清单是**产物**而不是配额，所以放局部变量（不放 `ToolBudget`）。
         let mut plan: Option<me_core::ai_plan::Plan> = None;
         let mut nudges = 0u32;
-        let mut blank_retries = 0u32;
+        // 工具循环内部是否已经压过旧 `tool_result`。压过就告诉模型一次，
+        // 不要每轮都重复同一句提示。
+        let mut tool_results_compacted = false;
+        // 连续多少轮没拿到业务工具结果（见 `MAX_NO_PROGRESS_ROUNDS`）。
+        let mut no_progress_rounds = 0u32;
+        // 收尾期补答预算：工具调用被丢弃 / 空正文，两种情形共用（见 `MAX_FINAL_RETRIES`）。
+        let mut final_retries = 0u32;
+        // 收尾 / 自检阶段被丢弃的工具调用次数。它是「空正文」成因判定依据：
+        // ≥1 说明模型想调工具（多半是记账），==0 说明它确实什么都没输出。
+        let mut dropped_calls = 0u32;
+        // 观测到「模型在收尾期想调 plan_update」之后，才给它这一个出口。
+        // 条件化的原因见 `phase_allows`：先观测再改行为，不预先开这个口子。
+        let mut final_allows_bookkeeping = false;
+        // 这个出口只开一次：用完之后就不再下发，免得模型在收尾期反复记账。
+        let mut final_bookkeeping_used = false;
+        // 成功调用的工具正文。兜底时原样交给用户——数据在手就不该说「没拿到」。
+        // 只留非清单类工具，且不进 `tool_trace`（那会把上下文顶爆）。
+        let mut deliveries: Vec<(AiToolName, String)> = Vec::new();
         let mut phase = Phase::Plan;
         let mut plan_rounds = 0u32;
         let mut answered_directly = false;
@@ -1403,8 +1481,6 @@ where
         let mut last_request_at: Option<Instant> = None;
         // `plan_submit` 连续被参数校验拒收的次数；超限后引擎自己合成计划。
         let mut plan_submit_rejections = 0u32;
-        // 收尾/自检阶段模型仍想调工具的次数；超限后不再追问，直接收场。
-        let mut final_tool_nudges = 0u32;
 
         // 两套工具集：PLAN 阶段只有 `plan_submit` / `answer_directly`，
         // 物理上取消了模型「边想边查」的可能——想查就必须先说要查什么。
@@ -1422,8 +1498,20 @@ where
             .cloned()
             .collect();
         request.tools = plan_tools.clone();
+        // 跨轮教训：模型不会跨轮学习，同一个错换个会话会原样重犯。
+        // 所以不靠提示词叮嘱，而是把**它自己的历史失败**统计出来喂回去。
+        // 只在本轮可能调工具时算：纯聊天用不上，也省一次查询。
+        let lessons = if request.tools.is_empty() {
+            Vec::new()
+        } else {
+            self.ai_lessons().await
+        };
         // 基础系统提示：每轮按阶段追加一句「这一轮该做什么」。
-        let base_system = request.system.clone();
+        let mut base_system = request.system.clone();
+        if let Some(block) = me_core::ai::lessons_block(&lessons) {
+            base_system.push_str("\n\n");
+            base_system.push_str(&block);
+        }
         // 上一轮有没做完的清单 → **第一次请求就**告诉模型可以接着做。
         //
         // 必须在请求发出前注入，而不是等模型回答之后再补：模型可能第一轮就
@@ -1454,7 +1542,11 @@ where
             }
             if started.elapsed() > STREAM_BUDGET {
                 status = AiMessageStatus::Failed;
-                error_text = Some("回复超时（工具循环总时长超过 600 秒）".to_string());
+                // 文案必须跟常量走：以前写死「600 秒」，而 `STREAM_BUDGET` 是 300 秒。
+                error_text = Some(format!(
+                    "回复超时（工具循环总时长超过 {} 秒）",
+                    STREAM_BUDGET.as_secs()
+                ));
                 retryable = true;
                 break;
             }
@@ -1499,7 +1591,15 @@ where
                 Phase::Plan => plan_tools.clone(),
                 Phase::Execute => execute_tools.clone(),
                 Phase::Replan => replan_tools.clone(),
-                // REFLECT / FINAL 不给工具：前者只要一段 JSON，后者只要一段答复。
+                // 收尾阶段原则上不给工具：只要一段答复。
+                //
+                // 例外是**已经观测到**模型在这里想调 `plan_update` 的情形
+                // （`dropped_calls > 0`）：它是纯内存、无 IO、不占工具预算，
+                // 收回它只会让模型把最后一轮花在「汇报完成」上，然后交出空白。
+                // 只放这一个，业务工具仍然一律禁——放业务工具等于绕过执行期。
+                Phase::Final if final_allows_bookkeeping && !final_bookkeeping_used => {
+                    final_bookkeeping_tools(&execute_tools)
+                }
                 Phase::Reflect | Phase::Final => Vec::new(),
             };
             // 系统提示按阶段补一句：这一轮不许调工具 / 只许交计划。
@@ -1511,6 +1611,26 @@ where
                 Some(suffix) => format!("{base_system}\n\n{suffix}"),
                 None => base_system.clone(),
             };
+
+            // 请求体预算：`build_chat_request` 的 `trim_history` 只管进对话那一刻，
+            // 工具循环里追加的 `tool_result` 走的是另一条路径。
+            //
+            // 只压最早的几条（最近 `KEEP_RECENT_TOOL_RESULTS` 条原样），
+            // 消息本身不删——`assistant(tool_calls)` 后面必须紧跟对应的 tool 消息。
+            // 压过之后告诉模型一次，别让它以为工具什么都没查到。
+            let message_budget = input_budget
+                .saturating_sub(SCHEMA_RESERVE_CHARS)
+                .max(me_core::ai::MIN_MAX_INPUT_CHARS as usize);
+            if me_core::ai::compact_tool_results(&mut request.messages, message_budget) > 0
+                && !tool_results_compacted
+            {
+                tool_results_compacted = true;
+                request.messages.push(me_core::ai::AiWireMessage::User {
+                    content: "（上下文接近上限：较早的几条工具结果已被压缩成摘要。\
+如果需要那些细节，请重新调用对应工具，不要凭印象回答。）"
+                        .to_string(),
+                });
+            }
 
             // 两次模型请求之间的最小间隔。
             //
@@ -1559,6 +1679,34 @@ where
                 if turn.output_tokens.is_some() {
                     usage_slot.1 = turn.output_tokens;
                 }
+            }
+
+            // 按轮一行。排查「空正文」时，这行是唯一的直接证据：
+            // `dropped_calls ≥ 1` 说明模型想调工具（调用被丢弃），
+            // `dropped_calls == 0 && text_chars == 0` 说明它确实什么都没写。
+            // 两种情形的修法不同，没有这行只能靠 `thinking` 猜。
+            //
+            // 只记计数，不记正文、不记参数：用户的问题不该进日志。
+            {
+                let dropped = if matches!(phase, Phase::Reflect | Phase::Final) {
+                    turn.tool_calls.len() as u32
+                } else {
+                    0
+                };
+                tracing::info!(
+                    conversation = conversation.0,
+                    message = ?message,
+                    round = _round,
+                    phase = ?phase,
+                    tools = turn.tool_calls.len(),
+                    dropped_calls = dropped,
+                    dropped_total = dropped_calls + dropped,
+                    text_chars = turn.text.chars().count(),
+                    final_retries,
+                    no_progress = no_progress_rounds,
+                    ms = last_request_at.map(|at| at.elapsed().as_millis()).unwrap_or(0),
+                    "AI 轮次"
+                );
             }
 
             // 每轮模型返回后写一次检查点。轮数上限就是 MAX_TOOL_ROUNDS（6），
@@ -1713,12 +1861,13 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 }
 
                 // 调用过工具却一个字没说：界面会停在一块空白上，用户既不知道做成了什么，
-                // 也不知道为什么没结果。先补一句提醒让它交代，只给一次机会。
-                if blank_retries < MAX_BLANK_RETRIES
+                // 也不知道为什么没结果。补一句提醒让它交代——预算与「收尾期还在调工具」
+                // 共用（`MAX_FINAL_RETRIES`），不再各给一次。
+                if final_retries < MAX_FINAL_RETRIES
                     && (executed_calls > 0 || plan.is_some())
                     && is_blank_answer(&turn.text)
                 {
-                    blank_retries += 1;
+                    final_retries += 1;
                     request.messages.push(me_core::ai::AiWireMessage::User {
                         content: "你还没有把结果告诉用户。请用自然语言说明：找到了什么、\
 没找到什么、下一步建议是什么；本轮调用过工具时按 [结果] 格式收尾。"
@@ -1726,7 +1875,7 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     });
                     continue;
                 }
-                // 催过一次还是空白：不再催（再催就是逼它编），交给兜底摘要。
+                // 催过还空：不再催（再催就是逼它编），交给兜底直出。
                 if is_blank_answer(&turn.text) {
                     break;
                 }
@@ -1789,16 +1938,68 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 acc.next_segment();
             }
 
-            // 自检 / 收尾阶段模型还想调工具：这两个阶段**没有下发任何工具**，
+            // 自检 / 收尾阶段模型还想调工具：这两个阶段**没有下发工具**，
             // 它却仍然把调用写了出来（有时填在 `tool_calls` 里，有时写成正文
             // 里的标签）。2026-11-07 的事故就是这么收场的：模型在收尾阶段想调
-            // `plan_update`，于是把调用写成了正文里的一段 XML，用户看到的是
+            // `plan_update`，于是把调用写成正文里的一段 XML，用户看到的是
             // 一坨标签，真正的答案（它已经写进思考区）一个字都没显示。
             //
             // 这里**不执行**这类调用：执行了也只会得到一句「这个阶段不需要
             // 工具」，白烧一轮请求。正确做法是再问一次「直接给答复」。
-            if matches!(phase, Phase::Reflect | Phase::Final) && !turn.tool_calls.is_empty() {
-                final_tool_nudges += 1;
+            //
+            // 2026-11-09：这类调用以前**不留任何痕迹**——trace 里没有、日志里
+            // 也没有，事后只能靠 `thinking` 猜「模型是调了工具还是什么都没写」。
+            // 现在两样都记，并按「观测到的形态」决定后续动作。
+            //
+            // 例外：上一轮已经观测到「模型想记账」，这一轮它**只**想调
+            // `plan_update` —— 放它过去执行一次（出口只开一次，见
+            // `final_bookkeeping_used`）。混着业务工具时仍然整轮丢弃：
+            // 业务工具在收尾阶段一律不执行。
+            let take_bookkeeping_pass = phase == Phase::Final
+                && final_allows_bookkeeping
+                && !final_bookkeeping_used
+                && !turn.tool_calls.is_empty()
+                && turn
+                    .tool_calls
+                    .iter()
+                    .all(|call| call.name == AiToolName::PlanUpdate);
+            if matches!(phase, Phase::Reflect | Phase::Final)
+                && !turn.tool_calls.is_empty()
+                && !take_bookkeeping_pass
+            {
+                dropped_calls += turn.tool_calls.len() as u32;
+                // 想记账 → 下一轮就把 `plan_update` 这一个放回去。
+                // 纯内存、无副作用，比让它对着被收回的工具反复尝试划算。
+                let asked_to_bookkeep = phase == Phase::Final
+                    && turn
+                        .tool_calls
+                        .iter()
+                        .any(|call| call.name == AiToolName::PlanUpdate);
+                if asked_to_bookkeep {
+                    final_allows_bookkeeping = true;
+                }
+                // 每一次被丢弃的调用都留一条 trace：状态用 `Skipped` 而不是
+                // `Error`——它没有被执行，记成失败会让 `[结果]` 变成「部分完成」，
+                // 反而制造一条新的矛盾。
+                for call in &turn.tool_calls {
+                    let (motive, motive_source) = me_core::ai::tool_motive(&call.arguments);
+                    traces.push(AiToolTrace {
+                        call_id: call.id.clone(),
+                        tool: call.name,
+                        status: AiToolStatus::Skipped,
+                        summary: phase_rejection_summary(phase, call.name).to_string(),
+                        duration_ms: 0,
+                        args: call
+                            .arguments
+                            .as_object()
+                            .map(|_| me_core::ai::truncate_chars(&call.arguments.to_string(), 200)),
+                        motive,
+                        motive_source,
+                        step_id: None,
+                        attempt: None,
+                        cards: Vec::new(),
+                    });
+                }
                 // 把这一轮模型说的话原样带回上下文，但**不带**工具调用：
                 // 带上就等于告诉服务端「我调了工具」，而实际并没有调。
                 request
@@ -1807,11 +2008,19 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         content: turn.text.clone(),
                         tool_calls: Vec::new(),
                     });
-                if final_tool_nudges <= MAX_FINAL_TOOL_NUDGES {
+                final_retries += 1;
+                if final_retries <= MAX_FINAL_RETRIES {
+                    let hint = if asked_to_bookkeep {
+                        "清单已经由引擎记好了，不要再更新清单。请直接把最终答复写给用户，\
+并按 [结果] 格式收尾。"
+                    } else if phase == Phase::Final {
+                        "现在是收尾阶段，不需要再调用工具。请直接把最终答复写给用户，\
+并按 [结果] 格式收尾。"
+                    } else {
+                        "现在是自检阶段，不需要调用工具。请只输出那段 JSON 自检结论。"
+                    };
                     request.messages.push(me_core::ai::AiWireMessage::User {
-                        content: "现在是收尾阶段，不需要再调用工具。请直接把最终答复写给用户，\
-                        并按 [结果] 格式收尾。"
-                            .to_string(),
+                        content: hint.to_string(),
                     });
                     continue;
                 }
@@ -1864,7 +2073,11 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 //
                 // 2026-11-07 的事故：`plan_submit` 在执行期没下发，但它一旦被执行
                 // 就等于绕过了「重列不超过 2 次」的上限。
-                if !phase_allows(phase, call.name) {
+                if !phase_allows(
+                    phase,
+                    call.name,
+                    final_allows_bookkeeping && !final_bookkeeping_used,
+                ) {
                     self.emit(Event::AiToolStarted {
                         conversation,
                         call_id: call.id.clone(),
@@ -1918,7 +2131,25 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 } else {
                     None
                 };
+                let mut tool_mismatch = false;
                 if let (Some(id), Some(current)) = (bound, plan.as_mut()) {
+                    // 兜底绑定：步骤写的工具和真正调的不一致时仍然绑上去（拒绝执行换不来
+                    // 它改对），但失败/回执会记到这一格上。2026-11-09 就是这种情形：
+                    // 步骤写 weather_locations、执行的是 weather_get，清单里于是出现
+                    // 「weather_locations 这一步失败，原因是 weather_get 的参数错误」。
+                    if let Some(step) = current.step(id)
+                        && let Some(declared) = step.tool
+                        && declared != call.name
+                    {
+                        tool_mismatch = true;
+                        tracing::warn!(
+                            conversation = conversation.0,
+                            step = id,
+                            declared = declared.as_str(),
+                            called = call.name.as_str(),
+                            "工具调用与清单步骤声明的工具不一致，按兜底绑定记录"
+                        );
+                    }
                     current.begin_step(id);
                 }
                 // 清单类工具成功时不进行为条：清单条本身就是它的展示位，
@@ -1991,7 +2222,7 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     if transient {
                         retry_no += 1;
                         // 重试是**同一次逻辑调用**：配额退回去，
-                        // 否则第二次就会撞上「本次消息已查询过天气」这类限额错误，
+                        // 否则第二次就会撞上「最多查询 N 次天气」这类限额错误，
                         // 把真正的网络故障盖掉。
                         budget.restore_quota(quota_before);
                         tokio::time::sleep(RETRY_BACKOFF[retry_no - 1]).await;
@@ -2054,8 +2285,16 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                                 ),
                             )
                         } else {
+                            // 步骤声明调 X、实际调的是 Y 时，把「实际调用了 Y」写进
+                            // 回执尾巴：清单从此能对得上账，也不需要在 `PlanStep`
+                            // 上新增字段或加 UI 组件。
+                            let mut evidence = result.trace.summary.clone();
+                            if tool_mismatch {
+                                evidence
+                                    .push_str(&format!("；实际调用的是 {}", call.name.as_str()));
+                            }
                             me_core::ai_plan::AttemptOutcome::Done {
-                                evidence: result.trace.summary.clone(),
+                                evidence: me_core::ai::truncate_chars(&evidence, 240),
                             }
                         };
                         // 引擎重试也是「尝试」：一次模型调用可能对应多次物理尝试，
@@ -2135,6 +2374,23 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 if show {
                     traces.push(trace);
                 }
+                if phase == Phase::Final && call.name == AiToolName::PlanUpdate {
+                    final_bookkeeping_used = true;
+                }
+                // 成功调用的正文留一份给兜底：模型交白卷时原样直出，
+                // 用户至少能看到温度 / 邮件主题，而不是一句「没拿到结果」。
+                // 只留业务工具，清单类工具的正文是 JSON，直出没有意义。
+                if !result.is_error && !result.tool.is_bookkeeping() {
+                    let text = result.content.trim();
+                    if !text.is_empty() {
+                        // 同一个工具只留**最后一次**成功的结果：引擎重试、
+                        // 或模型换参数重查，旧的那份只会把 4000 字符的预算占满。
+                        match deliveries.iter_mut().find(|(tool, _)| *tool == result.tool) {
+                            Some(slot) => *slot = (result.tool, text.to_string()),
+                            None => deliveries.push((result.tool, text.to_string())),
+                        }
+                    }
+                }
                 results.push(result);
             }
 
@@ -2158,6 +2414,31 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 } else {
                     plan_submit_rejections = 0;
                 }
+            }
+
+            // 无进展闸：连续几轮都没拿到**业务**工具结果，就提前收尾。
+            //
+            // 为什么单独一条：计划、重交、重列、补答各有各的上限，但它们是
+            // 并列的——对话可以在几个阶段之间来回蹭，每轮都是一次模型往返 +
+            // 400ms 强制间隔。这条闸是唯一能同时压住所有催促路径的那一条。
+            //
+            // PLAN / REPLAN 不计数：这两个阶段的「进展」就是交一份计划，
+            // 本来就不调业务工具；把它们算进来会把正常规划误判成空转。
+            if matches!(phase, Phase::Execute | Phase::Reflect | Phase::Final) {
+                let business_result = results.iter().any(|result| !result.tool.is_bookkeeping());
+                if business_result {
+                    no_progress_rounds = 0;
+                } else {
+                    no_progress_rounds += 1;
+                    if no_progress_rounds >= MAX_NO_PROGRESS_ROUNDS {
+                        error_text = Some(format!(
+                            "连续 {MAX_NO_PROGRESS_ROUNDS} 轮没有拿到新的工具结果，已提前收尾"
+                        ));
+                        break;
+                    }
+                }
+            } else {
+                no_progress_rounds = 0;
             }
 
             request
@@ -2357,9 +2638,36 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     }
                 } else {
                     phase = Phase::Final;
+                    // 提示里带上「哪一步做完了、回执是什么」：等于把答案的原料
+                    // 摆到它面前。2026-11-09 那次它已经在思考区想好了答案，
+                    // 却把收尾这一轮花在「补一次 plan_update」上，最后交白卷。
+                    let done_note = plan
+                        .as_ref()
+                        .map(|current| {
+                            let (done, total) = current.progress();
+                            let last = current
+                                .steps
+                                .iter()
+                                .rev()
+                                .find_map(|step| {
+                                    step.evidence.as_deref().map(|evidence| {
+                                        format!(
+                                            "第 {} 步「{}」的回执：{}",
+                                            step.id,
+                                            step.title,
+                                            me_core::ai::truncate_chars(evidence, 200)
+                                        )
+                                    })
+                                })
+                                .unwrap_or_default();
+                            format!("{done}/{total} 步已完成。{last}")
+                        })
+                        .unwrap_or_default();
                     request.messages.push(me_core::ai::AiWireMessage::User {
-                        content: "计划已执行完。请按 [结果] 格式给出最终答复，不要只重复工具回执。"
-                            .to_string(),
+                        content: format!(
+                            "计划已执行完（{done_note}）。清单已经由引擎记好了，\
+**不要再更新清单**；请直接按 [结果] 格式把最终答复写给用户，不要只重复工具回执。"
+                        ),
                     });
                 }
             }
@@ -2416,8 +2724,10 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
             && (executed_calls > 0 || plan.is_some())
             && is_blank_answer(&content)
         {
-            content = fallback_answer(plan.as_ref(), &traces);
-            error_text = Some("模型未输出正文，已用执行回执兜底".to_string());
+            content = fallback_answer(plan.as_ref(), &traces, &deliveries);
+            // 文案要跟兜底的实际行为一致：现在优先直接交付工具正文，
+            // 只有没有正文可交时才退回「回执摘要」。
+            error_text = Some("模型未输出正文，已直接交付工具结果".to_string());
         }
 
         // 兜底之二：模型给了正文，却没按规范写 `[结果]` 段落。
@@ -2638,7 +2948,7 @@ fn phase_system_suffix(phase: Phase) -> Option<&'static str> {
 ///
 /// 2026-11-07 的事故：`plan_submit` 在 EXECUTE 阶段没下发，但它一旦被执行就等于
 /// 绕过了「重列不超过 2 次」的上限；收尾阶段更是完全不该有工具。
-fn phase_allows(phase: Phase, tool: AiToolName) -> bool {
+fn phase_allows(phase: Phase, tool: AiToolName, final_bookkeeping: bool) -> bool {
     match phase {
         // 计划期只认清单类工具：业务工具一次都别想调。
         // `plan_update` 也在其中——模型有时用旧接口直接交一份完整清单。
@@ -2647,9 +2957,25 @@ fn phase_allows(phase: Phase, tool: AiToolName) -> bool {
         Phase::Execute => !matches!(tool, AiToolName::PlanSubmit | AiToolName::AnswerDirectly),
         // 重列期只认 `plan_submit`。
         Phase::Replan => tool == AiToolName::PlanSubmit,
-        // 自检与收尾不给工具。
-        Phase::Reflect | Phase::Final => false,
+        // 自检阶段一律不给工具：它只要一段 JSON 结论。
+        Phase::Reflect => false,
+        // 收尾阶段：只在「已经观测到模型想记账」时放行 `plan_update` 这一个。
+        // 它是纯内存操作，没有副作用，也不会绕过任何上限。
+        Phase::Final => final_bookkeeping && tool == AiToolName::PlanUpdate,
     }
+}
+
+/// 收尾阶段唯一可能下发的工具：`plan_update`。
+///
+/// 从执行期的工具集里筛，而不是另抄一份 schema——参数说明只有一处来源。
+fn final_bookkeeping_tools(
+    execute_tools: &[me_core::ai::AiToolSpec],
+) -> Vec<me_core::ai::AiToolSpec> {
+    execute_tools
+        .iter()
+        .filter(|spec| spec.name == AiToolName::PlanUpdate)
+        .cloned()
+        .collect()
 }
 
 /// 阶段拦截时回给模型的提示：说清**现在该做什么**，而不是只说「不行」。
@@ -2693,7 +3019,8 @@ fn phase_rejection_summary(phase: Phase, tool: AiToolName) -> &'static str {
             _ => "执行阶段不需要这个工具",
         },
         Phase::Replan => "重列阶段只能提交计划",
-        Phase::Reflect | Phase::Final => "收尾阶段不能调用工具",
+        Phase::Reflect => "自检阶段不能调用工具",
+        Phase::Final => "收尾阶段不能调用工具",
     }
 }
 
@@ -2794,8 +3121,35 @@ fn is_blank_answer(text: &str) -> bool {
 /// 模型整轮没写出正文时的兜底：只陈述**已经发生的事实**，不编造结论。
 ///
 /// 空白比错误更糟——用户既不知道做成了什么，也不知道为什么没结果。
-fn fallback_answer(plan: Option<&me_core::ai_plan::Plan>, traces: &[AiToolTrace]) -> String {
-    let mut out = String::from("这次没有拿到可用的结果。\n\n");
+fn fallback_answer(
+    plan: Option<&me_core::ai_plan::Plan>,
+    traces: &[AiToolTrace],
+    deliveries: &[(AiToolName, String)],
+) -> String {
+    let mut out = String::new();
+
+    // 首选：工具真的返回了内容，就**原样交给用户**。
+    //
+    // 2026-11-09 的事故：模型查到了双流的完整预报，收尾时交白卷，兜底却只给了
+    // 一句「这次没有拿到可用的结果」——数据在手，用户一个字没看到。
+    // 「排版一般」远好于「数据在手却说没拿到」，所以这里只搬运、不解读。
+    if !deliveries.is_empty() {
+        out.push_str("模型没能整理这次的结果，以下是查询原文（未做任何修改）：\n\n");
+        let joined = deliveries
+            .iter()
+            .map(|(_, text)| text.trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        out.push_str(&me_core::ai::truncate_chars(
+            &joined,
+            FALLBACK_DELIVERY_CHARS,
+        ));
+        out.push('\n');
+        return out;
+    }
+
+    // 没有可直出的内容：只陈述引擎记下的事实，不编结论。
+    out.push_str("这次没有拿到结果。\n\n");
     match plan {
         Some(plan) => {
             let (done, total) = plan.progress();
@@ -2817,10 +3171,38 @@ fn fallback_answer(plan: Option<&me_core::ai_plan::Plan>, traces: &[AiToolTrace]
         }
         None => {}
     }
-    out.push_str(
-        "\n你可以：① 让我先同步最近的邮件；② 换一个更具体的说法（例如「这周未读的邮件」）。",
-    );
+    // 建议句按**这次真正用过的能力**分支：给一次天气对话推「同步邮件」
+    // 只会让用户以为答错了人。
+    out.push('\n');
+    out.push_str(fallback_hint(traces, deliveries));
     out
+}
+
+/// 兜底里「你可以……」那一句。按本轮用过的工具选，不写死成一个场景。
+fn fallback_hint(traces: &[AiToolTrace], deliveries: &[(AiToolName, String)]) -> &'static str {
+    let used = |kind: AiToolName| {
+        deliveries.iter().any(|(tool, _)| *tool == kind)
+            || traces.iter().any(|trace| trace.tool == kind)
+    };
+    if used(AiToolName::EmailSearch) || used(AiToolName::MailRead) {
+        "你可以让我先同步最近的邮件，或者换一个更具体的说法（例如「这周未读的邮件」）。"
+    } else if used(AiToolName::WeatherGet) || used(AiToolName::WeatherLocations) {
+        "你可以告诉我具体城市（例如「成都」），或者先在天气页添加关注城市再问一次。"
+    } else if used(AiToolName::CalendarList)
+        || used(AiToolName::CalendarCreate)
+        || used(AiToolName::CalendarUpdate)
+        || used(AiToolName::CalendarDelete)
+    {
+        "你可以换一个时间范围（例如「下周」「这个月」），或者先确认日历是否已经同步。"
+    } else if used(AiToolName::MusicSearch)
+        || used(AiToolName::MusicPlay)
+        || used(AiToolName::MusicState)
+        || used(AiToolName::MusicControl)
+    {
+        "你可以先在设置里选择音乐目录，或者换一个更具体的歌名。"
+    } else {
+        "你可以换一个更具体的说法，或者把条件放宽一些。"
+    }
 }
 
 /// 正文里有没有 `[结果]` 段落。
@@ -2828,7 +3210,10 @@ fn fallback_answer(plan: Option<&me_core::ai_plan::Plan>, traces: &[AiToolTrace]
 /// 判据与界面一致：只认**独占一行**的 `[结果]`。
 /// 写在句子里的「[结果]」不算——那多半是模型在解释格式，不是真的写了段落。
 fn has_result_block(content: &str) -> bool {
-    content.lines().any(|line| line.trim() == "[结果]")
+    // 判定与 UI 切分同源（`me_core::ai::is_result_block_line`）：模型写
+    // `**[结果]**` 时若只看裸行，引擎会以为它没写、再追加一段，
+    // 用户就同时看到两个结论不同的结果块——2026-11-10 实测的 M-MAIL-01 现场。
+    content.lines().any(me_core::ai::is_result_block_line)
 }
 
 /// 按清单与回执合成一段 `[结果]` 段落。
@@ -2849,6 +3234,12 @@ fn synthesized_result_block(
     let mut all_done = true;
 
     for trace in traces {
+        // 记账类工具不进「做了什么」：用户看到「提交计划（失败）；更新清单（失败）」
+        // 只会以为功能坏了。它们是引擎与模型之间的对账动作，不是业务动作
+        // ——2026-11-10 实测里那条 10 轮往返的回复，[结果] 就是这么写的。
+        if trace.tool.is_bookkeeping() {
+            continue;
+        }
         match trace.status {
             AiToolStatus::Ok => {
                 let summary = trace.summary.trim();
@@ -2926,6 +3317,17 @@ fn finalize_plan(
             // 留一个 `running` 在界面上就是永远转圈的圆圈。
             for step in current.steps.iter_mut() {
                 if step.status != me_core::ai_plan::PlanStatus::Running {
+                    continue;
+                }
+                // 上一次尝试是失败、之后没有再成功过的步，收尾时不能算完成。
+                // `failure` 只由引擎的 `record_attempts` 写、由成功回执清空，
+                // 所以它非空就等于「最后一次执行是失败的」。
+                // 这条兜的是模型没调 `plan_update` 就直接收尾的情况。
+                if step.failure.is_some() {
+                    step.status = me_core::ai_plan::PlanStatus::Failed;
+                    if step.evidence.is_none() {
+                        step.evidence = Some("本轮执行失败，没有拿到结果".to_string());
+                    }
                     continue;
                 }
                 if step.kind == me_core::ai_plan::StepKind::Reason || step.evidence.is_some() {

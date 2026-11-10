@@ -717,10 +717,12 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                         tracks.len()
                     )));
                 } else {
+                    // 只报曲名，不报数字序号：界面列表编号是**视图序号**，
+                    // 搜索态下与曲库序号必然不同，模型说「第 3 首」用户会点到别的歌。
                     let list = hits
                         .iter()
                         .take(8)
-                        .map(|&index| format!("{}. {}", index + 1, tracks[index].title))
+                        .map(|&index| tracks[index].label().to_string())
                         .collect::<Vec<_>>()
                         .join("、");
                     outcome = Some(me_core::MusicOutcome::ok(format!(
@@ -730,16 +732,10 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 }
             }
             MusicOp::Play { query, index } => {
-                let target = match (index, query.as_deref()) {
-                    (Some(raw), _) if raw >= 1 && raw <= tracks.len() => Some(raw - 1),
-                    (Some(raw), _) => {
-                        outcome = Some(me_core::MusicOutcome::fail(format!(
-                            "序号 {raw} 超出范围（曲库共 {} 首，序号从 1 开始）",
-                            tracks.len()
-                        )));
-                        None
-                    }
-                    (None, Some(word)) => {
+                // `query` 优先：AI 侧已经不给 `index` 了（曲库序号它拿不到），
+                // 真同时传了也以「点名的那首」为准。
+                let target = match (query.as_deref(), index) {
+                    (Some(word), _) => {
                         let hits = crate::views::music::find_tracks(&tracks, word);
                         match hits.len() {
                             0 => {
@@ -753,17 +749,25 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                                 let list = hits
                                     .iter()
                                     .take(8)
-                                    .map(|&index| format!("{}. {}", index + 1, tracks[index].title))
+                                    .map(|&index| tracks[index].label().to_string())
                                     .collect::<Vec<_>>()
                                     .join("、");
                                 outcome = Some(me_core::MusicOutcome::ok(format!(
                                     "「{word}」匹配到 {} 首，没有自动播放。候选：{list}。\
-请让用户选一首（或用 index 指定序号）",
+请让用户说一个更具体的歌名，再用 query 播放",
                                     hits.len()
                                 )));
                                 None
                             }
                         }
+                    }
+                    (None, Some(raw)) if raw >= 1 && raw <= tracks.len() => Some(raw - 1),
+                    (None, Some(raw)) => {
+                        outcome = Some(me_core::MusicOutcome::fail(format!(
+                            "序号 {raw} 超出范围（曲库共 {} 首，序号从 1 开始）",
+                            tracks.len()
+                        )));
+                        None
                     }
                     (None, None) => Some(0),
                 };
@@ -1680,6 +1684,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                     status,
                     summary,
                     duration_ms,
+                    args: None,
                     motive,
                     motive_source,
                     step_id,
@@ -2072,13 +2077,30 @@ fn apply_audio_event(state: &mut UiState, event: AudioEvent) {
             state.music.now_playing = None;
             state.music.cover_texture = None;
             state.music.analyzer.reset();
+            // 旧命中集合里的索引在新曲库里指别的歌。先置 `None` 再重算，
+            // 是为了绕过 `apply_search` 的去抖——即使新旧集合「看起来一样」，
+            // 也必须把新作用域强制送回音频线程。
+            state.music.matches = None;
+            state.music.apply_search();
         }
-        AudioEvent::Durations(list) => {
-            for (index, ms) in list {
-                if let Some(track) = state.music.tracks.get_mut(index) {
-                    track.duration_ms = Some(ms);
+        AudioEvent::TrackInfo(list) => {
+            for info in list {
+                let Some(track) = state.music.tracks.get_mut(info.index) else {
+                    continue;
+                };
+                if info.duration_ms.is_some() {
+                    track.duration_ms = info.duration_ms;
+                }
+                // 标签优先于文件名推断：有标签就覆盖，没有就保留推断值。
+                if info.tag_title.is_some() {
+                    track.tag_title = info.tag_title;
+                }
+                if info.artist.is_some() {
+                    track.artist = info.artist;
                 }
             }
+            // 歌手/标题补齐后，搜索歌手才可能命中——重算一次（命中集合没变就不会下发）。
+            state.music.apply_search();
         }
         AudioEvent::State(snapshot) => {
             state.music.playing = snapshot.playing;
@@ -2124,6 +2146,8 @@ mod tests {
         Track {
             path: PathBuf::from(format!("C:/m/{title}.mp3")),
             title: title.to_string(),
+            tag_title: None,
+            artist: None,
             duration_ms: None,
         }
     }
@@ -2187,9 +2211,102 @@ mod tests {
     fn duration_event_fills_matching_track_only() {
         let mut state = UiState::default();
         state.music.tracks = vec![track("a"), track("b")];
-        apply_audio_event(&mut state, AudioEvent::Durations(vec![(1, 90_000), (9, 1)]));
+        apply_audio_event(
+            &mut state,
+            AudioEvent::TrackInfo(vec![
+                crate::audio::playlist::TrackInfo {
+                    index: 1,
+                    duration_ms: Some(90_000),
+                    tag_title: None,
+                    artist: None,
+                },
+                crate::audio::playlist::TrackInfo {
+                    index: 9,
+                    duration_ms: Some(1),
+                    tag_title: None,
+                    artist: None,
+                },
+            ]),
+        );
         assert_eq!(state.music.tracks[0].duration_ms, None);
         assert_eq!(state.music.tracks[1].duration_ms, Some(90_000));
+    }
+
+    fn scope_commands(state: &UiState) -> Vec<Option<Vec<usize>>> {
+        state
+            .music
+            .pending
+            .iter()
+            .filter_map(|command| match command {
+                crate::audio::AudioCommand::SetScope(scope) => Some(scope.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 换曲库（重扫 / 换目录）后，旧的命中集合在新曲库里指别的歌，必须重算并重发。
+    #[test]
+    fn playlist_event_recomputes_and_resends_the_search_scope() {
+        let mut state = UiState::default();
+        state.music.tracks = vec![track("a"), track("b"), track("bee")];
+        state.music.search_query = "e".into();
+        state.music.apply_search();
+        assert_eq!(state.music.matches.as_deref(), Some(&[2][..]));
+        state.music.pending.clear();
+
+        // 新曲库只剩两首，命中集合「恰好」还是 [0] —— 也**必须**重发，
+        // 因为索引的含义已经换了。
+        state.music.matches = Some(vec![0]);
+        apply_audio_event(
+            &mut state,
+            AudioEvent::Playlist {
+                tracks: vec![track("a"), track("bee")],
+                skipped: 0,
+                truncated: false,
+            },
+        );
+        assert_eq!(state.music.matches.as_deref(), Some(&[1][..]));
+        assert_eq!(
+            scope_commands(&state),
+            vec![Some(vec![1])],
+            "新作用域必须送回音频线程"
+        );
+    }
+
+    /// 标签补齐后，按歌手搜才可能命中——补齐事件要触发一次重算。
+    #[test]
+    fn track_info_fills_artist_and_refreshes_artist_search() {
+        let mut state = UiState::default();
+        state.music.tracks = vec![track("a"), track("b")];
+        state.music.search_field = crate::audio::playlist::MatchField::Artist;
+        state.music.search_query = "周杰伦".into();
+        state.music.apply_search();
+        assert_eq!(
+            state.music.matches.as_deref(),
+            Some(&[][..]),
+            "补齐前谁都没有歌手"
+        );
+        state.music.pending.clear();
+
+        apply_audio_event(
+            &mut state,
+            AudioEvent::TrackInfo(vec![crate::audio::playlist::TrackInfo {
+                index: 1,
+                duration_ms: Some(1_000),
+                tag_title: Some("标签标题".into()),
+                artist: Some("周杰伦".into()),
+            }]),
+        );
+
+        assert_eq!(state.music.tracks[1].duration_ms, Some(1_000));
+        assert_eq!(state.music.tracks[1].artist.as_deref(), Some("周杰伦"));
+        assert_eq!(
+            state.music.tracks[1].label(),
+            "标签标题",
+            "标签优先于文件名"
+        );
+        assert_eq!(state.music.matches.as_deref(), Some(&[1][..]));
+        assert_eq!(scope_commands(&state), vec![Some(vec![1])]);
     }
 
     #[test]

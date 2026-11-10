@@ -53,6 +53,13 @@ pub(crate) struct ToolBudget {
     /// 又白吃一次工具预算。只存 id 而不是整份 `AiContextRef`——后者带正文快照，
     /// 每轮克隆几千字符没有任何收益。
     pub context_refs: Vec<MessageId>,
+    /// 本轮**已经创建成功**的日程：`(标题, 开始时间)`。
+    ///
+    /// 同一条用户消息里重复创建同名日程是纯损失：2026-11-10 实测里
+    /// 「下周四跟张总开会」一次建出两条（11-13 与 11-19 各一条），
+    /// 用户既没有要求两条，也看不出哪条是对的。
+    /// 现有的「同标题 ±5 分钟」去重挡不住这种——它换了个日期就从旁边溜过去了。
+    pub created_events: Vec<(String, i64)>,
 }
 
 /// 「工具 + 业务参数」的指纹。
@@ -104,8 +111,8 @@ impl ToolBudget {
     /// 把配额退回到某次快照。
     ///
     /// 只在**引擎自动重试**前调用：重试的是同一次逻辑调用，
-    /// 配额已经付过一次了。少了这一步，「天气重试」第二次就会拿到
-    /// 「本次消息已查询过天气」，把真正的网络错误盖掉。
+    /// 配额已经付过一次了。少了这一步，「天气重试」第二次就会撞上
+    /// 「最多查询 N 次天气，已经用完」这类限额错误，把真正的网络错误盖掉。
     pub(crate) fn restore_quota(&mut self, snapshot: ToolQuota) {
         self.weather = snapshot.weather;
         self.calendar = snapshot.calendar;
@@ -156,6 +163,7 @@ pub(crate) fn intercepted_result(
             status: AiToolStatus::Error,
             summary: "相同参数已失败过，未执行".to_string(),
             duration_ms: 0,
+            args: trace_args(call),
             motive,
             motive_source,
             step_id: call_step_id(call),
@@ -172,6 +180,32 @@ fn call_step_id(call: &AiToolCall) -> Option<u8> {
         .and_then(Value::as_u64)
         .and_then(|value| u8::try_from(value).ok())
         .filter(|value| *value >= 1)
+}
+
+/// trace 里留存的**实际参数**：去掉 `motive` / `step_id`，截断到 200 字符。
+///
+/// 计划里的 `args` 只用于展示与校验，真正跑的是模型当场传的这份。
+/// 两者不一致时（例如清单写 `weather_locations`、实际调 `weather_get`），
+/// 事后排查唯一的证据就是它——2026-11-09 那次只能靠猜。
+///
+/// 为什么截断而不是全存：`email_search` 的 `criteria` 可能很长，
+/// 而 `tool_trace` 是每条消息都要落库的字段。
+fn trace_args(call: &AiToolCall) -> Option<String> {
+    let map = call.arguments.as_object()?;
+    let mut filtered = serde_json::Map::new();
+    for (key, value) in map {
+        if key == "motive" || key == "step_id" {
+            continue;
+        }
+        filtered.insert(key.clone(), value.clone());
+    }
+    if filtered.is_empty() {
+        return None;
+    }
+    Some(me_core::ai::truncate_chars(
+        &Value::Object(filtered).to_string(),
+        200,
+    ))
 }
 
 /// PLAN 阶段调了业务工具：不执行，告诉它现在该做什么。
@@ -197,6 +231,7 @@ pub(crate) fn phase_rejected_result(
             status: AiToolStatus::Error,
             summary: summary.to_string(),
             duration_ms: 0,
+            args: trace_args(call),
             motive,
             motive_source,
             step_id: None,
@@ -307,6 +342,28 @@ fn classify_tool_failure(
     }
 }
 
+/// 同一句话里重复创建同名日程时的拒绝文案。
+///
+/// 只看标题、不看时间：用户说「下周四跟张总开会」就是一件事，
+/// 模型算出 11-13 和 11-19 两个日期只说明它没算准，两条都留下是纯损失
+/// （2026-11-10 实测里 `calendar_events` 就多了一条永远不该存在的日程）。
+fn duplicate_create_rejection(created: &[(String, i64)], title: &str) -> Option<String> {
+    let title = title.trim();
+    if title.is_empty() {
+        // 没标题的调用交给工具自己的参数校验报错，这里不掺和。
+        return None;
+    }
+    let (first_title, first_start) = created
+        .iter()
+        .find(|(created, _)| created.trim().eq_ignore_ascii_case(title))?;
+    Some(format!(
+        "本轮已经创建过「{first_title}」这条日程（开始于 {}），\
+不再重复创建。如果时间不对，请用 calendar_update 改那一条；\
+如果确实是另一件事，请先把它的标题取得跟这条不一样。",
+        me_core::format_local_datetime(*first_start)
+    ))
+}
+
 /// 这次结果是不是「成功但空」。
 ///
 /// 「未找到」不是成功也不是失败，是**计划需要修正**的信号：要按 `on_empty`
@@ -320,7 +377,15 @@ pub(crate) fn is_empty_result(summary: &str) -> bool {
 const CALENDAR_LIMIT: u32 = 5;
 const CALENDAR_READ_LIMIT: u32 = 5;
 const MEMORY_LIMIT: u32 = 5;
-const WEATHER_LIMIT: u32 = 1;
+/// 一次回复最多查几次天气。
+///
+/// 原来是 1 次，直接把「成都和北京哪个热」封死了：`weather_get` 本身
+/// 只支持单地点，一次调用只能答一个城市。3 次够覆盖「对比两三个城市」，
+/// 又不至于让模型拿它当搜索框刷。
+///
+/// **不改成「按逻辑调用计费」**：同参数重复调用失败时照样该吃配额，
+/// 那是一道合理的防刷闸（参数写错就狂刷的场景会被放回来）。
+const WEATHER_LIMIT: u32 = 3;
 /// 同一封邮件在一次回复里最多读几次正文。
 const MAIL_READ_LIMIT: u32 = 3;
 
@@ -365,22 +430,15 @@ fn arg_str(args: &Value, key: &str, max: usize) -> Option<String> {
 
 /// `email_search` 认识的参数名。
 ///
-/// 与 schema 的 `properties` 一一对应（`motive` / `step_id` 是引擎注入的，不算）。
-const EMAIL_SEARCH_ARG_NAMES: &[&str] = &[
-    "query",
-    "from",
-    "to",
-    "subject",
-    "after",
-    "before",
-    "days",
-    "folder",
-    "unread_only",
-    "flagged_only",
-    "has_attachment",
-    "criteria",
-    "limit",
-];
+/// **由 [`me_core::ai_plan::EMAIL_SEARCH_CONDITIONS`] 派生**，只额外补一个 `limit`：
+/// 以前这里是手抄的第二份清单，抄漏了 `has_attachment`——执行期认它、计划期不认，
+/// 「找带附件的邮件」这种合法计划被拒，报错里还列不出这一项。
+/// 现在两处同源，加条件只改 `me-core` 那一份。
+fn email_search_arg_names() -> Vec<&'static str> {
+    let mut names = me_core::ai_plan::EMAIL_SEARCH_CONDITIONS.to_vec();
+    names.push("limit");
+    names
+}
 
 /// 已经被移除的参数，以及它们的替代说法。
 ///
@@ -402,6 +460,7 @@ fn reject_unknown_email_args(args: &Value) -> Result<(), CoreError> {
     let Some(map) = args.as_object() else {
         return Ok(());
     };
+    let names = email_search_arg_names();
     for key in map.keys() {
         if key == "motive" || key == "step_id" {
             continue;
@@ -411,10 +470,10 @@ fn reject_unknown_email_args(args: &Value) -> Result<(), CoreError> {
                 "参数「{key}」已经没有了。{hint}"
             )));
         }
-        if !EMAIL_SEARCH_ARG_NAMES.contains(&key.as_str()) {
+        if !names.contains(&key.as_str()) {
             return Err(CoreError::validation(format!(
                 "参数「{key}」不认得。可用的是：{}",
-                EMAIL_SEARCH_ARG_NAMES.join(" / ")
+                names.join(" / ")
             )));
         }
     }
@@ -558,7 +617,11 @@ where
                 }
                 AiToolName::WeatherGet => {
                     if budget.weather >= WEATHER_LIMIT {
-                        Err(CoreError::validation("本次消息已查询过天气"))
+                        // 文案要说明「这是限额」而不是「查过了」：后者会让模型
+                        // 以为它已经拿到数据，转头去编一个温度。
+                        Err(CoreError::validation(format!(
+                            "本次回复最多查询 {WEATHER_LIMIT} 次天气，已经用完。要比较更多城市请分开发问。"
+                        )))
                     } else {
                         budget.weather += 1;
                         let memory = budget.permissions.memory;
@@ -571,17 +634,36 @@ where
                     }
                 }
                 AiToolName::CalendarCreate => {
-                    if budget.calendar >= CALENDAR_LIMIT {
+                    let all_day = arg_bool(&call.arguments, "all_day").unwrap_or(false);
+                    let title = arg_str(&call.arguments, "title", 200).unwrap_or_default();
+                    let start = arg_str(&call.arguments, "start", 64)
+                        .and_then(|raw| parse_when(&raw, all_day));
+                    // 同名重复创建：一句话只要一条。
+                    //
+                    // 判据只看标题，不看时间——用户说一件事就是一件事，
+                    // 模型算出两个日期只说明它没算准，不该两条都留下。
+                    if let Some(rejection) =
+                        duplicate_create_rejection(&budget.created_events, &title)
+                    {
+                        Err(CoreError::validation(rejection))
+                    } else if budget.calendar >= CALENDAR_LIMIT {
                         Err(CoreError::validation("本次消息创建的日程已达上限（5 条）"))
                     } else {
                         budget.calendar += 1;
                         let memory = budget.permissions.memory;
-                        with_timeout(
+                        let result = with_timeout(
                             CALENDAR_TIMEOUT,
                             "创建日程",
                             self.tool_calendar_create(conversation, call, memory),
                         )
-                        .await
+                        .await;
+                        if result.is_ok() && !title.is_empty() {
+                            // 只有**成功**才记账：失败的创建不该挡住下一次重试。
+                            budget
+                                .created_events
+                                .push((title, start.unwrap_or_default()));
+                        }
+                        result
                     }
                 }
                 AiToolName::MemoryUpsert => {
@@ -611,11 +693,24 @@ where
                     }
                 }
                 AiToolName::MusicPlay => {
-                    let query = arg_str(&call.arguments, "query", 100);
-                    // 序号从 1 开始（与界面列表一致），内部转成 0 基。
-                    let index = arg_u32(&call.arguments, "index").map(|value| value as usize);
-                    self.run_music_op(conversation, &call.id, MusicOp::Play { query, index })
+                    // `index` 已移除：它是**曲库扫描序号**，模型根本拿不到。
+                    // 2026-11-10 的实测里模型拿「搜索结果第 1 条」当曲库序号，
+                    // 结果《一路向北》播成了《7 Years》，两轮都这样，
+                    // 而工具回了 ok、清单记了 done——用户听到的是另一首歌。
+                    if call.arguments.get("index").is_some() {
+                        Err(CoreError::validation(
+                            "music_play 不接受 index：曲库序号对模型不可见，用它只会播错歌。\
+请改用 query 点名歌名或歌手（用户可以报歌名，也可以从 music_search 的候选里挑一个复述给你）",
+                        ))
+                    } else {
+                        let query = arg_str(&call.arguments, "query", 100);
+                        self.run_music_op(
+                            conversation,
+                            &call.id,
+                            MusicOp::Play { query, index: None },
+                        )
                         .await
+                    }
                 }
                 AiToolName::MusicState => {
                     self.run_music_op(conversation, &call.id, MusicOp::State)
@@ -672,6 +767,7 @@ where
                     status: AiToolStatus::Ok,
                     summary,
                     duration_ms,
+                    args: trace_args(call),
                     motive: motive.clone(),
                     motive_source,
                     step_id: call_step_id(call),
@@ -701,6 +797,7 @@ where
                         status: AiToolStatus::Error,
                         summary: message,
                         duration_ms,
+                        args: trace_args(call),
                         motive: motive.clone(),
                         motive_source,
                         step_id: call_step_id(call),
@@ -733,6 +830,16 @@ where
         // 会让「重要」变成「重要且最近」——那是另一个问题。
         let criteria = me_core::ai_plan::parse_criteria(args)?;
         if !criteria.is_empty() {
+            // 计划里的 args 不参与执行，所以这条必须在这里也查一遍：
+            // 模型完全可能计划写对、实际调用时把两套条件混在一起。
+            let conflicts = me_core::ai_plan::conflicting_criteria_conditions(args);
+            if !conflicts.is_empty() {
+                return Err(CoreError::validation(format!(
+                    "criteria 和 {} 不能在同一组参数里混写：判据自己带条件，\
+再叠一层普通条件会被忽略。请只留 criteria（条数用 limit 控制），或者删掉 criteria。",
+                    conflicts.join(" / ")
+                )));
+            }
             return self
                 .email_search_by_criteria(conversation, call, &criteria, cards_out)
                 .await;
@@ -806,13 +913,14 @@ where
         Ok((text, format!("检索到 {} 封", messages.len())))
     }
 
-    /// 按**判据组**检索：每条判据各查一次，结果取并集。
+    /// 按**判据组**检索：每条判据各查一次，再在内存里合成。
     ///
     /// 为什么要单独一条路径：
-    /// - 判据之间是「或」，而 `SearchQuery` 的多个条件是「且」——语义相反，
-    ///   塞进同一个查询会得到完全不同的结果；
+    /// - 一次查询只能表达「且」，而判据**内部**的「且」与判据**之间**的
+    ///   两种角色（must / boost）是不同语义，塞进同一个查询会得到完全不同的结果；
     /// - 每条结果要标注**命中了哪条判据**，用户据此判断模型的理解对不对；
-    /// - 排序按判据在组里的先后：靠前的判据命中时排在前面。
+    /// - must 取交集（框范围），boost 只参与排序（定优先级）——
+    ///   只用并集的话，「优先处理重要的」会退化成「近 7 天」。
     ///
     /// 这是「让模型自己理解需求」的落点：引擎只负责把模型给的判据
     /// 忠实执行并标出来，**不替模型决定什么算重要**。
@@ -823,52 +931,141 @@ where
         criteria: &[me_core::ai_plan::Criterion],
         cards_out: &Arc<Mutex<Vec<me_core::MailCardRef>>>,
     ) -> Result<(String, String), CoreError> {
+        use me_core::ai_plan::CriterionMode;
+
         let limit = arg_u32(&call.arguments, "limit").unwrap_or(5).clamp(1, 20) as usize;
         let folder_names = self.folder_names().await;
 
-        // 每条判据各查一次。按判据顺序累加，后面的判据不覆盖前面的。
-        let mut ranked: Vec<(usize, MessageSummary)> = Vec::new();
-        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        // 每条判据各查一次，命中结果按 id 去重后进同一个池子。
+        //
+        // 池子只存一份：同一封邮件可能同时满足多条判据，存多份会把
+        // 「命中 8 封」算成 10 封，卡片也会重复出现。
+        let mut pool: Vec<MessageSummary> = Vec::new();
+        let mut slot: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+        let mut hit_by: Vec<Vec<usize>> = Vec::with_capacity(criteria.len());
         let mut per_criterion: Vec<(String, u32)> = Vec::new();
 
-        for (index, criterion) in criteria.iter().enumerate() {
+        for criterion in criteria {
             let query = self
                 .build_email_query(&criterion.query, limit as u32)
                 .await?;
             let outcome = self.search_mail(query, 20).await?;
             per_criterion.push((criterion.label.clone(), outcome.total));
+            let mut indices = Vec::new();
             for message in outcome.messages {
-                if seen.insert(message.id.0) {
-                    ranked.push((index, message));
-                }
+                let index = *slot.entry(message.id.0).or_insert_with(|| {
+                    pool.push(message);
+                    pool.len() - 1
+                });
+                indices.push(index);
             }
+            hit_by.push(indices);
         }
 
-        // 排序：先按判据顺序（靠前的判据优先），同一条判据内保持时间倒序。
-        // 稳定排序保证同一判据内的原始顺序不被打乱。
-        ranked.sort_by_key(|(index, _)| *index);
+        // 范围与优先级分开算：must 取交集，boost 只加分。
+        let must: Vec<usize> = (0..criteria.len())
+            .filter(|index| criteria[*index].mode == CriterionMode::Must)
+            .collect();
+        let boost: Vec<usize> = (0..criteria.len())
+            .filter(|index| criteria[*index].mode == CriterionMode::Boost)
+            .collect();
 
-        // 截到 limit，但**每条判据至少留一条**——
-        // 否则第 3 条判据的结果会被前面的判据完全挤掉，用户看不到模型的另一种理解。
-        let mut picked: Vec<(usize, MessageSummary)> = Vec::new();
-        let mut per_label: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
-        for (index, message) in ranked.into_iter() {
-            let used = per_label.entry(index).or_insert(0);
-            if *used < 1 || picked.len() < limit {
-                *used += 1;
-                picked.push((index, message));
+        let candidates: Vec<usize> = if must.is_empty() {
+            // 一条 must 都没有：范围就是「命中任意一条」，与老行为一致。
+            let mut seen = std::collections::HashSet::new();
+            hit_by
+                .iter()
+                .flatten()
+                .filter(|index| seen.insert(**index))
+                .copied()
+                .collect()
+        } else {
+            // 多条 must 之间是「且」：从第一条开始逐条取交集。
+            // 保留第一条的顺序：同一条查询内部本来就是时间倒序。
+            let mut iter = must.iter().map(|index| hit_by[*index].clone());
+            let mut kept = iter.next().unwrap_or_default();
+            for next in iter {
+                let set: std::collections::HashSet<usize> = next.into_iter().collect();
+                kept.retain(|index| set.contains(index));
             }
-            if picked.len() >= limit + criteria.len() {
+            kept
+        };
+
+        // 命中了几条 boost 就排多前；同分时靠前的判据优先，再同分保持检索顺序。
+        let mut ranked: Vec<(usize, Vec<usize>)> = candidates
+            .into_iter()
+            .map(|index| {
+                let matched: Vec<usize> = boost
+                    .iter()
+                    .copied()
+                    .filter(|criterion| hit_by[*criterion].contains(&index))
+                    .collect();
+                (index, matched)
+            })
+            .collect();
+        ranked.sort_by_key(|(index, matched)| {
+            (
+                std::cmp::Reverse(matched.len()),
+                matched.first().copied().unwrap_or(usize::MAX),
+                *index,
+            )
+        });
+
+        // 有 must 时范围已经被框定，直接按排名取前 limit 条。
+        // 没有 must 时**每条 boost 至少留一条**，否则第 3 条判据的结果会被
+        // 前面的判据完全挤掉，用户看不到模型的另一种理解。
+        let capacity = if must.is_empty() {
+            limit + boost.len().max(1)
+        } else {
+            limit
+        };
+        let mut picked: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut represented: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (index, matched) in ranked {
+            let fresh = matched
+                .iter()
+                .any(|criterion| !represented.contains(criterion));
+            if picked.len() < limit || fresh {
+                represented.extend(matched.iter().copied());
+                picked.push((index, matched));
+            }
+            if picked.len() >= capacity {
                 break;
             }
         }
 
+        // 命中理由（卡片上的那一小块）：只写**最靠前**的那条判据。
+        //
+        // 一封邮件可能同时满足三条判据，全写上去卡片就变成一句话了；
+        // 排序已经是「命中越多越靠前」，用户看清单也能看出优先级，
+        // 卡片上只需要标明它最主要是因为哪一条被挑出来的。
+        let primary_label = |matched: &[usize]| -> String {
+            let source: &[usize] = if matched.is_empty() { &must } else { matched };
+            match source.first() {
+                Some(index) => criteria[*index].label.clone(),
+                None => "命中".to_string(),
+            }
+        };
+        // 工具结果里写给模型看的：把命中的判据**全部**列出来。
+        // 模型要靠它判断「这次检索是不是真的按我的理解在跑」。
+        let all_labels = |matched: &[usize]| -> String {
+            let source: &[usize] = if matched.is_empty() { &must } else { matched };
+            if source.is_empty() {
+                "命中".to_string()
+            } else {
+                source
+                    .iter()
+                    .map(|index| criteria[*index].label.clone())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            }
+        };
+
         let cards: Vec<me_core::MailCardRef> = picked
             .iter()
-            .map(|(index, message)| me_core::MailCardRef {
-                message: message.id,
-                reason: criteria[*index].label.clone(),
+            .map(|(index, matched)| me_core::MailCardRef {
+                message: pool[*index].id,
+                reason: primary_label(matched),
             })
             .collect();
         let total = cards.len() as u32;
@@ -888,10 +1085,29 @@ where
                 .iter()
                 .map(|(label, count)| format!("{label}（{count} 封）"))
                 .collect();
+            // 交集为空时，最有用的信息是「哪一条把结果卡死了」——
+            // 否则模型只会看到「0 命中」，然后原样重试一遍。
+            let blocker = if must.is_empty() {
+                String::new()
+            } else {
+                let strict: Vec<String> = must
+                    .iter()
+                    .filter(|criterion| hit_by[**criterion].is_empty())
+                    .map(|criterion| criteria[*criterion].label.clone())
+                    .collect();
+                if strict.is_empty() {
+                    "这些判据同时满足的邮件一封都没有。".to_string()
+                } else {
+                    format!(
+                        "其中「{}」单独命中就是 0，是它把范围卡死了。",
+                        strict.join("、")
+                    )
+                }
+            };
             return Ok((
                 format!(
-                    "按 {} 条判据检索，本地缓存中 0 命中：{}。\
-可尝试：① 放宽判据里的时间窗；② 去掉某条判据；③ 提示用户先同步最近的邮件。\
+                    "按 {} 条判据检索，本地缓存中 0 命中：{}。{blocker}\
+可尝试：① 放宽判据里的时间窗；② 去掉某条 must 判据；③ 提示用户先同步最近的邮件。\
 **不要用完全相同的参数再查一次**——同样的条件只会得到同样的结果。",
                     criteria.len(),
                     detail.join("、")
@@ -900,27 +1116,44 @@ where
             ));
         }
 
+        let scope = if must.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "必须同时满足：{}；",
+                must.iter()
+                    .map(|index| criteria[*index].label.clone())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            )
+        };
         let mut text = format!(
-            "按 {} 条判据检索，命中 {} 封（判据：{}）：\n",
+            "按 {} 条判据检索，命中 {} 封（{scope}各判据命中数：{}）：\n",
             criteria.len(),
-            total,
+            picked.len(),
             per_criterion
                 .iter()
                 .map(|(label, count)| format!("{label} {count} 封"))
                 .collect::<Vec<_>>()
                 .join("、")
         );
-        for (position, (criterion_index, message)) in picked.iter().enumerate() {
+        for (position, (index, matched)) in picked.iter().enumerate() {
+            let message = &pool[*index];
             text.push_str(&format!(
                 "{}. [命中判据：{}] {}\n",
                 position + 1,
-                criteria[*criterion_index].label,
+                all_labels(matched),
                 format_message(
                     position + 1,
                     message,
                     folder_names.get(&message.folder).cloned()
                 )
             ));
+        }
+        if must.is_empty() && boost.len() > 1 {
+            text.push_str("（按命中的判据条数排序：命中越多越靠前）\n");
+        } else if !must.is_empty() && !boost.is_empty() {
+            text.push_str("（范围内按命中的优先级判据排序：命中越多越靠前）\n");
         }
         Ok((text, format!("命中 {total} 封")))
     }
@@ -1357,6 +1590,8 @@ days / folder / unread_only / flagged_only / has_attachment",
 
         let saved = self.weather_locations().await?;
         let mut target = None;
+        // 地点是怎么被选中的（按默认关注点收敛时给用户的说明）。
+        let mut matched_note: Option<String> = None;
         if let Some(raw_id) = wanted_id.as_deref() {
             if let Ok(id) = raw_id.parse::<i64>() {
                 target = saved.iter().find(|item| item.id.0 == id).cloned();
@@ -1375,69 +1610,168 @@ days / folder / unread_only / flagged_only / has_attachment",
                 .filter(|item| location_matches(item, name))
                 .cloned()
                 .collect();
-            if matches.len() > 1 {
-                return Ok((
-                    format!(
-                        "「{name}」匹配到多个已保存地点：{}。请让用户指定其中一个。",
-                        matches
-                            .iter()
-                            .map(|item| format!("{}（id={}）", item.title(), item.id.0))
-                            .collect::<Vec<_>>()
-                            .join("、")
-                    ),
-                    "地点不明确".to_string(),
-                ));
-            }
-            target = matches.into_iter().next();
+            target = match matches.len() {
+                0 => None,
+                1 => matches.into_iter().next(),
+                _ => {
+                    // 多命中先按「默认关注点」收敛。
+                    //
+                    // 2026-11-10 的实测：关注列表里「双流（默认）」和「武侯」的
+                    // `admin2` 都是成都，于是「成都天气怎么样」直接被打回
+                    // 「请确认是哪个区」——用户明明早就设了默认，引擎却把本该
+                    // 自己做的决定又推回给了他。
+                    let defaults: Vec<_> = matches
+                        .iter()
+                        .filter(|item| item.is_default)
+                        .cloned()
+                        .collect();
+                    match defaults.len() {
+                        1 => {
+                            let picked = defaults.into_iter().next();
+                            // 说明「按哪个处理」：用户说的是城市，查到的是区，
+                            // 不写出来就等于默默换了个地点（M-WX-05 那条的教训）。
+                            matched_note = picked.as_ref().map(|item| {
+                                format!(
+                                    "「{name}」对应多个关注地点，已按默认的「{}」查询",
+                                    item.title()
+                                )
+                            });
+                            picked
+                        }
+                        _ => {
+                            // 真的分不清：**报错**，不是「成功但没数据」。
+                            //
+                            // 以前这里 `return Ok((…「地点不明确」…))`，于是 trace
+                            // 记 `ok`、清单把这一步记成 done，用户端一个温度都没有
+                            // ——2026-11-10 实测里最典型的一条 S1（清单全绿、答复没数据）。
+                            // 没拿到数据就该是失败，让清单如实显示「这步没成」。
+                            let list = matches
+                                .iter()
+                                .map(|item| format!("{}（id={}）", item.title(), item.id.0))
+                                .collect::<Vec<_>>()
+                                .join("、");
+                            return Err(CoreError::validation(format!(
+                                "「{name}」在你关注的地点里对应多个：{list}。\
+这是用户自己关注的地点，不要替他挑；把候选列给用户，等他指定后再查一次。"
+                            )));
+                        }
+                    }
+                }
+            };
         }
 
         // 城市名唯一命中候选时会顺手把它存进天气侧栏（否则没地方挂快照）。
         // 这算一次隐式写配置，所以要在结果里明说，让模型转述给用户。
         let mut auto_saved = false;
+        // 没给地点、按默认关注地点兜底时用的说明（要转述给用户）。
+        let mut used_default = false;
         let location = match target {
             Some(location) => location,
+            None if wanted_name.is_none() => {
+                // 用户这句话里根本没有地点（「天气怎么样」）。
+                //
+                // 2026-11-09 的事故：这里以前直接返回 `Validation`，于是
+                // 「天气怎么样」永远查不出结果——哪怕用户早就把双流设成了默认地点。
+                // 默认地点 `is_default` 只被拼进「，默认」三个字，从没参与过决策。
+                //
+                // 现在的降级顺序：默认关注地点 → 唯一关注地点 → 把候选列给用户。
+                let fallback = saved
+                    .iter()
+                    .find(|item| item.is_default)
+                    .or_else(|| {
+                        if saved.len() == 1 {
+                            saved.first()
+                        } else {
+                            None
+                        }
+                    })
+                    .cloned();
+                match fallback {
+                    Some(location) => {
+                        used_default = true;
+                        location
+                    }
+                    None if saved.is_empty() => {
+                        return Ok((
+                            "用户还没有关注任何城市，这句话里也没说地点。\
+请让用户给出城市名（例如「成都」），确认后再查一次。"
+                                .to_string(),
+                            "缺少地点".to_string(),
+                        ));
+                    }
+                    None => {
+                        let list = saved
+                            .iter()
+                            .map(|item| format!("{}（id={}）", item.title(), item.id.0))
+                            .collect::<Vec<_>>()
+                            .join("、");
+                        return Err(CoreError::validation(format!(
+                            "用户这句话没说地点，关注列表里也没有设默认：{list}。\
+把候选列给用户，让他指定一个再查。"
+                        )));
+                    }
+                }
+            }
             None => {
                 let Some(name) = wanted_name.clone() else {
+                    // 上一条 arm 已经接住「没给地点」，走到这里必然有名字；
+                    // 留着这条兜底只是为了 match 全。
                     return Err(CoreError::validation(
-                        "请提供城市名（location）或已保存地点的 location_id",
+                        "这次没有可用的地点参数，请让用户给出城市名后再查。",
                     ));
                 };
                 let candidates = self.weather_candidates(&name).await?;
-                match candidates.len() {
-                    0 => {
-                        return Ok((
-                            format!("没有找到「{name}」这个地点，请让用户换一个更完整的城市名。"),
-                            "未找到地点".to_string(),
-                        ));
+                if candidates.is_empty() {
+                    return Err(CoreError::validation(format!(
+                        "没有找到「{name}」这个地点，请让用户换一个更完整的城市名。"
+                    )));
+                }
+                // 同名优先：「北京」搜出来是 北京·北京市 + 海淀/朝阳/顺义…共 10 条，
+                // 其中 `name` 恰好等于「北京」的那条就是用户说的城市。
+                //
+                // 以前这里一律按「候选 > 1 就反问」处理，于是任何一个不在关注列表里
+                // 的城市名都永远查不出天气——2026-11-10 实测的「成都和北京哪个更冷」
+                // 就是这么被判成「地点不明确」的。
+                let exact: Vec<_> = candidates
+                    .iter()
+                    .filter(|item| place_name_matches(&item.name, &name))
+                    .cloned()
+                    .collect();
+                let picked = match exact.len() {
+                    1 => exact.into_iter().next(),
+                    // 0 条同名说明用户给的是别名/简称，且只有一个候选时才敢用。
+                    // 多个候选仍然必须问：那是真的分不清（如「朝阳」北京/辽宁各一个）。
+                    _ => None,
+                }
+                .or_else(|| {
+                    if candidates.len() == 1 {
+                        candidates.first().cloned()
+                    } else {
+                        None
                     }
-                    1 => {
-                        let candidate = candidates[0].clone();
-                        self.add_weather_location(candidate.clone()).await;
-                        auto_saved = true;
-                        let saved = self.weather_locations().await?;
-                        match saved.into_iter().find(|item| {
-                            item.provider_location_id == candidate.provider_location_id
-                        }) {
-                            Some(location) => location,
-                            None => {
-                                return Err(CoreError::validation("地点保存失败，请稍后再试"));
-                            }
-                        }
-                    }
-                    _ => {
-                        let list = candidates
-                            .iter()
-                            .take(10)
-                            .map(|item| item.title())
-                            .collect::<Vec<_>>()
-                            .join("、");
-                        return Ok((
-                            format!(
-                                "「{name}」有多个候选地点：{list}。\
-不要自行挑选，请把候选列给用户，让用户确认后再查一次。"
-                            ),
-                            "地点不明确".to_string(),
-                        ));
+                });
+                let Some(candidate) = picked else {
+                    let list = candidates
+                        .iter()
+                        .take(10)
+                        .map(|item| item.title())
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    return Err(CoreError::validation(format!(
+                        "「{name}」有多个同名候选地点：{list}。\
+不要自行挑选，把候选列给用户，让他确认后再查一次。"
+                    )));
+                };
+                self.add_weather_location(candidate.clone()).await;
+                auto_saved = true;
+                let saved = self.weather_locations().await?;
+                match saved
+                    .into_iter()
+                    .find(|item| item.provider_location_id == candidate.provider_location_id)
+                {
+                    Some(location) => location,
+                    None => {
+                        return Err(CoreError::validation("地点保存失败，请稍后再试"));
                     }
                 }
             }
@@ -1446,12 +1780,27 @@ days / folder / unread_only / flagged_only / has_attachment",
         self.refresh_weather(location.id, false).await;
         let snapshot = self.weather_snapshot(location.id).await?;
         let Some(snapshot) = snapshot else {
-            return Err(CoreError::validation("天气数据暂时不可用，请稍后再试"));
+            // 刚触发过一次刷新却没拿到快照：这是**这次的**临时状况（网络抖动、
+            // 服务商 5xx），不是参数错。以前用 `Validation` 上报，等于告诉引擎
+            // 「参数不对」——不重试、还记进失败指纹，同一条消息里再也查不成。
+            return Err(CoreError::timeout(
+                "天气数据暂时不可用（刚尝试刷新但没有拿到数据），请稍后再试",
+            ));
         };
         if memory {
             self.register_location_entity(conversation, &location).await;
         }
         let mut text = format_weather(&location.title(), &snapshot, days, hours);
+        if let Some(note) = matched_note {
+            text = format!("（{note}；要换成另一个地点，让用户说一声即可）\n{text}");
+        }
+        if used_default {
+            text = format!(
+                "（用户这句话没有指明地点，已按默认关注地点「{}」查询；\
+如需别的城市，让用户说一声即可）\n{text}",
+                location.title()
+            );
+        }
         if auto_saved {
             text.push_str(&format!(
                 "\n（已把「{}」加入天气地点，用户可在天气页删除）",
@@ -1899,12 +2248,16 @@ fn plan_step_from_json(value: &Value) -> Result<PlanStep, CoreError> {
         .and_then(Capability::parse)
         .unwrap_or(Capability::General);
 
+    // 标题可省略：`plan_update` 只允许改状态与 evidence，标题本来就不可改，
+    // 于是「不传标题、沿用上一版」才是它最自然的写法（2026-11-09 审计）。
+    // 传了就必须与旧标题一致——那由 `validate_plan` 的不可变校验兜住；
+    // 省略时把它留空，交给 `validate_plan` 从上一版继承。
     let title = value
         .get("title")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| CoreError::validation(format!("第 {id} 步缺少 title")))?;
+        .unwrap_or_default()
+        .to_string();
 
     let status = value
         .get("status")
@@ -1923,7 +2276,7 @@ fn plan_step_from_json(value: &Value) -> Result<PlanStep, CoreError> {
         .filter(|text| !text.is_empty())
         .map(str::to_string);
 
-    let mut step = PlanStep::new(id, title, capability, status);
+    let mut step = PlanStep::new(id, &title, capability, status);
     step.evidence = evidence;
     Ok(step)
 }
@@ -2028,6 +2381,39 @@ fn location_matches(location: &me_core::WeatherLocation, name: &str) -> bool {
         .as_deref()
         .is_some_and(|admin| admin.eq_ignore_ascii_case(name));
     location.name.eq_ignore_ascii_case(name) || admin2_matches || location.title().contains(name)
+}
+
+/// 候选地点的名字与用户说法是否是**同一个地方**。
+///
+/// 只做两种等价：完全相同，或只差一个行政区后缀（「北京」≈「北京市」、
+/// 「朝阳」≈「朝阳区」）。刻意不写成 `contains`：搜「北京」会返回「北京」
+/// 以及「朝阳」「海淀」这些下辖区县，用包含关系会把「朝阳」也算成北京本级。
+fn place_name_matches(candidate: &str, wanted: &str) -> bool {
+    fn normalize(value: &str) -> &str {
+        let value = value.trim();
+        for suffix in [
+            "特别行政区",
+            "自治区",
+            "自治州",
+            "地区",
+            "市辖区",
+            "市",
+            "区",
+            "县",
+        ] {
+            if let Some(stripped) = value.strip_suffix(suffix)
+                && !stripped.is_empty()
+            {
+                return stripped;
+            }
+        }
+        value
+    }
+    let wanted = wanted.trim();
+    if wanted.is_empty() || candidate.trim().is_empty() {
+        return false;
+    }
+    candidate.trim() == wanted || normalize(candidate) == normalize(wanted)
 }
 
 /// 这封邮件**为什么**出现在结果里。
@@ -2219,6 +2605,99 @@ fn format_weather(
 mod tests {
     use super::*;
 
+    /// 三份清单必须同源：core 的条件表 → 执行期参数名 → 下发给模型的 schema。
+    ///
+    /// 2026-11-09：`has_attachment` 只活在执行期（`build_email_query` 读它、
+    /// 判据里也有它），但顶层 schema 漏了——`additionalProperties: false` 之下
+    /// 模型**根本看不到**这个参数，「找带附件的邮件」只能靠猜。
+    /// 计划期的条件表也漏了它，于是就算模型猜对了也会被拒。
+    #[test]
+    fn email_arg_names_match_the_schema_and_the_core_condition_list() {
+        let runtime = email_search_arg_names();
+        let schema = me_core::ai::tool_argument_names(AiToolName::EmailSearch)
+            .expect("email_search 必须有参数表");
+
+        for key in me_core::ai_plan::EMAIL_SEARCH_CONDITIONS {
+            assert!(runtime.contains(key), "执行期参数表漏了「{key}」");
+            assert!(schema.contains(&key.to_string()), "schema 漏了「{key}」");
+        }
+        assert!(runtime.contains(&"limit"), "limit 仍然要能写");
+        assert!(schema.contains(&"limit".to_string()));
+    }
+
+    /// 候选地点的同名判定：只认「完全相同」或「只差行政后缀」。
+    ///
+    /// 2026-11-10 的实测：查「北京」时和风返回 10 条（北京 + 海淀/朝阳/顺义…），
+    /// 旧逻辑「候选 > 1 就反问」让任何一个不在关注列表里的城市名都查不出天气。
+    #[test]
+    fn place_name_matches_only_the_same_place() {
+        assert!(place_name_matches("北京", "北京"));
+        assert!(
+            place_name_matches("北京市", "北京"),
+            "只差一个「市」算同一个"
+        );
+        assert!(place_name_matches("朝阳区", "朝阳"));
+        assert!(place_name_matches("自贡", "自贡市"));
+
+        // 下辖区县不是本级城市：搜「北京」不能把「朝阳」当成北京。
+        assert!(!place_name_matches("朝阳", "北京"));
+        assert!(!place_name_matches("海淀", "北京"));
+        assert!(!place_name_matches("", "北京"));
+        assert!(!place_name_matches("北京", "  "));
+    }
+
+    /// 同一句话里第二次建同名日程要被拦下。
+    ///
+    /// 2026-11-10 的实测：模型把「下周四」算成 11-13、又算成 11-19，
+    /// 两条都写进了 `calendar_events`——用户既没要求两条，也看不出哪条对。
+    /// 旧的「同标题 ±5 分钟」去重挡不住它：换个日期就绕过去了。
+    #[test]
+    fn duplicate_create_is_rejected_even_on_another_day() {
+        let created = vec![("与张总开会".to_string(), 1_795_068_000)];
+        assert!(
+            duplicate_create_rejection(&created, "与张总开会").is_some(),
+            "同名不同日期也要拦"
+        );
+        assert!(
+            duplicate_create_rejection(&created, " 与张总开会 ").is_some(),
+            "两边的空格不该让它绕过去"
+        );
+        assert!(
+            duplicate_create_rejection(&created, "与张总复盘").is_none(),
+            "不同的事不该被拦"
+        );
+        assert!(
+            duplicate_create_rejection(&created, "  ").is_none(),
+            "没标题交给参数校验，不在这里拦"
+        );
+    }
+
+    /// `music_play` 不能再接受 `index`。
+    ///
+    /// 2026-11-10 的实测：模型把「搜索结果的第 1 条」当成曲库序号传进来，
+    /// 《一路向北》播成了《7 Years》，工具回 ok、清单记 done。
+    #[test]
+    fn music_play_has_no_index_argument() {
+        let names = me_core::ai::tool_argument_names(AiToolName::MusicPlay)
+            .expect("music_play 必须有参数表");
+        assert!(
+            !names.contains(&"index".to_string()),
+            "曲库序号对模型不可见，留着它只会播错歌：{names:?}"
+        );
+        assert!(names.contains(&"query".to_string()));
+    }
+
+    /// 天气限额至少能覆盖「对比两个城市」。
+    ///
+    /// 2026-11-09 之前是 1 次/消息：`weather_get` 本身只支持单地点，
+    /// 于是「成都和北京哪个热」在不改工具的前提下无解——模型只能查一个，
+    /// 另一个靠编。抬到 3 次是最小修复。
+    #[test]
+    fn weather_limit_allows_multi_city_comparison() {
+        // 编译期就能判定，所以放在 const block 里：改回 1 次会直接编译失败。
+        const { assert!(WEATHER_LIMIT >= 2) };
+    }
+
     /// 超时必须变成一句**说得清**的工具错误：带上工具名与秒数，
     /// 而不是 `CoreError::ai(Transient)` 那句固定的「服务暂时不可用」。
     #[tokio::test]
@@ -2360,6 +2839,44 @@ mod tests {
             repairs.iter().any(|r| r.note.contains("capability")),
             "补 capability 要有说明：{repairs:?}"
         );
+    }
+
+    /// `plan_update` 只回 id/status/evidence 也能用：标题由引擎从上一版继承。
+    ///
+    /// 解析层**不猜**（留空），合并层才有上一版可比——所以断言分两段。
+    #[test]
+    fn plan_update_step_without_title_inherits_it() {
+        let value = serde_json::json!({
+            "id": 1,
+            "status": "done",
+            "evidence": "拿到 20 封",
+        });
+        let parsed = plan_step_from_json(&value).expect("不该报错");
+        assert_eq!(parsed.title, "", "解析阶段不猜，交给合并");
+
+        let prev = me_core::ai_plan::Plan {
+            goal: "查最近的邮件".to_string(),
+            steps: vec![me_core::ai_plan::PlanStep::new(
+                1,
+                "检索近 7 天邮件",
+                Capability::Mail,
+                me_core::ai_plan::PlanStatus::Running,
+            )],
+            ..Default::default()
+        };
+        let next = me_core::ai_plan::validate_plan(
+            Some(&prev),
+            &me_core::ai_plan::Plan {
+                // goal 也省略：合并时沿用原目标。
+                goal: String::new(),
+                steps: vec![parsed],
+                ..Default::default()
+            },
+        )
+        .expect("省略标题应当通过");
+        assert_eq!(next.steps[0].title, "检索近 7 天邮件");
+        assert_eq!(next.steps[0].status, me_core::ai_plan::PlanStatus::Done);
+        assert_eq!(next.steps[0].evidence.as_deref(), Some("拿到 20 封"));
     }
 
     /// `plan_update` 的契约里 capability 也不该是必填：模型只回传

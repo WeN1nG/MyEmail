@@ -841,7 +841,7 @@ fn is_blank_answer(text: &str) -> bool {
 
 1. `EXECUTE/REFLECT` 结束后，若本轮**调用过工具**且 `is_blank_answer(content)`：
    追加一条 reminder「你必须用自然语言向用户交代结果：找到了什么、没找到什么」，
-   再给 1 轮（`MAX_BLANK_RETRIES = 1`）；
+   再给 1 轮（`MAX_FINAL_RETRIES = 2`：收尾期只保留一份预算，空正文与「收尾期还在调工具」共用）；
 2. 仍为空 → 引擎**合成兜底文本**（不调模型）：
 
 ```text
@@ -857,7 +857,13 @@ fn is_blank_answer(text: &str) -> bool {
 你可以：① 让我先同步最近的邮件；② 换一个更具体的说法（例如「这周未读的邮件」）。
 ```
 
-状态保持 `Complete`，`error = "模型未输出正文，已用执行回执兜底"`。
+状态保持 `Complete`，`error = "模型未输出正文，已直接交付工具结果"`。
+
+> **2026-11-09 更新**：兜底口径已改（见 [AI工具调用优化.md](AI工具调用优化.md) §6.1）。
+> 模型交白卷时**优先把成功调用的工具正文原样交付**（截断 4000 字符，前置「模型没能整理这次的结果，
+> 以下是查询原文」）；没有正文可交才退回上面的「列清单 / 列回执」；建议句也改按本轮用过的能力分支，
+> 不再固定推荐「同步邮件」。补答预算从「空正文 1 次 / 收尾调工具 1 次、两者互斥」合并为
+> 单一 `final_retries = 2`。
 
 > **为什么不是 `Partial`**：`ai_messages.status` 有 CHECK 约束
 > `IN ('streaming','complete','failed','cancelled')`（[migrations.rs:299](../../crates/me-store/src/migrations.rs)），
@@ -947,7 +953,7 @@ v2 的处理：把「正在流式的那一条消息的清单」提到 `UiState` 
 | `MAX_STEP_ATTEMPTS` | —（无） | 3 | R6 |
 | `MAX_REPLANS` | —（无） | 2 | R9 |
 | `MAX_PLAN_NUDGES` | 2 | 2（保留，仅用于「计划开着却停手」） | 与新机制不重叠 |
-| `MAX_BLANK_RETRIES` | —（无） | 1 | §9.2 |
+| `MAX_FINAL_RETRIES` | —（无） | 2 | §9.2；合并了「空正文」与「收尾期调工具」两个计数（它们曾互斥） |
 | 单工具超时 | 2/3/5/5/20 s | 不变 | 重试次数变了，单次超时不必变 |
 | 全局并发 | 2 / 单会话 1 | 不变 | 变的是单轮内部的步数，不是并发流数 |
 
@@ -1344,7 +1350,7 @@ turns = [
 | `MAX_REPLANS` | 2 | 同上 |
 | `MAX_PLAN_HISTORY` | 2 | 同上 |
 | `MAX_STEP_ARGS_BYTES` | 1024 | 同上 |
-| `MAX_BLANK_RETRIES` | 1 | `me-sync/src/ai.rs` |
+| `MAX_FINAL_RETRIES` | 2 | `me-sync/src/ai.rs` |
 | `PHASE_PLAN_BUDGET` | 60 s | 同上 |
 | `PHASE_EXECUTE_BUDGET` | 300 s | 同上 |
 | `PHASE_REFLECT_BUDGET` | 45 s | 同上 |

@@ -244,17 +244,64 @@ pub struct Criterion {
     /// 这条判据的名字（≤ 24 字），给人看。
     #[serde(default)]
     pub label: String,
+    /// 这一条是「必须满足」还是「加分项」，见 [`CriterionMode`]。
+    #[serde(default)]
+    pub mode: CriterionMode,
     /// 这条判据对应的检索条件（`email_search` 的参数子集）。
     #[serde(default)]
     pub query: serde_json::Value,
+}
+
+/// 一条判据的两种角色。
+///
+/// 「取并集」只够回答「有没有命中」，回答不了「先看哪个」——
+/// 用户说「优先处理重要的」，并集会把它退化成「近 7 天」（2026-11-10 实测：
+/// 卡片理由全是「近 7 天」，星标邮件一条没排到前面）。所以拆成两档：
+///
+/// - [`CriterionMode::Must`]：范围。所有 must 判据取**交集**，不满足就根本不出现；
+/// - [`CriterionMode::Boost`]：优先级。命中越多排越前，不影响是否出现。
+///
+/// 一条 `must` 都没有时全部按 `boost` 处理（并集 + 命中的排前面），
+/// 与老行为等价——模型不写 `mode` 也不会变差。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionMode {
+    /// 必须满足（多条之间是「且」）。
+    Must,
+    /// 命中即加分（只影响排序）。
+    #[default]
+    Boost,
+}
+
+impl CriterionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CriterionMode::Must => "must",
+            CriterionMode::Boost => "boost",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "must" => Some(CriterionMode::Must),
+            "boost" => Some(CriterionMode::Boost),
+            _ => None,
+        }
+    }
 }
 
 impl Criterion {
     pub fn new(label: &str, query: serde_json::Value) -> Self {
         Self {
             label: label.to_string(),
+            mode: CriterionMode::Boost,
             query,
         }
+    }
+
+    pub fn with_mode(mut self, mode: CriterionMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     /// 判据有没有至少一个可执行条件。
@@ -346,10 +393,27 @@ pub fn parse_criteria(args: &serde_json::Value) -> Result<Vec<Criterion>, CoreEr
                 label.chars().count()
             )));
         }
-        // 名字之外的部分才是条件。
+        // 名字之外的部分才是条件；`mode` 是角色标记，也不进条件。
+        let mut mode = CriterionMode::Boost;
+        if let Some(raw) = map.get("mode") {
+            let Some(text) = raw.as_str() else {
+                return Err(CoreError::validation(format!(
+                    "criteria 第 {} 项（{label}）的 mode 必须是字符串：must 或 boost",
+                    index + 1
+                )));
+            };
+            let Some(parsed) = CriterionMode::parse(text) else {
+                return Err(CoreError::validation(format!(
+                    "criteria 第 {} 项（{label}）的 mode 只能是 must（必须满足，框范围）\
+或 boost（命中即加分，只影响排序），收到「{text}」",
+                    index + 1
+                )));
+            };
+            mode = parsed;
+        }
         let mut query = serde_json::Map::new();
         for (key, value) in map {
-            if key == "label" {
+            if key == "label" || key == "mode" {
                 continue;
             }
             if !CRITERION_CONDITIONS.contains(&key.as_str()) {
@@ -369,7 +433,7 @@ pub fn parse_criteria(args: &serde_json::Value) -> Result<Vec<Criterion>, CoreEr
                 index + 1
             )));
         }
-        out.push(Criterion::new(label, serde_json::Value::Object(query)));
+        out.push(Criterion::new(label, serde_json::Value::Object(query)).with_mode(mode));
     }
     Ok(out)
 }
@@ -1368,16 +1432,35 @@ pub enum EmptyAction {
 /// `motive` 与 `step_id` 原样保留：它们不参与检索，但重试时要靠 `step_id`
 /// 绑回清单里的那一步，丢了就绑不上了。
 pub fn relax_args(args: &serde_json::Value) -> Option<serde_json::Value> {
-    // 判据组：去掉最后一条（最宽的那条）。
+    // 判据组：去掉一条——但**先去掉 boost**。
+    //
+    // 判据现在有两种角色：must 决定范围，boost 只决定顺序。去掉一条 boost
+    // 只丢优先级、范围不动；去掉一条 must 才会真的变宽。所以：
+    // - 有两条以上 boost：去掉最后一条 boost（后写的通常是次要的那条）；
+    // - boost 只剩一条：去它不改变范围（范围由 must 决定），等于白花一次尝试，
+    //   因此直接去 must，让范围真的变宽。
     if let Some(items) = args.get("criteria").and_then(serde_json::Value::as_array)
         && items.len() > 1
     {
-        let mut map = args.as_object()?.clone();
-        map.insert(
-            "criteria".to_string(),
-            serde_json::Value::Array(items[..items.len() - 1].to_vec()),
-        );
-        return Some(serde_json::Value::Object(map));
+        let is_boost = |item: &serde_json::Value| {
+            item.get("mode").and_then(serde_json::Value::as_str) != Some("must")
+        };
+        let boost_count = items.iter().filter(|item| is_boost(item)).count();
+        let drop_index = if boost_count >= 2 {
+            items.iter().rposition(is_boost)
+        } else {
+            items
+                .iter()
+                .rposition(|item| !is_boost(item))
+                .or_else(|| items.iter().rposition(is_boost))
+        };
+        if let Some(index) = drop_index {
+            let mut kept = items.to_vec();
+            kept.remove(index);
+            let mut map = args.as_object()?.clone();
+            map.insert("criteria".to_string(), serde_json::Value::Array(kept));
+            return Some(serde_json::Value::Object(map));
+        }
     }
     let mut map = args.as_object()?.clone();
     // 1) 先丢星标
@@ -1489,14 +1572,31 @@ pub fn validate_plan(prev: Option<&Plan>, next: &Plan) -> Result<Plan, CoreError
         }
         seen.push(step.id);
 
+        // 标题为空的两种情形要分开对待：
+        //
+        // - `prev = None`（首次建清单）：必须写，不然用户看不出这一步做什么；
+        // - `prev = Some`（`plan_update`）：**沿用上一版的标题**。
+        //
+        // 后者是被工具描述逼出来的：它写着「只能改状态与 evidence，不能改标题」，
+        // 模型照着这条只传 id/status/evidence 是最自然的写法，而 schema 里
+        // `title` 又是 required、解析函数也硬要标题——于是「按说明写」反而被判
+        // 「第 N 步缺少标题」，还是一条不可重试的参数错误（2026-11-09 审计）。
+        // 既然标题本来就不可改，让它省略才是自洽的。
         let title = step.title.trim();
-        if title.is_empty() {
-            return Err(CoreError::validation(format!(
-                "第 {} 步缺少标题（title）",
-                step.id
-            )));
-        }
-        let title = truncate_chars(title, MAX_STEP_TITLE_CHARS);
+        let title = if title.is_empty() {
+            match prev.and_then(|plan| plan.steps.iter().find(|item| item.id == step.id)) {
+                Some(old) => old.title.clone(),
+                None => {
+                    return Err(CoreError::validation(format!(
+                        "第 {} 步缺少标题（title）",
+                        step.id
+                    )));
+                }
+            }
+        } else {
+            title.to_string()
+        };
+        let title = truncate_chars(&title, MAX_STEP_TITLE_CHARS);
         let evidence = step
             .evidence
             .as_deref()
@@ -1547,6 +1647,55 @@ pub fn validate_plan(prev: Option<&Plan>, next: &Plan) -> Result<Plan, CoreError
                 }
                 let mut merged = old;
                 merged.title = title;
+                // 引擎记过「上一次尝试失败」的步，模型不能直接标 done。
+                //
+                // 2026-11-09 的事故：`weather_get` 报 invalid_args 之后，模型用
+                // `plan_update` 把它标成 done，还配了一句「功能受限，改为直接查询」的
+                // evidence。清单统计因此变成「1/1 步完成，0 步失败」——界面上是一次
+                // 体面的完成，实际一个字的数据都没拿到。清单是给用户对账的，
+                // 这一格必须如实：要么重试到真正成功（成功回执会清掉 failure），
+                // 要么老实标 skipped。
+                if step.status == PlanStatus::Done
+                    && merged.status != PlanStatus::Done
+                    && let Some(failure) = merged.failure.as_ref()
+                {
+                    return Err(CoreError::validation(format!(
+                        "第 {} 步上一次执行失败（{}），不能标成 done：\
+换参数重新执行、让它真正成功，或者标 skipped 并在 evidence 里写清为什么放弃",
+                        step.id,
+                        failure.human()
+                    )));
+                }
+                // 工具步标 done，必须真有这一轮的执行回执。
+                //
+                // 2026-11-10 的实测：模型要建「下周五交材料」的日程，`calendar_create`
+                // 一次都没调，却在 `plan_update` 里把这一步标成 done，还写了一句
+                // 「成功创建日程: event_id=1，时间=2026-07-24」。清单全绿，库里没有
+                // 这条日程——用户以为交材料的事已经安排好了，实际什么都没发生。
+                //
+                // 判据用 `attempts`：它只由引擎在**真实执行**之后递增，模型改不了。
+                // 工具步 attempts == 0 说明它声明的那个工具这一轮从没跑过，
+                // 此时 done 必然是编的。
+                if step.status == PlanStatus::Done && merged.status != PlanStatus::Done {
+                    if merged.is_tool_step() && merged.attempts == 0 {
+                        let tool = merged.tool.map(AiToolName::as_str).unwrap_or("工具");
+                        return Err(CoreError::validation(format!(
+                            "第 {} 步声明调用 {tool}，但这一轮一次都没执行过，不能标成 done：\
+先真正调用 {tool} 拿到回执，或者标 skipped 并在 evidence 里写清为什么没做。\
+不要用「已创建 / 已发送」这类说法代替回执",
+                            step.id
+                        )));
+                    }
+                    // done 却不写回执，等于让用户无法对账。
+                    // 只卡工具步：推理步的「结论」在正文里，不在清单上。
+                    if merged.is_tool_step() && evidence.is_none() && merged.evidence.is_none() {
+                        return Err(CoreError::validation(format!(
+                            "第 {} 步标成 done 时必须写 evidence：一句话说明这一步拿到了什么\
+（命中几封 / 创建了哪条 / 查到了什么）",
+                            step.id
+                        )));
+                    }
+                }
                 merged.status = step.status;
                 // **引擎记过事实的步骤，evidence 不能被模型复述覆盖。**
                 //
@@ -2006,6 +2155,20 @@ pub fn validate_plan_v2(
                 check_args_against_schema(step.id, tool, args)?;
                 validate_criteria(step.id, tool, args)?;
             }
+        } else if step.kind == StepKind::Tool
+            && let Some(tool) = step.tool
+        {
+            // 工具步没写 args，等于执行期拿一个空对象去调：有必填参数的工具
+            // 必然失败，而且失败在「参数」这一档（不可重试、进失败指纹）。
+            let required = crate::ai::tool_required_names(tool);
+            if !required.is_empty() {
+                return Err(CoreError::validation(format!(
+                    "第 {} 步是工具步但没写 args：{} 至少需要 {}",
+                    step.id,
+                    tool.as_str(),
+                    required.join(" / ")
+                )));
+            }
         }
 
         let expect = step.expect.as_deref().map(str::trim).unwrap_or("");
@@ -2069,6 +2232,16 @@ fn validate_criteria(
             "第 {step_id} 步的 criteria 只对 email_search 有意义（它是给检索用的）"
         )));
     }
+    // 判据组与普通条件互斥：混写时执行期只认判据，另一套条件会被静默丢掉。
+    let conflicts = conflicting_criteria_conditions(args);
+    if !conflicts.is_empty() {
+        return Err(CoreError::validation(format!(
+            "第 {step_id} 步的 args 把 criteria 和 {} 混写了：判据自己带条件，\
+再叠一层普通条件会被忽略（执行期只认 criteria）。请只留 criteria（条数用 limit 控制），\
+或者删掉 criteria 改用普通条件。",
+            conflicts.join(" / ")
+        )));
+    }
     Ok(())
 }
 
@@ -2102,9 +2275,25 @@ fn check_args_against_schema(
             )));
         }
     }
+    // 必填参数：**schema 说必填的，计划期就得有**。
+    //
+    // 以前这里只查键名，于是 `mail_read` 不带 `message_id`、`calendar_update`
+    // 不带 `event_id` 都能一路通过计划，到执行期才报错；而参数错误不可重试、
+    // 还会被记进失败指纹，模型就被堵在一条走不通的路上（2026-11-09 天气事故同形）。
+    // 值允许是 `$1.message_id` 这类引用，所以只要求键在、且不是 null。
+    for key in crate::ai::tool_required_names(tool) {
+        if map.get(&key).is_none_or(serde_json::Value::is_null) {
+            return Err(CoreError::validation(format!(
+                "第 {step_id} 步的 args 缺少 {} 必填的 {key}：先把它算出来再写进这一步",
+                tool.as_str()
+            )));
+        }
+    }
     // 判据组本身就算「给了条件」——每条判据内部都是一组可执行条件。
+    //
+    // 注意这里**没有** `!map.is_empty()`：空 args 与「只给 limit」一样，
+    // 执行期都会报「至少需要一个检索条件」，计划期没理由放行。
     if tool == AiToolName::EmailSearch
-        && !map.is_empty()
         && !map.contains_key("criteria")
         && !EMAIL_SEARCH_CONDITIONS
             .iter()
@@ -2123,6 +2312,11 @@ fn check_args_against_schema(
 /// `criteria` 是判据组：它内部就是一组条件，所以它也算「给了条件」。
 /// 这里**没有** `important_only`——「什么算重要」由模型自己写成判据，
 /// 引擎不替它决定任何一种口径。
+///
+/// 这份清单同时是执行期「认识哪些参数」的来源（`me-sync` 的
+/// `email_search_arg_names` 由它派生），所以**加条件只改这里**：
+/// 以前两处各抄一份，`has_attachment` 就漏在了计划期——「找带附件的邮件」
+/// 这种完全合法的计划被拒，提示里还列不出这一项。
 pub const EMAIL_SEARCH_CONDITIONS: &[&str] = &[
     "query",
     "from",
@@ -2133,9 +2327,36 @@ pub const EMAIL_SEARCH_CONDITIONS: &[&str] = &[
     "folder",
     "unread_only",
     "flagged_only",
+    "has_attachment",
     "days",
     "criteria",
 ];
+
+/// `email_search` 的判据组与普通检索条件**不能混写**。
+///
+/// 执行期一旦发现 `criteria` 非空就直接走判据路径
+/// （`me-sync` 的 `email_search_by_criteria`），顶层的 `query` / `days` /
+/// `flagged_only` 这些参数**一个都不会用**，而且不报错——模型混写时，
+/// 用户拿到的结果比它以为的宽，界面上完全看不出来。
+///
+/// 返回冲突的键名（已排序）；空表示没有冲突。`limit` 不算冲突：
+/// 判据路径要用它控制条数。
+pub fn conflicting_criteria_conditions(args: &serde_json::Value) -> Vec<String> {
+    let Some(map) = args.as_object() else {
+        return Vec::new();
+    };
+    if !map.contains_key("criteria") {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = EMAIL_SEARCH_CONDITIONS
+        .iter()
+        .filter(|key| **key != "criteria")
+        .filter(|key| map.contains_key(**key))
+        .map(|key| (*key).to_string())
+        .collect();
+    out.sort();
+    out
+}
 
 /// 一次重列的输入（来自 SelfCheck，不是来自计划 JSON）。
 pub struct ReplanRequest<'a> {
@@ -2348,6 +2569,38 @@ mod tests {
         );
     }
 
+    /// `plan_update` 可以只回 id/status/evidence：标题沿用上一版。
+    ///
+    /// 2026-11-09 审计：工具描述写着「只能改状态与 evidence，不能改标题」，
+    /// 模型照这条只传 id/status/evidence 是最自然的写法，而标题当时是必填——
+    /// 于是「按说明写」反而被判「缺少标题」，还是一条不可重试的参数错误。
+    #[test]
+    fn title_can_be_omitted_when_updating() {
+        let first = validate_plan(
+            None,
+            &draft("目标", vec![step(1, "检索邮件", PlanStatus::Running)]),
+        )
+        .expect("首建");
+
+        let mut update = first.clone();
+        update.steps[0].title = String::new();
+        update.steps[0].status = PlanStatus::Done;
+        update.steps[0].evidence = Some("拿到 3 封".to_string());
+        let next = validate_plan(Some(&first), &update).expect("省略标题应当通过");
+        assert_eq!(next.steps[0].title, "检索邮件", "标题要沿用上一版");
+        assert_eq!(next.steps[0].status, PlanStatus::Done);
+        assert_eq!(next.steps[0].evidence.as_deref(), Some("拿到 3 封"));
+
+        // 首建时没有上一版可继承，标题仍然必填。
+        let err = validate_plan(None, &draft("目标", vec![step(1, "", PlanStatus::Pending)]))
+            .expect_err("首建缺标题要拒绝");
+        assert!(
+            err.user_message().contains("缺少标题"),
+            "{}",
+            err.user_message()
+        );
+    }
+
     #[test]
     fn status_cannot_go_backwards() {
         let first = validate_plan(
@@ -2378,6 +2631,326 @@ mod tests {
             "{}",
             err.user_message()
         );
+    }
+
+    #[test]
+    fn done_is_rejected_while_the_last_attempt_is_a_failure() {
+        // 2026-11-09：`weather_get` 报 invalid_args，模型用 plan_update 把这一步标成
+        // done，清单统计于是变成「1/1 步完成，0 步失败」——界面上一片祥和，实际没数据。
+        let mut plan = validate_plan_v2(
+            None,
+            &v2_draft(
+                "查天气",
+                vec![tool_step(
+                    1,
+                    "查天气",
+                    AiToolName::EmailSearch,
+                    json!({ "days": 7 }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("合法");
+        plan.record_attempt(
+            1,
+            AttemptOutcome::Failed(StepFailure::InvalidArgs {
+                detail: "请提供城市名".to_string(),
+            }),
+        );
+
+        let lie = draft("查天气", vec![step(1, "查天气", PlanStatus::Done)]);
+        let err = validate_plan(Some(&plan), &lie).expect_err("失败步不能标 done");
+        assert!(
+            err.user_message().contains("不能标成 done"),
+            "{}",
+            err.user_message()
+        );
+        assert!(
+            err.user_message().contains("请提供城市名"),
+            "要带上失败原因，模型才知道重试什么：{}",
+            err.user_message()
+        );
+
+        // 真的重试成功了，就当没失败过——成功回执会清掉 failure。
+        plan.record_attempt(
+            1,
+            AttemptOutcome::Done {
+                evidence: "双流 · 成都 · 四川省 天气".to_string(),
+            },
+        );
+        let merged = validate_plan(Some(&plan), &lie).expect("成功后可以标 done");
+        assert_eq!(merged.steps[0].status, PlanStatus::Done);
+        assert!(merged.steps[0].failure.is_none());
+    }
+
+    #[test]
+    fn plan_rejects_steps_missing_a_required_argument() {
+        // schema 里写着 required，计划期就得照着查。
+        // 以前只查「键名认不认识」：`mail_read` 不带 message_id 也能通过计划，
+        // 到执行期才报错，而参数错误不可重试、还会进失败指纹——路直接堵死。
+        let err = validate_plan_v2(
+            None,
+            &v2_draft(
+                "读正文",
+                vec![tool_step(1, "读正文", AiToolName::MailRead, json!({}))],
+            ),
+            &allowed(),
+        )
+        .expect_err("缺少 message_id 应当被拒");
+        assert!(
+            err.user_message().contains("message_id"),
+            "要点名缺的是哪个参数：{}",
+            err.user_message()
+        );
+
+        // 写上了就通过（值可以是 `$1.message_id` 这类引用，所以只查键在不在）。
+        validate_plan_v2(
+            None,
+            &v2_draft(
+                "读正文",
+                vec![tool_step(
+                    1,
+                    "读正文",
+                    AiToolName::MailRead,
+                    json!({ "message_id": "$1.message_id" }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("带必填参数的计划应当通过");
+    }
+
+    #[test]
+    fn plan_accepts_has_attachment_as_the_only_condition() {
+        // 2026-11-09：`has_attachment` 只写在执行期的参数表里，计划期的条件清单漏了它，
+        // 于是「找带附件的邮件」这种完全合法的计划被拒，报错里还列不出这一项。
+        validate_plan_v2(
+            None,
+            &v2_draft(
+                "找带附件的邮件",
+                vec![tool_step(
+                    1,
+                    "找带附件的邮件",
+                    AiToolName::EmailSearch,
+                    json!({ "has_attachment": true }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("只有 has_attachment 也算给了条件");
+
+        // 反过来：一个条件都没有（空 args）在执行期必然被拒，计划期不该放行。
+        let err = validate_plan_v2(
+            None,
+            &v2_draft(
+                "找邮件",
+                vec![tool_step(1, "找邮件", AiToolName::EmailSearch, json!({}))],
+            ),
+            &allowed(),
+        )
+        .expect_err("空 args 应当被拒");
+        assert!(
+            err.user_message().contains("缺少检索条件"),
+            "{}",
+            err.user_message()
+        );
+    }
+
+    #[test]
+    fn conflicting_criteria_conditions_names_only_plain_conditions() {
+        // 判据 + limit：合法组合（limit 控制条数，不是条件）。
+        assert!(
+            conflicting_criteria_conditions(&json!({
+                "limit": 5,
+                "criteria": [{ "label": "已星标", "flagged_only": true }]
+            }))
+            .is_empty()
+        );
+        // 判据 + 普通条件：点名冲突项，且排序稳定（便于测试与日志阅读）。
+        assert_eq!(
+            conflicting_criteria_conditions(&json!({
+                "criteria": [{ "label": "已星标", "flagged_only": true }],
+                "query": "发票",
+                "days": 7
+            })),
+            vec!["days".to_string(), "query".to_string()]
+        );
+        // 没有 criteria：永远不冲突。
+        assert!(conflicting_criteria_conditions(&json!({ "days": 7 })).is_empty());
+    }
+
+    #[test]
+    fn plan_rejects_criteria_mixed_with_plain_conditions() {
+        // 2026-11-09 审计：执行期一看到 `criteria` 就整条走判据路径，顶层的
+        // `query` / `days` / `flagged_only` **一个都不用，也不报错**。
+        // 模型混写时用户拿到的结果比它以为的宽，界面上完全看不出来。
+        let err = validate_plan_v2(
+            None,
+            &v2_draft(
+                "找重要邮件",
+                vec![tool_step(
+                    1,
+                    "找重要邮件",
+                    AiToolName::EmailSearch,
+                    json!({
+                        "days": 7,
+                        "criteria": [{ "label": "已星标", "flagged_only": true }]
+                    }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect_err("criteria 与普通条件混写应当被拒");
+        assert!(
+            err.user_message().contains("criteria") && err.user_message().contains("days"),
+            "报错要点名冲突的条件：{}",
+            err.user_message()
+        );
+
+        // `limit` 不算冲突：判据路径要用它控制条数。
+        validate_plan_v2(
+            None,
+            &v2_draft(
+                "找重要邮件",
+                vec![tool_step(
+                    1,
+                    "找重要邮件",
+                    AiToolName::EmailSearch,
+                    json!({
+                        "limit": 5,
+                        "criteria": [{ "label": "已星标", "flagged_only": true }]
+                    }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("只带 limit 不算混写");
+    }
+
+    /// 计划期就要接受 `mode`：等到执行期才发现字段不认，等于白花一次调用。
+    #[test]
+    fn plan_accepts_criteria_with_mode() {
+        validate_plan_v2(
+            None,
+            &v2_draft(
+                "最近一个月里优先看星标的邮件",
+                vec![tool_step(
+                    1,
+                    "按范围与优先级检索",
+                    AiToolName::EmailSearch,
+                    json!({
+                        "criteria": [
+                            { "label": "近 30 天", "mode": "must", "days": 30 },
+                            { "label": "已星标", "mode": "boost", "flagged_only": true }
+                        ]
+                    }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("mode 是合法字段");
+    }
+
+    #[test]
+    fn plan_allows_weather_without_a_location() {
+        // weather_get 的 location / location_id 都是可选的：不给就按默认关注地点查
+        // （2026-11-09 的兜底）。计划期不能把它当成「缺必填」拦下来。
+        validate_plan_v2(
+            None,
+            &v2_draft(
+                "查天气",
+                vec![tool_step(
+                    1,
+                    "查天气",
+                    AiToolName::WeatherGet,
+                    json!({ "days": 3 }),
+                )],
+            ),
+            &[
+                AiToolName::EmailSearch,
+                AiToolName::MailRead,
+                AiToolName::WeatherGet,
+            ],
+        )
+        .expect("没给地点是合法的：引擎会按默认地点兜底");
+    }
+
+    /// 工具步标 done，必须真有这一轮的执行回执。
+    ///
+    /// 2026-11-10 的实测：模型要建「下周五交材料」的日程，`calendar_create`
+    /// 一次都没调，却在 `plan_update` 里把这一步标成 done，还编了一句
+    /// 「成功创建日程: event_id=1」。清单全绿，库里没有这条日程——
+    /// 用户以为事情已经安排好了，实际什么都没发生。
+    #[test]
+    fn tool_step_cannot_be_done_without_an_attempt() {
+        let first = validate_plan_v2(
+            None,
+            &v2_draft(
+                "检索邮件",
+                vec![tool_step(
+                    1,
+                    "检索邮件",
+                    AiToolName::EmailSearch,
+                    json!({ "days": 7 }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("首建");
+
+        // 模型一步都没跑，直接汇报完成。
+        let mut update = draft("", vec![step(1, "检索邮件", PlanStatus::Done)]);
+        update.steps[0].evidence = Some("已检索到 4 封".to_string());
+        let err = validate_plan(Some(&first), &update).expect_err("没有回执不能标 done");
+        assert!(
+            err.user_message().contains("一次都没执行过"),
+            "要说明是「没执行」而不是含糊的参数错：{}",
+            err.user_message()
+        );
+    }
+
+    /// 引擎记过一次尝试后，模型把这一步标 done 是正常路径——不能误伤。
+    #[test]
+    fn tool_step_with_an_attempt_can_be_marked_done() {
+        let mut first = validate_plan_v2(
+            None,
+            &v2_draft(
+                "检索邮件",
+                vec![tool_step(
+                    1,
+                    "检索邮件",
+                    AiToolName::EmailSearch,
+                    json!({ "days": 7 }),
+                )],
+            ),
+            &allowed(),
+        )
+        .expect("首建");
+        // 模拟引擎执行后的状态：有回执、有尝试次数。
+        first.steps[0].status = PlanStatus::Running;
+        first.steps[0].attempts = 1;
+        first.steps[0].evidence = Some("检索到 4 封".to_string());
+
+        let mut update = draft("", vec![step(1, "检索邮件", PlanStatus::Done)]);
+        update.steps[0].evidence = Some("命中 4 封".to_string());
+        let merged = validate_plan(Some(&first), &update).expect("有回执就该放行");
+        assert_eq!(merged.steps[0].status, PlanStatus::Done);
+    }
+
+    /// 推理步不受「必须有执行回执」约束：它本来就不调工具。
+    #[test]
+    fn reason_step_may_be_done_without_an_attempt() {
+        let first = validate_plan_v2(
+            None,
+            &v2_draft("比较两城气温", vec![reason_step(1, "给出结论")]),
+            &allowed(),
+        )
+        .expect("首建");
+
+        let mut update = draft("", vec![step(1, "给出结论", PlanStatus::Done)]);
+        update.steps[0].kind = StepKind::Reason;
+        let merged = validate_plan(Some(&first), &update).expect("推理步不该被这条规则挡住");
+        assert_eq!(merged.steps[0].status, PlanStatus::Done);
     }
 
     #[test]
@@ -3435,6 +4008,74 @@ mod tests {
             .collect();
         let err = parse_criteria(&json!({ "criteria": items })).expect_err("要拒");
         assert!(err.to_string().contains("上限"), "{err}");
+    }
+
+    /// 判据的两种角色：不写 `mode` 就是 `boost`（老行为，并集 + 排序），
+    /// 写 `must` 才变成「必须满足」。`mode` 本身不是检索条件。
+    ///
+    /// 这条测试守的是**向后兼容**：老模型不写 mode，行为必须与改造前一致，
+    /// 否则「升级即变差」。
+    #[test]
+    fn criteria_mode_defaults_to_boost_and_must_is_explicit() {
+        let parsed = parse_criteria(&json!({
+            "criteria": [
+                {"label": "近 30 天", "days": 30},
+                {"label": "已星标", "mode": "must", "flagged_only": true}
+            ]
+        }))
+        .expect("要解析成功");
+        assert_eq!(parsed[0].mode, CriterionMode::Boost, "不写 mode 就是 boost");
+        assert_eq!(parsed[1].mode, CriterionMode::Must);
+        // mode 不能被当成检索条件带进去：带进去执行期会拿它去搜「must」。
+        assert!(
+            !parsed[1].query.as_object().unwrap().contains_key("mode"),
+            "{:?}",
+            parsed[1].query
+        );
+        assert_eq!(parsed[1].query["flagged_only"], true);
+    }
+
+    /// `mode` 写错要当场拒，并点名可用值——执行期才发现要白花一次调用。
+    #[test]
+    fn criteria_with_unknown_mode_is_rejected() {
+        let err = parse_criteria(&json!({
+            "criteria": [{"label": "已星标", "mode": "required", "flagged_only": true}]
+        }))
+        .expect_err("要拒");
+        let text = err.to_string();
+        assert!(text.contains("must"), "{text}");
+        assert!(text.contains("boost"), "{text}");
+    }
+
+    /// 放宽时先丢 boost、后丢 must：丢 boost 只丢顺序，丢 must 才会变宽。
+    #[test]
+    fn relax_drops_boost_before_must() {
+        let widened = relax_args(&json!({
+            "criteria": [
+                {"label": "近 30 天", "mode": "must", "days": 30},
+                {"label": "已星标", "flagged_only": true},
+                {"label": "未读", "unread_only": true}
+            ]
+        }))
+        .expect("可放宽");
+        let items = widened["criteria"].as_array().expect("还有判据");
+        assert_eq!(items.len(), 2, "{widened}");
+        assert!(
+            items.iter().any(|item| item["mode"] == "must"),
+            "范围不能被先丢掉：{widened}"
+        );
+
+        // 只剩一条 boost 时去它没有意义（范围由 must 决定），改去 must。
+        let widened = relax_args(&json!({
+            "criteria": [
+                {"label": "近 30 天", "mode": "must", "days": 30},
+                {"label": "已星标", "flagged_only": true}
+            ]
+        }))
+        .expect("可放宽");
+        let items = widened["criteria"].as_array().expect("还有判据");
+        assert_eq!(items.len(), 1, "{widened}");
+        assert_eq!(items[0]["label"], "已星标", "该丢的是 must：{widened}");
     }
 
     /// 判据组的放宽：**去掉最宽的那一条**。
