@@ -538,7 +538,18 @@ async fn both_sides_changed_creates_conflict_copy() {
         .expect("conflict copy");
     assert_eq!(copy.sync_state, DraftSyncState::Conflict);
     assert!(copy.subject.as_deref().unwrap().starts_with("[冲突副本]"));
-    let copy_raw = cache::read_draft_raw(&paths, copy.id).unwrap().unwrap();
+    // 这条断言守的是**顺序**，不只是内容：`create_conflict` 必须先把副本（含原文文件）
+    // 落盘，再把原草稿标成 Conflict。反过来写的话，`wait_until` 一看到 Conflict 就返回，
+    // 而副本文件可能还没写完——CI 的慢 IO 上就抓到了这个窗口（原先是裸 unwrap 到 None，
+    // panic 信息只说「在 541 行」，完全看不出是竞态）。
+    let copy_raw = cache::read_draft_raw(&paths, copy.id)
+        .expect("读冲突副本原文")
+        .unwrap_or_else(|| {
+            panic!(
+                "原草稿已标记冲突，但副本原文还没落盘：把 `create_conflict` 的顺序改回\
+「先标状态、后建副本」就会这样，UI 在这段窗口里点「保留两份」会直接失败"
+            )
+        });
     assert!(String::from_utf8_lossy(&copy_raw).contains("server v2 body"));
 
     // 「保留两份」：冲突副本转为独立本地草稿，进入普通列表。

@@ -675,19 +675,33 @@ where
         local_hash: &str,
     ) -> Result<(), CoreError> {
         let server_hash = snapshot_hash(server.snapshot);
-        self.bind_synced(
-            local.id,
-            server.uid,
-            server.uid_validity,
-            local_hash,
-            &server_hash,
-        )
-        .await?;
-        let local_id = local.id;
-        self.db(move |s| s.set_draft_sync_state(local_id, DraftSyncState::Conflict, None))
-            .await?;
+        // 顺序是**先落副本、再标冲突**，反过来会留下一个真实的坏状态：
+        // 「原草稿已 Conflict，但副本文件还没写完」。UI 收到 `DraftConflictDetected`
+        // 就弹「已保留两份（副本 X）」，用户点进去却读不到原文；点「保留两份」时
+        // `resolve_conflict` 读副本原文得到 None，直接报「冲突副本原文缺失」。
+        // CI 上 `spawn_blocking` 与 DB 往返都比本机慢，这个窗口被
+        // `draft_sync_mock::both_sides_changed_creates_conflict_copy` 抓到了。
         let copy = self
             .create_conflict_copy_from_snapshot(account, local.id, server.snapshot, server.raw)
+            .await?;
+        // 基线对齐到「服务器版本」，但**不发 Synced 事件**：它只是中间态，
+        // 发出去只会让界面闪一下 Synced → Conflict。
+        let local_id = local.id;
+        let local_hash = local_hash.to_string();
+        let server_uid = server.uid;
+        let uid_validity = server.uid_validity;
+        let baseline_server = server_hash;
+        self.db(move |s| {
+            s.mark_draft_synced(
+                local_id,
+                Some(server_uid),
+                Some(uid_validity),
+                &local_hash,
+                &baseline_server,
+            )
+        })
+        .await?;
+        self.db(move |s| s.set_draft_sync_state(local_id, DraftSyncState::Conflict, None))
             .await?;
         self.emit_draft_state(local.id, DraftSyncState::Conflict, None)
             .await;
