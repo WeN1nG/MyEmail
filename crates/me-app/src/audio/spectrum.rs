@@ -140,8 +140,10 @@ impl Fft {
         debug_assert_eq!(re.len(), n);
         debug_assert_eq!(im.len(), n);
 
-        for i in 0..n {
-            let j = self.rev[i];
+        // 逐项取位反转表：用 `enumerate` 而不是 `0..n` 再索引，
+        // 否则 clippy 的 `needless_range_loop` 会在 CI 的新 stable 上报错
+        // （本机 1.99 还没有这条 lint，属于工具链漂移）。
+        for (i, &j) in self.rev.iter().enumerate().take(n) {
             if i < j {
                 re.swap(i, j);
                 im.swap(i, j);
