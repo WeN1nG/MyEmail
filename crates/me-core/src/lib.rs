@@ -164,6 +164,11 @@ pub mod settings_key {
     /// 写成功时——简报是「每天最多一次」的行为，宁可某天因为网络失败少一份，
     /// 也不能因为重试而在同一天连开几个会话。
     pub const AI_DAILY_BRIEFING: &str = "ai_daily_briefing";
+    /// 用户自定义的每日简报提示词；**空或缺失表示使用内置默认**。
+    ///
+    /// 存的是**用户原文**，不做归一化：默认提示词将来会改，而「用户改过的版本」
+    /// 不该跟着一起变。真要跟随默认，用户点「恢复默认」把这份清空即可。
+    pub const AI_DAILY_BRIEFING_PROMPT: &str = "ai_daily_briefing_prompt";
     /// AI 功能开关（`doc/v03架构设计.md` D26）。
     ///
     /// **预留键，v0.3 未接线**，与 [`FEATURE_CALENDAR`] 同状态：无读取方、

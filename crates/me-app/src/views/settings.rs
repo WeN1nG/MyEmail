@@ -17,6 +17,19 @@ fn page_scroll_area() -> egui::ScrollArea {
         .auto_shrink([false, false])
 }
 
+/// 简报提示词弹窗的初值：已自定义就用用户原文，否则用内置默认。
+///
+/// 默认值也填进输入框（而不是留空 + 占位提示）：用户点「修改」时要能看见
+/// 实际会发出去的那份提示词，才判断得出该「加一句」还是「整段重写」。
+pub(crate) fn daily_briefing_text(state: &UiState) -> String {
+    let custom = state.daily_briefing_prompt.trim();
+    if custom.is_empty() {
+        me_core::ai::DAILY_BRIEFING_PROMPT.to_string()
+    } else {
+        custom.to_string()
+    }
+}
+
 pub fn show(
     state: &mut UiState,
     commands: &mut Vec<Command>,
@@ -30,6 +43,35 @@ pub fn show(
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("AI 服务").strong());
             crate::views::ai::settings_section(state, commands, ui);
+        });
+
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("每日简报").strong());
+            ui.horizontal(|ui| {
+                let custom = state.daily_briefing_prompt.trim();
+                let (badge, color) = if custom.is_empty() {
+                    ("当前：内置默认提示词".to_string(), Color32::GRAY)
+                } else {
+                    (
+                        format!("当前：已自定义（{} 字）", custom.chars().count()),
+                        Color32::from_rgb(120, 170, 240),
+                    )
+                };
+                ui.label(RichText::new(badge).small().color(color));
+                if ui.button("修改").clicked() {
+                    state.daily_briefing_draft = daily_briefing_text(state);
+                    state.dialog = Dialog::DailyBriefingPrompt;
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "每天第一次启动时，AI 会自己发一份简报。提示词里写清要哪几段、\
+                     每段怎么呈现即可；留空或用「恢复默认」就回到内置版本。",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
         });
 
         ui.add_space(8.0);
@@ -434,6 +476,90 @@ pub fn open_path(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 跑一帧设置页，收集绘制出来的文本。
+    fn settings_texts(state: &mut UiState) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut texts = Vec::new();
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    show(state, &mut Vec::new(), None, ui);
+                });
+            });
+            for clipped in &output.shapes {
+                collect_texts(&clipped.shape, &mut texts);
+            }
+        }
+        texts
+    }
+
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_texts(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 设置页必须有「每日简报」这一栏，并且状态如实反映「默认还是自定义」。
+    ///
+    /// 只看有没有「修改」按钮不够：用户最需要知道的是「我现在用的是哪一份」。
+    #[test]
+    fn daily_briefing_row_reports_default_and_custom_state() {
+        let mut state = UiState::default();
+        let texts = settings_texts(&mut state);
+        assert!(
+            texts.iter().any(|text| text.contains("每日简报")),
+            "设置页要有「每日简报」一栏：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "修改"),
+            "要有「修改」按钮：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("内置默认")),
+            "未自定义时要说明用的是默认：{texts:?}"
+        );
+
+        let mut custom = UiState {
+            daily_briefing_prompt: "只列三封最重要的邮件".to_string(),
+            ..Default::default()
+        };
+        let texts = settings_texts(&mut custom);
+        assert!(
+            texts.iter().any(|text| text.contains("已自定义")),
+            "自定义后要显示「已自定义」：{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("内置默认")),
+            "自定义后不该再说「内置默认」：{texts:?}"
+        );
+    }
+
+    /// 弹窗初值：已自定义读用户的，否则读内置默认。
+    #[test]
+    fn daily_briefing_text_follows_the_saved_value() {
+        let mut state = UiState::default();
+        assert_eq!(
+            daily_briefing_text(&state),
+            me_core::ai::DAILY_BRIEFING_PROMPT,
+            "没自定义时弹窗里要显示实际会发出去的那份默认提示词"
+        );
+        state.daily_briefing_prompt = "  看邮件  ".to_string();
+        assert_eq!(daily_briefing_text(&state), "看邮件", "首尾空白要去掉");
+    }
 
     #[test]
     fn page_scroll_area_reaches_right_edge() {

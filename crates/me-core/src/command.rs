@@ -336,6 +336,13 @@ pub enum Command {
     /// 界面只负责「启动后问一次」，重复启动、同一天开两次都不会多出一份。
     /// 没有可用模型 / 未确认隐私 / 没有 key 时静默跳过——启动阶段不该弹错误。
     GenerateDailyAiBriefing,
+    /// 保存用户自定义的每日简报提示词；**空串表示恢复内置默认**。
+    ///
+    /// 只写 `meta`，不发事件：设置页在提交时已经乐观更新，启动时的回显由
+    /// `Event::SettingsLoaded` 负责。存原文（不归一化），下次发起简报时再 trim。
+    SetDailyBriefingPrompt {
+        prompt: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,6 +527,11 @@ pub enum Event {
         /// 音乐目录；`None` 表示尚未选择。
         music_dir: Option<PathBuf>,
         music_order: MusicOrder,
+        /// 用户自定义的每日简报提示词；**空串表示使用内置默认**。
+        ///
+        /// 空串而不是 `Option`：设置页要拿它做输入框初值，`String` 少一层解包；
+        /// 「是否自定义」用 `is_empty()` 判断即可。
+        daily_briefing_prompt: String,
     },
     /// 附件缓存目录已迁移到新位置；旧文件已搬移、数据库路径已更新。
     AttachmentDirChanged {
@@ -1186,6 +1198,7 @@ mod tests {
             attachment_dir: PathBuf::from("C:/data/attach"),
             music_dir: Some(PathBuf::from("C:/music")),
             music_order: MusicOrder::Shuffle,
+            daily_briefing_prompt: String::new(),
         };
         let json = serde_json::to_string(&settings).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();

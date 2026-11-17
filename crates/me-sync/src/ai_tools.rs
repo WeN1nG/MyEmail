@@ -174,10 +174,15 @@ pub(crate) fn intercepted_result(
 }
 
 /// 模型在参数里声明的步骤号。非法值按「没写」处理——绑定失败不该拒绝执行。
+///
+/// `2` 与 `"2"` 都认：模型经常把数字写成字符串，绑定失败会让回执记到错误的格子上。
 fn call_step_id(call: &AiToolCall) -> Option<u8> {
     call.arguments
         .get("step_id")
-        .and_then(Value::as_u64)
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            other => scalar_text(other).and_then(|text| text.trim().parse::<u64>().ok()),
+        })
         .and_then(|value| u8::try_from(value).ok())
         .filter(|value| *value >= 1)
 }
@@ -247,7 +252,15 @@ pub(crate) fn phase_rejected_result(
 /// 1. 参数里的 `step_id`，且该步确实是这一步工具；
 /// 2. `motive` 里写的「第 N 步」；
 /// 3. 第一个「同一个工具、还没结束」的步；
-/// 4. 第一个「还没结束」的工具步。
+/// 4. 第一个「还没结束」的工具步；
+/// 5. 同一个工具、**已经因为次数用尽被判失败**的步。
+///
+/// 第 5 级是 2026-11-12 加的：`MAX_STEP_ATTEMPTS` 用尽会把该步置成终态 `failed`，
+/// 而模型往往在最后一次尝试之后才凑对参数。旧实现不再绑定这种步，于是
+/// 「确实查到了，但清单永远显示失败」——`plan_update` 又因为终态不可改而被拒，
+/// 模型被锁在一个它自己解不开的状态里（那次简报就是这么交的白卷）。
+/// 绑定到 failed 步不是「复活」，只是把真实回执记到它该在的那一格：
+/// 成功走 `record_attempts(Done)` 会把状态与 failure 一起刷新。
 pub(crate) fn bind_step(plan: &Plan, call: &AiToolCall, motive: &Option<String>) -> Option<u8> {
     let usable = |id: u8| {
         plan.step(id)
@@ -264,7 +277,8 @@ pub(crate) fn bind_step(plan: &Plan, call: &AiToolCall, motive: &Option<String>)
     {
         return Some(id);
     }
-    plan.steps
+    if let Some(id) = plan
+        .steps
         .iter()
         .filter(|step| step.is_tool_step() && !step.status.is_terminal())
         .find(|step| step.tool == Some(call.name))
@@ -272,6 +286,16 @@ pub(crate) fn bind_step(plan: &Plan, call: &AiToolCall, motive: &Option<String>)
             plan.steps
                 .iter()
                 .find(|step| step.is_tool_step() && !step.status.is_terminal())
+        })
+        .map(|step| step.id)
+    {
+        return Some(id);
+    }
+    // 只剩「次数用尽」的失败步：仍要绑，否则成功回执无处可写。
+    plan.steps
+        .iter()
+        .find(|step| {
+            step.is_tool_step() && step.status == PlanStatus::Failed && step.tool == Some(call.name)
         })
         .map(|step| step.id)
 }
@@ -420,8 +444,38 @@ where
     }
 }
 
+/// 把任意 JSON 标量读成文本：字符串原样，数字 / 布尔转成字面量。
+///
+/// 模型并不总是遵守 schema 的类型。2026-11-12 的「每日简报」会话里，
+/// 它把 `days` 写成 `"7"`、`unread_only` 写成 `"True"`（Python 风格）——
+/// 而旧实现只认 `as_str()`，于是这些参数被**静默丢弃**、退回默认值：
+/// 不报错也不生效，比报错更难查（`unread_only` 丢了就等于检索全部邮件）。
+fn scalar_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+/// 报错用的一句话描述：让模型看见「它给的是什么」。
+///
+/// 只说「需要数字」而不说「收到 `"1"`（字符串）」，模型会以为它已经写对了
+/// （它看到的就是 `1`），于是原样重交——这是同一句话被拒绝三次的成因。
+fn describe_json(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => "（没写）".to_string(),
+        Some(Value::String(text)) => {
+            format!("字符串「{}」", truncate_chars(text, 40))
+        }
+        Some(other) => truncate_chars(&other.to_string(), 40),
+    }
+}
+
 fn arg_str(args: &Value, key: &str, max: usize) -> Option<String> {
-    let value = args.get(key)?.as_str()?.trim();
+    let value = scalar_text(args.get(key)?)?;
+    let value = value.trim();
     if value.is_empty() {
         return None;
     }
@@ -480,12 +534,33 @@ fn reject_unknown_email_args(args: &Value) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// 整数参数：`7` 与 `"7"` 都认。判不出来就当没传（由调用方用自己的默认值）。
 fn arg_u32(args: &Value, key: &str) -> Option<u32> {
-    args.get(key)?.as_u64().map(|value| value as u32)
+    let value = args.get(key)?;
+    let number = match value {
+        Value::Number(number) => number.as_u64()?,
+        other => scalar_text(other)?.trim().parse::<u64>().ok()?,
+    };
+    u32::try_from(number).ok()
 }
 
+/// 布尔参数：`true` / `"true"` / `"True"` / `1` / `"yes"` 都算真。
+///
+/// 旧实现只认 `as_bool()`，模型写 `"true"` 时参数被静默丢掉、
+/// `unread_only` 退回默认值——用户以为只看未读，实际拿到的是全部邮件。
 fn arg_bool(args: &Value, key: &str) -> Option<bool> {
-    args.get(key)?.as_bool()
+    let value = args.get(key)?;
+    if let Some(flag) = value.as_bool() {
+        return Some(flag);
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number != 0);
+    }
+    match scalar_text(value)?.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "y" | "1" => Some(true),
+        "false" | "no" | "n" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn arg_date(args: &Value, key: &str) -> Option<i64> {
@@ -494,7 +569,15 @@ fn arg_date(args: &Value, key: &str) -> Option<i64> {
     Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp())
 }
 
-/// 解析日程时间：带时区的 RFC 3339，或全天事件的 `YYYY-MM-DD`。
+/// 解析日程时间。
+///
+/// 宽松优先级：RFC 3339 → 带时区但**省略秒** → 无时区（按本地时区）→ 纯日期。
+///
+/// 为什么必须宽松：`2026-11-12T00:00+08:00` 是完全合法的 ISO-8601（只是省了秒），
+/// 但 [`chrono::DateTime::parse_from_rfc3339`] 要求秒，会把它判成非法。
+/// 2026-11-12 的「每日简报」会话里，模型正是被这一点连着拒了三次：
+/// 第一次 `T00:00` 被拒（确实没时区），第二次补上 `+08:00` 仍被拒，
+/// 而错误文案只说「需要带时区」——模型看不出真正缺的是**秒**，只能继续猜。
 fn parse_when(raw: &str, all_day: bool) -> Option<i64> {
     let raw = raw.trim();
     if all_day && raw.len() == 10 {
@@ -504,11 +587,46 @@ fn parse_when(raw: &str, all_day: bool) -> Option<i64> {
     if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
         return Some(parsed.timestamp());
     }
-    // 允许 `2026-11-06T15:00:00+08:00` 之外的常见写法：带空格但有时区。
-    if let Ok(parsed) = chrono::DateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%:z") {
-        return Some(parsed.timestamp());
+    // 带时区、秒可省；T 与空格两种写法都认。
+    for format in [
+        "%Y-%m-%dT%H:%M:%S%:z",
+        "%Y-%m-%dT%H:%M%:z",
+        "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%d %H:%M%:z",
+    ] {
+        if let Ok(parsed) = chrono::DateTime::parse_from_str(raw, format) {
+            return Some(parsed.timestamp());
+        }
     }
-    None
+    // 无时区：按**本地时区**解释。用户说「明天 9 点」指的就是本地 9 点，
+    // 之前一律判非法只是把补时区的活推回给了模型。
+    for format in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, format) {
+            return naive
+                .and_local_timezone(chrono::Local)
+                .single()
+                .map(|parsed| parsed.timestamp());
+        }
+    }
+    let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok()?;
+    date.and_hms_opt(0, 0, 0)?
+        .and_local_timezone(chrono::Local)
+        .single()
+        .map(|parsed| parsed.timestamp())
+}
+
+/// 时间参数解析失败时的提示：给例子，不给形容词。
+fn when_error(field: &str, raw: &str) -> CoreError {
+    CoreError::validation(format!(
+        "{field} 的时间看不懂：「{}」。请写成带时区的 ISO-8601（例：2026-11-12T09:00:00+08:00，\
+秒可省；也接受不带时区的 2026-11-12T09:00 或纯日期 2026-11-12）",
+        truncate_chars(raw, 40)
+    ))
 }
 
 impl<S, F, M> SyncService<S, F, M>
@@ -885,14 +1003,12 @@ where
         }
 
         if messages.is_empty() {
-            return Ok((
-                "本地缓存中 0 命中。可尝试：① 放宽时间窗（例如最近 30 天）；\
-② 去掉 flagged_only / unread_only 这类限定；③ 换发件人或主题关键词；\
-④ 一封都没有时提示用户先同步最近的邮件。\
-**不要用完全相同的参数再查一次**——同样的条件只会得到同样的结果。"
-                    .to_string(),
-                "未找到（0 命中）".to_string(),
-            ));
+            let hint = self
+                .empty_result_hint(reason_from.as_deref(), reason_subject.as_deref())
+                .await;
+            // summary 必须保留「未找到 / 0 命中」字样：`is_empty_result` 靠它判定
+            // 「成功但空」，改掉会让这一步被当成正常完成，引擎不再放宽条件。
+            return Ok((hint, "未找到（0 命中）".to_string()));
         }
 
         let mut text = format!(
@@ -1104,13 +1220,23 @@ where
                     )
                 }
             };
+            // 发件人可能是「写法不对」而不是「没有这个人」：把库里真实存在的
+            // 相近发件人一并给出，模型才不会拿同一个词换个拼写反复试。
+            let from_hint = criteria
+                .iter()
+                .find_map(|criterion| criterion.query.get("from"))
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let candidates = self.similar_senders(&from_hint, 5).await;
             return Ok((
                 format!(
                     "按 {} 条判据检索，本地缓存中 0 命中：{}。{blocker}\
 可尝试：① 放宽判据里的时间窗；② 去掉某条 must 判据；③ 提示用户先同步最近的邮件。\
-**不要用完全相同的参数再查一次**——同样的条件只会得到同样的结果。",
+**不要用完全相同的参数再查一次**——同样的条件只会得到同样的结果。{}",
                     criteria.len(),
-                    detail.join("、")
+                    detail.join("、"),
+                    sender_candidate_block(&candidates)
                 ),
                 "未找到（0 命中）".to_string(),
             ));
@@ -1208,8 +1334,12 @@ where
 days / folder / unread_only / flagged_only / has_attachment",
             ));
         }
-        // `from` 允许写人名：先按实体注册表换成邮箱；换不到就按原文做子串匹配
-        // （`from_addr` 里存的是 `Name <addr>`，姓名本身也能命中）。
+        // `from` 允许写人名：只在**实体表精确命中**时才换成邮箱，否则原样交给
+        // 存储层的子串/归一化匹配。
+        //
+        // 别在这里"帮忙"把 `Wang Tao` 猜成某个地址：猜错等于把用户的一句话
+        // 改成另一个人，而且会绕开 `from_addr OR from_name` 与归一化匹配——
+        // 那两条路本来能命中，被替换后反而查不到（v4debug01.md D9 的附带约束）。
         if let Some(raw) = from.clone() {
             from = Some(self.resolve_from_filter(raw).await);
         }
@@ -1366,13 +1496,11 @@ days / folder / unread_only / flagged_only / has_attachment",
         }
         let args = &call.arguments;
         let from = match arg_str(args, "from", 40) {
-            Some(raw) => parse_when(&raw, false)
-                .ok_or_else(|| CoreError::validation("from 需要带时区的 ISO-8601 时间"))?,
+            Some(raw) => parse_when(&raw, false).ok_or_else(|| when_error("from", &raw))?,
             None => start_of_today(),
         };
         let to = match arg_str(args, "to", 40) {
-            Some(raw) => parse_when(&raw, false)
-                .ok_or_else(|| CoreError::validation("to 需要带时区的 ISO-8601 时间"))?,
+            Some(raw) => parse_when(&raw, false).ok_or_else(|| when_error("to", &raw))?,
             None => from + 7 * 86_400,
         };
         if to <= from {
@@ -1447,13 +1575,11 @@ days / folder / unread_only / flagged_only / has_attachment",
 
         let all_day = arg_bool(args, "all_day").unwrap_or(existing.all_day);
         let start_utc = match arg_str(args, "start", 40) {
-            Some(raw) => parse_when(&raw, all_day)
-                .ok_or_else(|| CoreError::validation("start 需要带时区的 ISO-8601 时间"))?,
+            Some(raw) => parse_when(&raw, all_day).ok_or_else(|| when_error("start", &raw))?,
             None => existing.start_utc,
         };
         let end_utc = match arg_str(args, "end", 40) {
-            Some(raw) => parse_when(&raw, all_day)
-                .ok_or_else(|| CoreError::validation("end 需要带时区的 ISO-8601 时间"))?,
+            Some(raw) => parse_when(&raw, all_day).ok_or_else(|| when_error("end", &raw))?,
             None => existing.end_utc.max(start_utc),
         };
         if end_utc < start_utc {
@@ -1831,10 +1957,10 @@ days / folder / unread_only / flagged_only / has_attachment",
             arg_str(args, "start", 64).ok_or_else(|| CoreError::validation("缺少开始时间"))?;
         let end_raw =
             arg_str(args, "end", 64).ok_or_else(|| CoreError::validation("缺少结束时间"))?;
-        let start_utc = parse_when(&start_raw, all_day)
-            .ok_or_else(|| CoreError::validation("开始时间格式不正确（需要带时区的 ISO-8601）"))?;
-        let mut end_utc = parse_when(&end_raw, all_day)
-            .ok_or_else(|| CoreError::validation("结束时间格式不正确（需要带时区的 ISO-8601）"))?;
+        let start_utc =
+            parse_when(&start_raw, all_day).ok_or_else(|| when_error("start", &start_raw))?;
+        let mut end_utc =
+            parse_when(&end_raw, all_day).ok_or_else(|| when_error("end", &end_raw))?;
         if all_day && end_utc <= start_utc {
             end_utc = start_utc + 86_400;
         }
@@ -1997,6 +2123,40 @@ days / folder / unread_only / flagged_only / has_attachment",
     // -----------------------------------------------------------------------
     // 辅助：检索条件解析与工具结果自动登记
     // -----------------------------------------------------------------------
+
+    /// 0 命中时的回执：先给「怎么放宽」，再给「库里真实存在的相近发件人」。
+    ///
+    /// 后者是这次事故的直接教训：模型手上一份名单都没有，只能拿 `wangtao`
+    /// 换个拼写反复试，两轮追问里打了 13 次 `email_search`。
+    async fn empty_result_hint(&self, from: Option<&str>, subject: Option<&str>) -> String {
+        let mut text = "本地缓存中 0 命中。可尝试：① 放宽时间窗（例如最近 30 天）；\
+② 去掉 flagged_only / unread_only 这类限定；③ 换发件人或主题关键词；\
+④ 一封都没有时提示用户先同步最近的邮件。\
+**不要用完全相同的参数再查一次**——同样的条件只会得到同样的结果。"
+            .to_string();
+        let seed = from.or(subject).unwrap_or_default();
+        let candidates = self.similar_senders(seed, 5).await;
+        text.push_str(&sender_candidate_block(&candidates));
+        text
+    }
+
+    /// 用归一化 token 在缓存里的发件人中找相近的几位。
+    ///
+    /// 只挑「至少命中一个 token」的，不整库下发：200 个发件人 × 邮箱会把每轮
+    /// 输入预算吃掉一大块。一个都不像时返回空，宁可不说也不凑数。
+    async fn similar_senders(&self, raw: &str, limit: usize) -> Vec<me_core::port::SenderSummary> {
+        let tokens: Vec<String> = me_core::model::split_sender_tokens(raw)
+            .iter()
+            .map(|token| me_core::model::normalize_sender_key(token))
+            .filter(|token| token.chars().count() >= me_core::model::MIN_SENDER_TOKEN_CHARS)
+            .collect();
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        // 80 条足够覆盖个人邮箱的真实规模；再多也只是把候选池撑大。
+        let all = self.db(|s| s.senders(80)).await.unwrap_or_default();
+        pick_similar_senders(all, &tokens, limit)
+    }
 
     /// `from` 允许写人名：命中实体且带邮箱时换成邮箱，否则原样返回。
     async fn resolve_from_filter(&self, raw: String) -> String {
@@ -2229,16 +2389,40 @@ done/failed/skipped 并写一句 evidence（拿到了什么）。{summary}{repai
     }
 }
 
+/// 计划步骤号：`1`、`"1"` 都认，`"1.0"` / 缺失 / 越界都退回一句能照做的提示。
+///
+/// 2026-11-12 的「每日简报」会话：模型把 id 写成字符串，`as_u64()` 直接给 None，
+/// 而报错只说「每一步都需要数字 id」——它看到的原文就是 `1`，以为已经写对，
+/// 于是同一份清单一字不改又交了一次。错误里必须带上**收到的原值**。
+fn plan_step_id(value: &Value) -> Result<u8, CoreError> {
+    let raw = value.get("id");
+    let Some(raw) = raw else {
+        return Err(CoreError::validation(
+            "这一步缺少 id（1–8 的数字），例：{\"id\": 1, \"title\": \"…\"}",
+        ));
+    };
+    let number = match raw {
+        Value::Number(number) => number.as_u64(),
+        other => scalar_text(other).and_then(|text| text.trim().parse::<u64>().ok()),
+    };
+    let Some(number) = number else {
+        return Err(CoreError::validation(format!(
+            "步骤 id 必须是 1–8 的数字，收到的是 {}。例：{{\"id\": 1, \"title\": \"…\"}}",
+            describe_json(Some(raw))
+        )));
+    };
+    u8::try_from(number)
+        .ok()
+        .filter(|id| (1..=8).contains(id))
+        .ok_or_else(|| CoreError::validation(format!("步骤编号必须在 1–8 之间（收到 {number}）")))
+}
+
 /// 把 `plan_update` 的一个 step 对象转成领域类型。
 ///
 /// 错误信息要**点名是哪一步的哪个字段**：模型收到的 `is_error` 工具结果里
 /// 只有这句话，含糊的「参数错误」会让它原样重试一次。
 fn plan_step_from_json(value: &Value) -> Result<PlanStep, CoreError> {
-    let id = value
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| CoreError::validation("每一步都需要数字 id（1–8）"))?;
-    let id = u8::try_from(id).map_err(|_| CoreError::validation("步骤编号必须在 1–8 之间"))?;
+    let id = plan_step_id(value)?;
 
     // 缺失或非法都记成 `general`：合并时若旧步有具体领域，会沿用旧步的，
     // 所以模型在 `plan_update` 里不写 capability 也不会被拒。
@@ -2287,11 +2471,7 @@ fn plan_step_from_json(value: &Value) -> Result<PlanStep, CoreError> {
 /// 的契约），这个要接受 kind/tool/args/expect/on_empty。混用一个函数会让
 /// `plan_update` 不小心也能改工具与参数——那等于绕过了「重列才换方案」的约束。
 fn plan_step_v2_from_json(value: &Value) -> Result<PlanStep, CoreError> {
-    let id = value
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| CoreError::validation("每一步都需要数字 id（1–8）"))?;
-    let id = u8::try_from(id).map_err(|_| CoreError::validation("步骤编号必须在 1–8 之间"))?;
+    let id = plan_step_id(value)?;
 
     let title = value
         .get("title")
@@ -2532,8 +2712,12 @@ fn format_message(index: usize, message: &MessageSummary, folder: Option<String>
     } else {
         format!(" · {}", tags.join(" · "))
     };
+    // `[id=…]` 是**回执里唯一可指认的锚点**：没有它，模型拿不到 `mail_read`
+    // 需要的 `message_id`，只能换关键词反复搜；简报的引用对账也没有可校验的东西。
+    // 行尾而不是行首：模型照抄时不易把它当成列表序号（见 v4debug01.md D1）。
+    let id = message.id.0;
     format!(
-        "{index}. [{date}] {flag}{subject} — {from}{tags}\n   {snippet}",
+        "{index}. [{date}] {flag}{subject} — {from}{tags} [id={id}]\n   {snippet}",
         from = message
             .from
             .as_ref()
@@ -2541,6 +2725,53 @@ fn format_message(index: usize, message: &MessageSummary, folder: Option<String>
             .unwrap_or_else(|| "(未知发件人)".to_string()),
         snippet = truncate_chars(&snippet, 300)
     )
+}
+
+/// 从候选池里挑出与 token 相近的发件人。
+///
+/// 排序：命中 token 越多越靠前 → 邮件数越多越靠前 → 其余保持库内顺序
+/// （`senders()` 按最近来信倒序）。
+fn pick_similar_senders(
+    all: Vec<me_core::port::SenderSummary>,
+    tokens: &[String],
+    limit: usize,
+) -> Vec<me_core::port::SenderSummary> {
+    let mut scored: Vec<(usize, me_core::port::SenderSummary)> = all
+        .into_iter()
+        .filter_map(|sender| {
+            let hay = me_core::model::normalize_sender_key(&format!(
+                "{} {}",
+                sender.display, sender.addr
+            ));
+            let hits = tokens
+                .iter()
+                .filter(|token| hay.contains(token.as_str()))
+                .count();
+            (hits > 0).then_some((hits, sender))
+        })
+        .collect();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then(right.1.count.cmp(&left.1.count)));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, sender)| sender)
+        .collect()
+}
+
+/// 把候选发件人写成回执里的那一段；没有候选时返回空串（不占位置）。
+fn sender_candidate_block(candidates: &[me_core::port::SenderSummary]) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("\n本地缓存里相近的发件人（要用就照抄地址重查）：\n");
+    for sender in candidates {
+        text.push_str(&format!(
+            "- {} <{}>（{} 封）\n",
+            sender.display, sender.addr, sender.count
+        ));
+    }
+    text.push_str("都对不上就如实告诉用户「库里没有这个人」，不要按主题猜一封出来。\n");
+    text
 }
 
 fn format_weather(
@@ -2623,6 +2854,122 @@ mod tests {
         }
         assert!(runtime.contains(&"limit"), "limit 仍然要能写");
         assert!(schema.contains(&"limit".to_string()));
+    }
+
+    /// 省略秒的 ISO-8601 必须能解析。
+    ///
+    /// 2026-11-12 的「每日简报」：模型给 `2026-11-12T00:00+08:00`——完全合法，
+    /// 只是省了秒——被 `parse_from_rfc3339` 判非法，而错误文案只说「需要带时区」。
+    /// 它于是在时区上改了两轮，第三次改用纯日期，三次尝试全废。
+    #[test]
+    fn parse_when_accepts_iso8601_without_seconds() {
+        let full = parse_when("2026-11-12T00:00:00+08:00", false).expect("完整写法");
+        assert_eq!(
+            parse_when("2026-11-12T00:00+08:00", false),
+            Some(full),
+            "省略秒要认"
+        );
+        assert_eq!(
+            parse_when("2026-11-12 00:00+08:00", false),
+            Some(full),
+            "空格分隔也要认"
+        );
+        let local = parse_when("2026-11-12T00:00", false).expect("无时区按本地解释");
+        assert_eq!(
+            parse_when("2026-11-12", false),
+            Some(local),
+            "纯日期 = 本地当天 00:00"
+        );
+        assert!(
+            parse_when("明天上午", false).is_none(),
+            "真看不懂的仍要拒绝，别猜"
+        );
+    }
+
+    /// 字符串标量要认：模型经常把 `7` / `true` 写成 `"7"` / `"True"`。
+    ///
+    /// 旧实现静默返回 None，参数被丢掉、退回默认值——`unread_only` 丢了就等于
+    /// 检索全部邮件，比报错更难被发现。
+    #[test]
+    fn args_accept_string_scalars_from_chatty_models() {
+        let args = serde_json::json!({
+            "days": "7",
+            "unread_only": "True",
+            "limit": 20,
+            "all_day": "false",
+        });
+        assert_eq!(arg_u32(&args, "days"), Some(7), "字符串数字要认");
+        assert_eq!(arg_u32(&args, "limit"), Some(20), "原生数字照旧");
+        assert_eq!(
+            arg_bool(&args, "unread_only"),
+            Some(true),
+            "Python 风格的真值要认"
+        );
+        assert_eq!(arg_bool(&args, "all_day"), Some(false));
+        assert_eq!(
+            arg_str(&args, "days", 10).as_deref(),
+            Some("7"),
+            "arg_str 读数字也给文本"
+        );
+        assert_eq!(arg_u32(&args, "missing"), None);
+    }
+
+    /// 步骤号写成字符串要认；真读不出来时，错误里必须带上**收到的原值**。
+    ///
+    /// 「每一步都需要数字 id」这句话不带原值时，模型看到自己写的 `1` 会以为
+    /// 已经写对，于是原样重交——2026-11-12 的第一次 `plan_submit` 就是这样被拒的。
+    #[test]
+    fn plan_step_id_accepts_string_and_names_what_it_saw() {
+        assert_eq!(plan_step_id(&serde_json::json!({"id": 1})).ok(), Some(1));
+        assert_eq!(
+            plan_step_id(&serde_json::json!({"id": "2"})).ok(),
+            Some(2),
+            "字符串数字要认"
+        );
+        let err = plan_step_id(&serde_json::json!({"id": "第一步"})).expect_err("非数字要拒");
+        assert!(
+            err.user_message().contains("第一步"),
+            "错误要带上收到的原值：{}",
+            err.user_message()
+        );
+        assert!(
+            plan_step_id(&serde_json::json!({"id": 9})).is_err(),
+            "越界仍要拒"
+        );
+        assert!(
+            plan_step_id(&serde_json::json!({})).is_err(),
+            "缺 id 仍要拒"
+        );
+    }
+
+    /// 次数用尽的失败步仍要能接住**真实**回执。
+    ///
+    /// `MAX_STEP_ATTEMPTS` 用尽会把该步置成终态 `failed`，而模型常常在最后一次
+    /// 尝试之后才凑对参数（2026-11-12 的第 4 次 `calendar_list` 就成功了）。
+    /// 旧实现不再绑定这种步，于是「确实查到了，清单永远显示失败」，
+    /// `plan_update` 又因为终态不可改而被拒——模型被锁死在它自己解不开的状态里。
+    #[test]
+    fn bind_step_reclaims_a_step_whose_attempts_ran_out() {
+        let plan = Plan {
+            steps: vec![
+                PlanStep::new(1, "检索邮件", Capability::Mail, PlanStatus::Done)
+                    .with_tool(AiToolName::EmailSearch),
+                PlanStep::new(2, "查询日程", Capability::Calendar, PlanStatus::Failed)
+                    .with_tool(AiToolName::CalendarList),
+            ],
+            ..Plan::default()
+        };
+        let call = AiToolCall {
+            id: "c1".to_string(),
+            name: AiToolName::CalendarList,
+            arguments: serde_json::json!({}),
+            parse_ok: true,
+        };
+        assert_eq!(
+            bind_step(&plan, &call, &None),
+            Some(2),
+            "失败步要接住后来的成功回执"
+        );
     }
 
     /// 候选地点的同名判定：只认「完全相同」或「只差行政后缀」。
@@ -2892,5 +3239,74 @@ mod tests {
         let step = plan_step_from_json(&value).expect("不该报错");
         assert_eq!(step.capability, Capability::General);
         assert_eq!(step.status.as_str(), "done");
+    }
+
+    // -----------------------------------------------------------------------
+    // 回执里的邮件锚点与候选发件人（v4debug01 D1 / D9）
+    // -----------------------------------------------------------------------
+
+    fn summary(id: i64, subject: &str, name: &str, addr: &str) -> MessageSummary {
+        MessageSummary {
+            id: MessageId(id),
+            account: me_core::AccountId(1),
+            folder: me_core::FolderId(1),
+            uid: Some(1),
+            message_id: Some(format!("<{id}@example.com>")),
+            subject: Some(subject.to_string()),
+            from: Some(me_core::Address::new(Some(name.to_string()), addr)),
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: Some(1_762_000_000),
+            date_source: me_core::model::DateSource::Header,
+            size: Some(1024),
+            flags: Flags::SEEN,
+            snippet: Some("片段".to_string()),
+            has_attachment: false,
+            body_cached: false,
+            in_reply_to: None,
+            references: Vec::new(),
+        }
+    }
+
+    /// 回执必须带 `message_id`：`mail_read` 的唯一入参就是它，
+    /// 没有锚点模型只能换关键词反复搜（2026-11-17 那一轮打了 13 次）。
+    #[test]
+    fn email_search_result_carries_message_ids() {
+        let line = format_message(
+            1,
+            &summary(143, "检测到新登录", "Microsoft", "noreply@x.com"),
+            None,
+        );
+        assert!(line.contains("[id=143]"), "缺锚点：{line}");
+        // 锚点必须在第一行（摘要换行前），否则模型容易把它当成正文。
+        let head = line.lines().next().unwrap_or_default();
+        assert!(head.contains("[id=143]"), "锚点跑到片段里了：{line}");
+        // 汇总行不再带多余的空格变形，渲染层直接按 `[id=` 摘。
+        assert!(!line.contains("[id = "), "{line}");
+    }
+
+    #[test]
+    fn similar_senders_pick_by_token_overlap() {
+        let all = vec![
+            me_core::port::SenderSummary {
+                display: "Wang Tao".into(),
+                addr: "wangtao@example.com".into(),
+                count: 2,
+            },
+            me_core::port::SenderSummary {
+                display: "Li Ming".into(),
+                addr: "liming@example.com".into(),
+                count: 9,
+            },
+        ];
+        let tokens = vec![me_core::model::normalize_sender_key("wangtao")];
+        let picked = pick_similar_senders(all.clone(), &tokens, 5);
+        assert_eq!(picked.len(), 1, "只挑相近的，不整库下发");
+        assert_eq!(picked[0].addr, "wangtao@example.com");
+
+        // 一个都不像时返回空：宁可不说，也不凑数。
+        assert!(pick_similar_senders(all, &[String::from("zzz")], 5).is_empty());
+        // 没有候选时那段文字是空串，不给回执添空行。
+        assert!(sender_candidate_block(&[]).is_empty());
     }
 }

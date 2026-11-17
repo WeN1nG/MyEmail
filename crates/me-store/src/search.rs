@@ -7,7 +7,7 @@ use std::fs;
 
 use me_core::CoreError;
 use me_core::model::{FolderId, SearchQuery};
-use me_core::port::{SearchOutcome, SearchRepo};
+use me_core::port::{SearchOutcome, SearchRepo, SenderSummary};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, params, params_from_iter};
 
@@ -152,8 +152,49 @@ fn base_filters(query: &SearchQuery) -> (Vec<String>, Vec<SqlValue>) {
         Some(false) => parts.push("m.has_attachment = 0".to_string()),
         None => {}
     }
+    // 发件人单独处理：它要同时比地址、显示名，以及「去掉空格与标点」的归一化形态。
+    //
+    // 三层各修一个真实故障（见 doc/versiondoc/v4debug01.md）：
+    // - 只查 `from_addr` → 按中文姓名永远 0 命中（显示名在 `from_name` 列）；
+    // - 原样子串 → `wangtao` 命中不了 `Wang Tao`，而那正是用户和模型最自然的写法；
+    // - 整串匹配 → `Tao Wang` 写得出来却搜不到，拆 token 取 AND 才两头都中。
+    if let Some(raw) = query
+        .from
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        for token in me_core::model::split_sender_tokens(raw) {
+            let pattern = format!("%{}%", escape_like(&token));
+            if token.chars().count() >= me_core::model::MIN_SENDER_TOKEN_CHARS {
+                let normalized = format!(
+                    "%{}%",
+                    escape_like(&me_core::model::normalize_sender_key(&token))
+                );
+                parts.push(
+                    "(m.from_addr LIKE ? ESCAPE '\\' OR m.from_name LIKE ? ESCAPE '\\' \
+                      OR replace(replace(replace(lower(m.from_addr), ' ', ''), '.', ''), '-', '') \
+                         LIKE ? ESCAPE '\\' \
+                      OR replace(replace(replace(lower(m.from_name), ' ', ''), '.', ''), '-', '') \
+                         LIKE ? ESCAPE '\\')"
+                        .to_string(),
+                );
+                values.push(SqlValue::Text(pattern.clone()));
+                values.push(SqlValue::Text(pattern));
+                values.push(SqlValue::Text(normalized.clone()));
+                values.push(SqlValue::Text(normalized));
+            } else {
+                // 单字符 token 只走原样子串：归一化后一个字母能命中半个库。
+                parts.push(
+                    "(m.from_addr LIKE ? ESCAPE '\\' OR m.from_name LIKE ? ESCAPE '\\')"
+                        .to_string(),
+                );
+                values.push(SqlValue::Text(pattern.clone()));
+                values.push(SqlValue::Text(pattern));
+            }
+        }
+    }
     for (column, value) in [
-        ("m.from_addr", query.from.as_deref()),
         ("m.to_addrs", query.to.as_deref()),
         ("m.subject", query.subject.as_deref()),
     ] {
@@ -384,5 +425,37 @@ impl SearchRepo for WritableStore {
         }
         tx.commit().store()?;
         Ok(indexed)
+    }
+
+    fn senders(&self, limit: u32) -> Result<Vec<SenderSummary>, CoreError> {
+        let limit = limit.clamp(1, 200);
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT COALESCE(NULLIF(TRIM(from_name), ''), from_addr) AS display,
+                        from_addr,
+                        COUNT(*) AS n,
+                        MAX(date) AS last_seen
+                   FROM messages
+                  WHERE from_addr IS NOT NULL AND TRIM(from_addr) <> ''
+                  GROUP BY LOWER(from_addr)
+                  ORDER BY last_seen DESC
+                  LIMIT ?1",
+            )
+            .store()?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok(SenderSummary {
+                    display: row.get(0)?,
+                    addr: row.get(1)?,
+                    count: row.get::<_, i64>(2)?.clamp(0, i64::from(u32::MAX)) as u32,
+                })
+            })
+            .store()?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.store()?);
+        }
+        Ok(out)
     }
 }

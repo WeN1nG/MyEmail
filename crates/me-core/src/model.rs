@@ -1064,6 +1064,55 @@ impl SearchQuery {
     }
 }
 
+/// `from` 里一次最多拆几个词。
+///
+/// 再多只是把 SQL 撑长，不会更准：真实输入是「姓名」「姓名 + 公司」，
+/// 4 个 token 已经覆盖「Wang Tao <公司> <部门>」这种写法。
+pub const MAX_SENDER_TOKENS: usize = 4;
+
+/// 单 token 少于这个字符数就不做归一化比对。
+///
+/// 否则 `from:"a"` 会把半个邮箱库捞出来——归一化把空格和点都去掉之后，
+/// 一个字母几乎能命中任何地址。
+pub const MIN_SENDER_TOKEN_CHARS: usize = 2;
+
+/// 把发件人检索词拆成 token。
+///
+/// - 带 `@` 的当成**地址**，整串一个 token（拆开会把 `wangtao@example.com`
+///   拆成 `wangtao@example` + `com`，后半段几乎命中整个库）；
+/// - 不带 `@` 的当成**人名**，按空白 / 半角逗号 / 全角逗号 / 顿号 / 点 / 连字符拆。
+///   点与连字符也要拆：`tao.wang` 是「Tao Wang」的另一种写法，
+///   拆成 `tao` + `wang` 才能靠 AND 命中。
+///
+/// 多 token 之间取 **AND**（每个都要出现），这样 `Wang Tao` 与 `Tao Wang`
+/// 都能命中同一个人，而只叫 `Wang` 的另一个人不会被误捞。
+pub fn split_sender_tokens(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    if raw.contains('@') {
+        return vec![raw.to_string()];
+    }
+    raw.split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '，' | '、' | '.' | '-'))
+        .filter(|token| !token.is_empty())
+        .take(MAX_SENDER_TOKENS)
+        .map(str::to_string)
+        .collect()
+}
+
+/// 发件人比对用的归一化：小写 + 去掉空格 / 点 / 连字符。
+///
+/// `wangtao` ↔ `Wang Tao`、`tao.wang` ↔ `Tao Wang` 靠它对齐。
+/// **SQL 侧必须用同一组字符做 `replace`**（见 `me-store/src/search.rs`），
+/// 两边规则不一致等于没归一化。
+pub fn normalize_sender_key(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| !matches!(ch, ' ' | '.' | '-'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // 保存的搜索
 // ---------------------------------------------------------------------------

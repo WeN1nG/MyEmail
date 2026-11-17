@@ -598,6 +598,11 @@ pub enum AiToolName {
 }
 
 impl AiToolName {
+    /// 是不是「邮件类」工具：它们的回执里带 `cards`，也就是可对账的 id 集合。
+    pub fn is_email(self) -> bool {
+        matches!(self, AiToolName::EmailSearch | AiToolName::MailRead)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             AiToolName::EmailSearch => "email_search",
@@ -1601,8 +1606,12 @@ pub const DAILY_BRIEFING_PROMPT: &str = "\
 按下面四段给我一份今天的简报，每段都要来自工具回执：\
 \
 一、未读邮件：调用 email_search（unread_only=true，days=7）查未读。\
-按时间倒序最多列 5 封，每封一行「发件人 · 主题 · 时间」+ 一句要点；\
-广告、通知、验证码这类归并成一句「另有 N 封通知类」。一封都没有就直说没有。\
+按时间倒序最多列 5 封，每封一行「发件人 · 主题 · 时间 [id=编号]」+ 一句要点。\
+[id=编号] 里的编号必须**照抄**回执里那封信的 id，不许自己从 1 开始编号、不许猜；\
+发件人照抄回执原文（显示名与地址都算），不要翻译、改写，也不要把发件人换成回执里没有的人；\
+回执里没有链接字段，所以不要写「链接」或任何 URL。\
+广告、通知、验证码这类归并成一句「另有 N 封通知类」：N 必须等于该行列出的 [id=…] 个数，\
+一个 id 配一个名字，不许只写名字不写 id。一封都没有就直说没有。\
 \
 二、近三天日程：调用 calendar_list 查从今天 00:00 起三天内（含今天）的安排。\
 逐条写「时间 · 标题」，全天事件单独标出；时间冲突、或前后两件事间隔不到半小时，\
@@ -1617,6 +1626,290 @@ pub const DAILY_BRIEFING_PROMPT: &str = "\
 格式：四个小标题「未读邮件 / 近三天日程 / 近三天天气 / 今天要注意」，\
 中文短句，能用列表就用列表。工具取不到数据、或某一类本来就没有时，\
 直接写「没有」并说明原因，绝对不要编造邮件、日程或天气。";
+
+/// 自定义简报提示词的长度上限。
+///
+/// 450 字左右就能把默认那份覆盖完整（默认本身就约 430 字），2000 字足够写得更细，
+/// 又不至于把整轮请求的输入预算吃掉一大块——简报还要带工具 schema 与历史。
+pub const DAILY_BRIEFING_PROMPT_MAX_CHARS: usize = 2000;
+
+/// 本次生效的简报提示词：用户自定义优先，空则回退内置默认。
+///
+/// 只 `trim` 不改写内容：用户写什么就发什么（多行、列表、自己的分段都保留）。
+/// 超长截断而不是拒绝——用户不会因为多写了几个字就丢掉整份自定义。
+pub fn daily_briefing_prompt(custom: Option<&str>) -> String {
+    let custom = custom.map(str::trim).unwrap_or_default();
+    if custom.is_empty() {
+        return DAILY_BRIEFING_PROMPT.to_string();
+    }
+    truncate_chars(custom, DAILY_BRIEFING_PROMPT_MAX_CHARS)
+}
+
+// ---------------------------------------------------------------------------
+// 简报引用对账（防幻觉）
+// ---------------------------------------------------------------------------
+
+/// 未与回执对齐的行尾标记。渲染层**不摘它**——它是给用户看的结论。
+pub const VERIFY_MARK: &str = "（未核实）";
+
+/// 正文里 `[id=143]` 这类邮件锚点：返回 `(起始字节, 结束字节, 编号)`。
+///
+/// 允许 `[id = 143]` 这种空格变体：模型写标记时经常带空格，判太死会把
+/// 一条合格的引用误判成「没写 id」，进而让整段被标「未核实」。
+fn mail_id_spans(text: &str) -> Vec<(usize, usize, i64)> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        // 先比字节：`[` 是 ASCII，命中时 `index` 必然落在字符边界上，切片才安全。
+        if bytes[index] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 1;
+        while cursor < bytes.len() && bytes[cursor] == b' ' {
+            cursor += 1;
+        }
+        if !text[cursor..].starts_with("id") {
+            index += 1;
+            continue;
+        }
+        cursor += 2;
+        while cursor < bytes.len() && bytes[cursor] == b' ' {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            index += 1;
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor] == b' ' {
+            cursor += 1;
+        }
+        let digits = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor == digits {
+            index += 1;
+            continue;
+        }
+        let end_of_digits = cursor;
+        while cursor < bytes.len() && bytes[cursor] == b' ' {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b']' {
+            index += 1;
+            continue;
+        }
+        match text[digits..end_of_digits].parse::<i64>() {
+            Ok(id) => {
+                spans.push((index, cursor + 1, id));
+                index = cursor + 1;
+            }
+            Err(_) => index += 1,
+        }
+    }
+    spans
+}
+
+/// 把 `[id=143]` 从**展示文本**里摘掉。
+///
+/// **只用于渲染**：落库的正文必须保留原文——下一轮用户说「把那封打开」时，
+/// 历史里的 id 是模型直接调 `mail_read` 的唯一锚点。
+pub fn strip_mail_ids(text: &str) -> String {
+    let spans = mail_id_spans(text);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end, _) in spans {
+        out.push_str(&text[cursor..start]);
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// 邮件引用与工具回执的对账结果（只统计，不判断质量）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MailCitationAudit {
+    /// 带了 id 且能在本轮回执里找到的引用条数。
+    pub cited: usize,
+    /// 带了 id 但回执里没有这个 id 的条数（编造或记错）。
+    pub unknown: usize,
+    /// 是邮件行却完全没写 id 的条数（无法核对）。
+    pub unmarked: usize,
+    /// 「另有 N 封」这类归并句里，N 与该行 id 个数不符的次数。
+    pub mismatched: usize,
+}
+
+/// 把回复里**说到的邮件**与**本轮工具回执**对账。
+///
+/// 触发面是「这一轮调过邮件工具」，不是「这一轮是不是每日简报」。
+/// 2026-11-17 的两次事故刚好证明了这一点：第一次简报编了两封「Wang Tao」，
+/// 第二次（用户把提示词粘进输入框）把回执的 4 封数成「另有 3 封」——
+/// 后者因为 `insert_user=true` 被判成普通对话，一道校验都没跑。
+///
+/// 分两遍：
+/// 1. **全篇**：任何 `[id=…]` 都必须在本轮回执里；找不到就把锚点就地换成
+///    「（未核实）」。就地替换的好处是表格行不会被撑坏（行尾追加会破坏
+///    Markdown 表格）。「另有 N 封」的 N 必须等于该行列出的 id 个数
+///    （`甲-a` 口径：一个 id 配一封，只数字数会得到「数对、身份错」）。
+/// 2. **仅「未读邮件」段**：邮件行完全没写 id 时补标「（未核实）」。
+///    自然语言里没有稳定结构，全篇硬标必然误伤（模型合理改写主题就中招）。
+///
+/// 本轮没查过邮件（`allowed` 为空）时原样返回：没有回执就没有可比对的事实。
+pub fn align_email_citations(
+    content: &str,
+    receipts: &[AiToolTrace],
+) -> (String, MailCitationAudit) {
+    let allowed: std::collections::HashSet<i64> = receipts
+        .iter()
+        .filter(|trace| trace.tool.is_email())
+        .flat_map(|trace| trace.cards.iter().map(|card| card.message.0))
+        .collect();
+    if allowed.is_empty() {
+        return (content.to_string(), MailCitationAudit::default());
+    }
+
+    let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+    let mut audit = MailCitationAudit::default();
+    let mut touched = false;
+    // 已经被就地标过的行：第二遍不再重复计数。
+    let mut marked: Vec<bool> = vec![false; lines.len()];
+
+    // 第一遍：全篇扫锚点与归并句（不限简报）。
+    for (index, line) in lines.iter_mut().enumerate() {
+        let spans = mail_id_spans(line);
+        if !spans.is_empty() {
+            let mut out = String::with_capacity(line.len());
+            let mut cursor = 0;
+            let mut replaced = false;
+            for (start, end, id) in &spans {
+                out.push_str(&line[cursor..*start]);
+                if allowed.contains(id) {
+                    audit.cited += 1;
+                    out.push_str(&line[*start..*end]);
+                } else {
+                    audit.unknown += 1;
+                    replaced = true;
+                    // 锚点前通常是「主题 · 时间 」，先收掉空格再落标记，
+                    // 免得变成「实习申请 （未核实）」。
+                    while out.ends_with(' ') {
+                        out.pop();
+                    }
+                    out.push_str(VERIFY_MARK);
+                }
+                cursor = *end;
+            }
+            out.push_str(&line[cursor..]);
+            if replaced {
+                *line = out;
+                marked[index] = true;
+                touched = true;
+            }
+        }
+
+        // 归并句：`另有 N 封…` 的 N 必须等于这一行列出的 id 个数。
+        if let Some(claimed) = merged_mail_count(line)
+            && claimed != mail_id_spans(line).len()
+        {
+            audit.mismatched += 1;
+            if !line.trim_end().ends_with(VERIFY_MARK) {
+                *line = format!("{}{}", line.trim_end(), VERIFY_MARK);
+                touched = true;
+            }
+            marked[index] = true;
+        }
+    }
+
+    // 第二遍：只在「未读邮件」段里给「没写 id 的邮件行」补标记。
+    if let Some(head) = lines.iter().position(|line| line.contains("未读邮件")) {
+        let tail = lines
+            .iter()
+            .enumerate()
+            .skip(head + 1)
+            .find(|(_, line)| {
+                ["近三天日程", "近三天天气", "今天要注意"]
+                    .iter()
+                    .any(|heading| line.contains(heading))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(lines.len());
+
+        let mut bare: Vec<usize> = Vec::new();
+        for index in (head + 1)..tail {
+            if marked[index] || !is_mail_line(&lines[index]) {
+                continue;
+            }
+            if mail_id_spans(&lines[index]).is_empty() && merged_mail_count(&lines[index]).is_none()
+            {
+                bare.push(index);
+            }
+        }
+        audit.unmarked = bare.len();
+
+        if audit.cited > 0 {
+            for index in bare {
+                lines[index] = format!("{}{}", lines[index].trim_end(), VERIFY_MARK);
+                touched = true;
+            }
+        } else if audit.unmarked > 0 {
+            // 整段一条都没对上（自定义提示词没要求写 id 时就这样）：
+            // 逐行标会变成满屏「未核实」，只加一句说明。
+            lines.insert(
+                tail,
+                "（本段未能与本轮检索回执对齐，内容未核实）".to_string(),
+            );
+            touched = true;
+        }
+    }
+
+    if !touched {
+        return (content.to_string(), audit);
+    }
+    (lines.join("\n"), audit)
+}
+
+/// 归并句里的封数：`另有 3 封通知类` → `Some(3)`。
+///
+/// 只认「另有」开头的归并句。它两次都是编造的藏身处（「另有 2 封」实际 3 封、
+/// 「另有 3 封」实际 0 封），所以值得单独解析。
+fn merged_mail_count(line: &str) -> Option<usize> {
+    let rest = line.split_once("另有")?.1;
+    let start = rest.find(|ch: char| ch.is_ascii_digit())?;
+    let digits: String = rest[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let after = &rest[start + digits.len()..];
+    if !after.trim_start().starts_with('封') {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// 一封邮件在回复里可能长成的「行」：列表符号、引用块、表格行、有序列表。
+///
+/// 不把 `>` 与 `|` 算进来会漏掉最脏的位置——`> 另有 3 封通知类` 正是
+/// 2026-11-17 第二份简报里编造的那行。
+fn is_mail_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("• ")
+        || trimmed.starts_with("· ")
+        || trimmed.starts_with('>')
+        || trimmed.starts_with('|')
+    {
+        return true;
+    }
+    trimmed.split_once(". ").is_some_and(|(ordinal, _)| {
+        !ordinal.is_empty() && ordinal.chars().all(|ch| ch.is_ascii_digit())
+    })
+}
 
 /// 本地日期戳 `YYYY-MM-DD`，用于「每天只做一次」这类持久标记。
 ///
@@ -2457,6 +2750,203 @@ pub fn tool_specs(permissions: &AiToolPermissions) -> Vec<AiToolSpec> {
         .collect()
 }
 
+/// 一次参数归一化的记录。只给日志与排障用，不进 `tool_trace`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoercedArg {
+    /// 参数路径，如 `steps[0].id`、`all_day`。
+    pub path: String,
+    /// 修正前的 JSON 文本（已截断）。
+    pub from: String,
+}
+
+/// 按工具 schema 把模型给的参数强制成声明的类型。
+///
+/// 模型（尤其非 OpenAI 系）并不遵守 `"type": "integer"`：它会把 `7` 写成 `"7"`、
+/// 把 `true` 写成 `"True"`。每个工具各写一遍容错既容易漏、也管不住新加的工具，
+/// 所以统一在**调用进入引擎的那一刻**做一次 schema 驱动的强制转换：
+/// 之后读参数、算指纹、落 trace 看到的都是同一份干净值。
+///
+/// 只改类型、不改语义：认不出来的原样留着，交给各自的参数校验报错
+/// （「差一点」的自动修，真写错的仍然要拒绝）。
+///
+/// `plan_submit` 额外处理一层：它的 `steps[].args` 是自由对象，schema 里没有
+/// properties，得按该步声明的 `tool` 取对应工具的 schema 再归一化一次。
+pub fn coerce_tool_arguments(tool: AiToolName, args: &Value) -> (Value, Vec<CoercedArg>) {
+    let mut out = args.clone();
+    let mut fixed = Vec::new();
+    let Some(spec) = TOOL_SPECS.iter().find(|spec| spec.name == tool) else {
+        return (out, fixed);
+    };
+    coerce_against_schema(&spec.input_schema, &mut out, "", &mut fixed);
+    if tool == AiToolName::PlanSubmit {
+        coerce_plan_step_args(&mut out, &mut fixed);
+    }
+    (out, fixed)
+}
+
+/// 递归按 schema 归一化。只走 schema 声明过的字段：`additionalProperties: false`
+/// 之下多出来的键要留给原有校验去点名，这里动它只会让错误更难懂。
+fn coerce_against_schema(
+    schema: &Value,
+    value: &mut Value,
+    path: &str,
+    fixed: &mut Vec<CoercedArg>,
+) {
+    let kind = schema.get("type").and_then(Value::as_str);
+    match kind {
+        Some("object") => {
+            let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+                return;
+            };
+            let Some(map) = value.as_object_mut() else {
+                return;
+            };
+            for (key, sub_schema) in properties {
+                let Some(sub_value) = map.get_mut(key) else {
+                    continue;
+                };
+                let sub_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                coerce_against_schema(sub_schema, sub_value, &sub_path, fixed);
+            }
+        }
+        Some("array") => {
+            let Some(items) = schema.get("items") else {
+                return;
+            };
+            let Some(list) = value.as_array_mut() else {
+                return;
+            };
+            for (index, item) in list.iter_mut().enumerate() {
+                coerce_against_schema(items, item, &format!("{path}[{index}]"), fixed);
+            }
+        }
+        Some("integer") => {
+            if let Some(next) = as_json_integer(value) {
+                fixed.push(coerced_note(path, value));
+                *value = next;
+            }
+        }
+        Some("number") => {
+            if let Some(next) = as_json_number(value) {
+                fixed.push(coerced_note(path, value));
+                *value = next;
+            }
+        }
+        Some("boolean") => {
+            if let Some(next) = as_json_bool(value) {
+                fixed.push(coerced_note(path, value));
+                *value = next;
+            }
+        }
+        Some("string") => {
+            if let Some(next) = as_json_string(value) {
+                fixed.push(coerced_note(path, value));
+                *value = next;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn coerced_note(path: &str, value: &Value) -> CoercedArg {
+    CoercedArg {
+        path: path.to_string(),
+        from: truncate_chars(&value.to_string(), 40),
+    }
+}
+
+/// `"7"` / `"7.0"` → `7`；已经是整数就返回 `None`（无需修正）。
+///
+/// 布尔不换算成 0/1：那是语义替换，不是类型修正。
+fn as_json_integer(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) => {
+            let text = text.trim();
+            if let Ok(number) = text.parse::<i64>() {
+                return Some(Value::from(number));
+            }
+            let float = text.parse::<f64>().ok()?;
+            if float.fract() == 0.0 && float.is_finite() {
+                return Some(Value::from(float as i64));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `"1.5"` → `1.5`；整数按原样留着（JSON 数字本来就同时满足 integer/number）。
+fn as_json_number(value: &Value) -> Option<Value> {
+    let Value::String(text) = value else {
+        return None;
+    };
+    let number = text.trim().parse::<f64>().ok()?;
+    serde_json::Number::from_f64(number).map(Value::Number)
+}
+
+/// `"true"` / `"True"` / `"yes"` / `"1"` / `1` → `true`。
+fn as_json_bool(value: &Value) -> Option<Value> {
+    let flag = match value {
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "y" | "1" => true,
+            "false" | "no" | "n" | "0" => false,
+            _ => return None,
+        },
+        Value::Number(number) => match number.as_i64() {
+            Some(0) => false,
+            Some(1) => true,
+            // 2 / 0.5 这类不属于布尔语义，别自作主张。
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(Value::Bool(flag))
+}
+
+/// `3` → `"3"`，`true` → `"true"`。
+fn as_json_string(value: &Value) -> Option<Value> {
+    match value {
+        Value::Number(number) => Some(Value::String(number.to_string())),
+        Value::Bool(flag) => Some(Value::String(flag.to_string())),
+        _ => None,
+    }
+}
+
+/// `plan_submit` 的 `steps[].args`：按这一步声明的工具取 schema 再归一化。
+///
+/// 不加这一层，模型在计划里写 `{"days":"7"}` 仍会在计划校验时被判参数错误——
+/// 而它执行时明明会用同一份参数，等于把「类型漂移」从执行期挪到了计划期。
+fn coerce_plan_step_args(plan: &mut Value, fixed: &mut Vec<CoercedArg>) {
+    let Some(steps) = plan.get_mut("steps").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (index, step) in steps.iter_mut().enumerate() {
+        let Some(tool) = step
+            .get("tool")
+            .and_then(Value::as_str)
+            .and_then(AiToolName::parse)
+        else {
+            continue;
+        };
+        let Some(spec) = TOOL_SPECS.iter().find(|spec| spec.name == tool) else {
+            continue;
+        };
+        let Some(args) = step.get_mut("args") else {
+            continue;
+        };
+        coerce_against_schema(
+            &spec.input_schema,
+            args,
+            &format!("steps[{index}].args"),
+            fixed,
+        );
+    }
+}
+
 /// PLAN 阶段下发的工具：**只有** `plan_submit` 与 `answer_directly`。
 ///
 /// 这是「强制清单」唯一真正可靠的实现方式：模型物理上没有 `email_search` 可调，
@@ -2959,6 +3449,89 @@ pub trait AiMemoryRepo {
 mod tests {
     use super::*;
 
+    /// 模型把 `true` 写成 `"True"`、把 `7` 写成 `"7"` 时，进入引擎就要被纠正。
+    ///
+    /// 不修的话每个工具都得自己容错：漏一处就是「参数静默丢失、退回默认值」，
+    /// 不报错也不生效（2026-11-12 的简报：`unread_only:"True"` 被丢掉，
+    /// 用户以为只看未读，实际拿到全部邮件）。
+    #[test]
+    fn coerce_arguments_fixes_type_drift() {
+        let args = json!({
+            "title": "复盘",
+            "start": "2026-11-12T09:00:00+08:00",
+            "end": "2026-11-12T10:00:00+08:00",
+            "all_day": "false",
+            "calendar_id": "3",
+            "reminders": ["10", 30]
+        });
+        let (out, fixed) = coerce_tool_arguments(AiToolName::CalendarCreate, &args);
+        assert_eq!(out["all_day"], json!(false));
+        assert_eq!(out["calendar_id"], json!(3));
+        assert_eq!(out["reminders"], json!([10, 30]));
+        assert_eq!(fixed.len(), 3, "三处修正都要记下来：{fixed:?}");
+        assert!(
+            fixed.iter().any(|item| item.path == "reminders[0]"),
+            "数组下标要写进路径：{fixed:?}"
+        );
+        // 只改副本：调用方手里的原值不能被悄悄动过。
+        assert_eq!(args["all_day"], json!("false"));
+    }
+
+    /// `plan_submit` 要穿透两层：步骤号，以及每个步骤声明的工具参数。
+    ///
+    /// 少了第二层，模型在计划里写 `{"days":"7"}` 会在**计划校验**被判参数错误，
+    /// 而它执行时用的正是同一份参数——等于把类型漂移从执行期挪到计划期。
+    #[test]
+    fn coerce_arguments_reaches_into_plan_steps() {
+        let args = json!({
+            "goal": "简报",
+            "steps": [
+                {
+                    "id": "1",
+                    "title": "查邮件",
+                    "kind": "tool",
+                    "tool": "email_search",
+                    "args": {"days": "7", "unread_only": "True"}
+                },
+                {
+                    "id": 2,
+                    "title": "归纳",
+                    "kind": "reason"
+                }
+            ]
+        });
+        let (out, fixed) = coerce_tool_arguments(AiToolName::PlanSubmit, &args);
+        assert_eq!(out["steps"][0]["id"], json!(1), "步骤号要变数字");
+        assert_eq!(out["steps"][0]["args"]["days"], json!(7));
+        assert_eq!(out["steps"][0]["args"]["unread_only"], json!(true));
+        assert!(
+            fixed.iter().any(|item| item.path == "steps[0].args.days"),
+            "路径要能指到嵌套参数：{fixed:?}"
+        );
+    }
+
+    /// 归一化只改类型、不猜语义：认不出来的原样留着，交给各自的校验去报错。
+    #[test]
+    fn coerce_arguments_leaves_real_mistakes_alone() {
+        let args = json!({
+            "title": "复盘",
+            "start": "下周三",
+            "end": "2026-11-12T10:00:00+08:00",
+            "all_day": "也许",
+            "calendar_id": 3,
+            "未知字段": "1"
+        });
+        let (out, fixed) = coerce_tool_arguments(AiToolName::CalendarCreate, &args);
+        assert_eq!(
+            out["start"],
+            json!("下周三"),
+            "看不懂的时间不该被猜成某个时刻"
+        );
+        assert_eq!(out["all_day"], json!("也许"), "读不出的布尔原样留着");
+        assert_eq!(out["未知字段"], json!("1"), "schema 没声明的字段不碰");
+        assert!(fixed.is_empty(), "没有可修的就不该记修正：{fixed:?}");
+    }
+
     /// 时间锚点必须带上**日期 + 星期 + 时区**三样。
     ///
     /// 2026-11-10 的实测：提示词里没有当前时间，模型自己编了三个「今天」
@@ -3032,6 +3605,35 @@ mod tests {
                 "简报提示词缺少「{needle}」"
             );
         }
+    }
+
+    /// 用户自定义优先；空 / 纯空白回退默认；超长截断而不是拒。
+    ///
+    /// 三件事分别对应设置页的三种状态：点过「保存」、点过「恢复默认」、
+    /// 以及写得太长。回退必须覆盖「纯空白」——用户全删了只留几个换行，
+    /// 若当成自定义发出去，模型会收到一段空白提示词。
+    #[test]
+    fn daily_briefing_prompt_prefers_custom_text() {
+        assert_eq!(daily_briefing_prompt(None), DAILY_BRIEFING_PROMPT);
+        assert_eq!(
+            daily_briefing_prompt(Some("  \n\t ")),
+            DAILY_BRIEFING_PROMPT,
+            "纯空白要回退默认，不能发一段空提示词给模型"
+        );
+        assert_eq!(
+            daily_briefing_prompt(Some("只列三封最重要的邮件")),
+            "只列三封最重要的邮件"
+        );
+        let trimmed = daily_briefing_prompt(Some("  看邮件  "));
+        assert_eq!(trimmed, "看邮件", "首尾空白要去掉，正文一个字不改");
+
+        let long: String = "雨".repeat(DAILY_BRIEFING_PROMPT_MAX_CHARS + 50);
+        let cut = daily_briefing_prompt(Some(&long));
+        assert_eq!(
+            cut.chars().count(),
+            DAILY_BRIEFING_PROMPT_MAX_CHARS + 1,
+            "截断后带一个省略号"
+        );
     }
 
     /// `[结果]` 判定要容得下模型加的装饰，否则引擎会重复追加一段。
@@ -4115,5 +4717,186 @@ mod tests {
         assert!(lessons_block(&[]).is_none());
         let block = lessons_block(&lessons).expect("有教训");
         assert!(block.contains("calendar_create"), "{block}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 简报引用对账
+    // -----------------------------------------------------------------------
+
+    fn mail_receipt(ids: &[i64]) -> AiToolTrace {
+        AiToolTrace {
+            call_id: "call_test".to_string(),
+            tool: AiToolName::EmailSearch,
+            status: AiToolStatus::Ok,
+            summary: "检索到 2 封".to_string(),
+            duration_ms: 1,
+            args: None,
+            motive: None,
+            motive_source: MotiveSource::Model,
+            step_id: None,
+            attempt: None,
+            cards: ids
+                .iter()
+                .map(|id| MailCardRef {
+                    message: MessageId(*id),
+                    reason: "近 7 天内".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// 简报的固定形状：四段小标题 + 列表。对账只碰第一段。
+    fn briefing(unread: &str) -> String {
+        format!("## 今日简报\n\n**未读邮件**\n{unread}\n**近三天日程**\n- 没有日程安排。\n")
+    }
+
+    #[test]
+    fn strip_mail_ids_removes_anchor_but_keeps_verify_mark() {
+        let text = "1. 淘米网络 · 校招 [id=150]（未核实）";
+        assert_eq!(strip_mail_ids(text), "1. 淘米网络 · 校招 （未核实）");
+        // 没有锚点时原样返回，不做任何替换。
+        assert_eq!(strip_mail_ids("普通正文"), "普通正文");
+        // 数字不是 id 的方括号不动。
+        assert_eq!(strip_mail_ids("[2026-11-16] 主题"), "[2026-11-16] 主题");
+    }
+
+    #[test]
+    fn align_keeps_cited_lines_untouched() {
+        let content = briefing(
+            "- 淘米网络 · 2027 校招启动 — 昨天 [id=150]\n- ChatGPT · 从这里开始 — 今天 [id=149]",
+        );
+        let (out, audit) = align_email_citations(&content, &[mail_receipt(&[150, 149])]);
+        assert_eq!(out, content, "全部命中时一个字都不该改");
+        assert_eq!(
+            audit,
+            MailCitationAudit {
+                cited: 2,
+                unknown: 0,
+                unmarked: 0,
+                mismatched: 0
+            }
+        );
+    }
+
+    /// 编造的邮件：锚点要删（留着像证据），行要留（不删用户能看到的内容）。
+    #[test]
+    fn align_marks_unknown_id_and_removes_anchor() {
+        let content = briefing("- Wang Tao · 实习申请 [id=999]\n- 淘米网络 · 校招 [id=150]");
+        let (out, audit) = align_email_citations(&content, &[mail_receipt(&[150])]);
+        assert!(out.contains("Wang Tao · 实习申请（未核实）"), "{out}");
+        assert!(!out.contains("[id=999]"), "假锚点必须删掉：{out}");
+        assert!(out.contains("[id=150]"), "真锚点不能被牵连：{out}");
+        assert_eq!(audit.cited, 1);
+        assert_eq!(audit.unknown, 1);
+    }
+
+    #[test]
+    fn align_marks_unmarked_mail_line() {
+        let content = briefing("- 淘米网络 · 校招 — 昨天\n- ChatGPT · 从这里开始 [id=149]");
+        let (out, audit) = align_email_citations(&content, &[mail_receipt(&[149])]);
+        assert!(out.contains("校招 — 昨天（未核实）"), "{out}");
+        assert_eq!(audit.unmarked, 1);
+        assert_eq!(audit.cited, 1);
+    }
+
+    /// 自定义提示词不要求写 id 时：整段都无锚点 → 只加一句，不逐行标。
+    #[test]
+    fn align_warns_once_when_no_ids_at_all() {
+        let content = briefing("- 淘米网络 · 校招 — 昨天\n- ChatGPT · 从这里开始 — 今天");
+        let (out, audit) = align_email_citations(&content, &[mail_receipt(&[150])]);
+        assert_eq!(out.matches(VERIFY_MARK).count(), 0, "不该逐行标：{out}");
+        assert!(out.contains("未能与本轮检索回执对齐"), "{out}");
+        assert_eq!(audit.unmarked, 2);
+    }
+
+    #[test]
+    fn align_is_noop_without_mail_receipts() {
+        let content = briefing("- 随便一条 [id=150]");
+        let (out, audit) = align_email_citations(&content, &[]);
+        assert_eq!(out, content, "本轮没查邮件就不该动正文");
+        assert_eq!(audit, MailCitationAudit::default());
+    }
+
+    /// 模型写 `[id = 150]`（带空格）仍算有效锚点。
+    #[test]
+    fn align_tolerates_spaced_ids() {
+        let content = briefing("- 淘米网络 · 校招 [id = 150]");
+        let (out, audit) = align_email_citations(&content, &[mail_receipt(&[150])]);
+        assert_eq!(out, content, "带空格的锚点也算写对了");
+        assert_eq!(audit.cited, 1);
+        assert_eq!(audit.unmarked, 0);
+    }
+
+    /// 没有「未读邮件」段也照样查假锚点：触发面是「这轮用过邮件工具」，
+    /// 不是「这轮是不是简报」。这正是 2026-11-17 第二次漏掉的那条路
+    /// （用户把简报提示词粘进输入框，`insert_user=true`）。
+    #[test]
+    fn align_cleans_unknown_ids_outside_briefing() {
+        let content = "库里没有这个人。顺带说一句，实习邮件在 [id=999] 里。";
+        let (out, audit) = align_email_citations(content, &[mail_receipt(&[150])]);
+        assert!(!out.contains("[id=999]"), "假锚点必须摘掉：{out}");
+        assert!(out.contains("实习邮件在（未核实）"), "{out}");
+        assert_eq!(audit.unknown, 1);
+        assert_eq!(audit.cited, 0);
+    }
+
+    /// 但普通对话里「没写 id」的行**不**补标——自然语言没有稳定结构，
+    /// 全篇硬标会把模型的合理复述判成编造。
+    #[test]
+    fn align_does_not_mark_bare_lines_outside_briefing() {
+        let content = "华勤技术一共两封，都是邀请更新应聘信息。";
+        let (out, audit) = align_email_citations(content, &[mail_receipt(&[150])]);
+        assert_eq!(out, content, "不该给普通句子加标记");
+        assert_eq!(audit, MailCitationAudit::default());
+    }
+
+    /// 第二份简报的实况：回执 4 封、4 封全列完了，却写「另有 3 封通知类」。
+    /// 这行是 blockquote，旧版 `is_bullet_line` 不认 `>`，整行逃过对账。
+    #[test]
+    fn align_marks_merged_count_mismatch() {
+        let content = briefing(
+            "1. ChatGPT · 从这里开始 [id=149]\n\
+             2. ChatGPT · 更少杂务 [id=147]\n\
+             3. Ollama · Inkling 2 Small [id=145]\n\
+             4. Microsoft · 检测到新登录 [id=143]\n\
+             > 另有 **3 封通知类**（均为 Junk 文件夹中的推广/产品更新邮件）。",
+        );
+        let (out, audit) = align_email_citations(&content, &[mail_receipt(&[149, 147, 145, 143])]);
+        assert_eq!(audit.cited, 4, "四封真邮件照旧算命中");
+        assert_eq!(audit.unknown, 0);
+        assert_eq!(audit.mismatched, 1, "3 封对不上该行的 0 个 id");
+        assert!(
+            out.contains("> 另有 **3 封通知类**") && out.contains(VERIFY_MARK),
+            "该行要留原文但补标记：{out}"
+        );
+    }
+
+    /// 归并句写对了就不动它：`另有 2 封：A [id=..]、B [id=..]`。
+    #[test]
+    fn align_accepts_merged_line_with_matching_ids() {
+        let content = briefing(
+            "1. Microsoft · 检测到新登录 [id=143]\n\
+             > 另有 2 封通知类：Ollama [id=145]、ChatGPT [id=149]",
+        );
+        let (out, audit) = align_email_citations(&content, &[mail_receipt(&[143, 145, 149])]);
+        assert_eq!(out, content, "数字与 id 个数一致，一个字都不该改");
+        assert_eq!(audit.mismatched, 0);
+        assert_eq!(audit.cited, 3);
+    }
+
+    /// 表格行里的假锚点就地替换，不能追加到行尾——追加会破坏 Markdown 表格。
+    #[test]
+    fn align_keeps_table_row_shape() {
+        let content =
+            "| 时间 | 发件人 · 主题 |\n|------|---------------|\n| 11-16 | 华勤 [id=999] |";
+        let (out, audit) = align_email_citations(content, &[mail_receipt(&[150])]);
+        let row = out.lines().last().expect("row");
+        assert!(
+            row.starts_with('|') && row.ends_with('|'),
+            "表格行结构要保住：{row}"
+        );
+        assert!(!row.contains("[id=999]"), "{row}");
+        assert!(row.contains(VERIFY_MARK), "{row}");
+        assert_eq!(audit.unknown, 1);
     }
 }

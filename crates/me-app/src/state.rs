@@ -359,6 +359,12 @@ pub struct UiState {
     pub oauth_microsoft_tenant: String,
     /// 当前生效的附件缓存根目录；`None` 表示尚未从后端收到设置。
     pub attachment_dir: Option<PathBuf>,
+    /// 用户自定义的每日简报提示词；**空串表示使用内置默认**。
+    pub daily_briefing_prompt: String,
+    /// 简报提示词的编辑草稿（弹窗打开时从上一行复制）。
+    ///
+    /// 与已保存值分开：点「取消」要能整份丢掉，半截编辑不该污染已保存的内容。
+    pub daily_briefing_draft: String,
     /// 剩余磁盘低于 500 MB 时置位，顶部常驻提示。
     pub disk_low: bool,
 
@@ -481,6 +487,8 @@ impl Default for UiState {
             oauth_microsoft_client_id: String::new(),
             oauth_microsoft_tenant: String::new(),
             attachment_dir: None,
+            daily_briefing_prompt: String::new(),
+            daily_briefing_draft: String::new(),
             disk_low: false,
             folders_dirty: true,
             messages_dirty: true,
@@ -990,6 +998,11 @@ pub enum Dialog {
     },
     /// 和风天气配置（Host + API Key）。由天气页的「配置密钥」按钮打开。
     WeatherConfig,
+    /// 编辑每日简报的提示词。由设置页「每日简报」那一栏的「修改」按钮打开。
+    ///
+    /// 草稿**不放这里**而是放 `UiState::daily_briefing_draft`：枚举要 `Clone`，
+    /// 每次重绘都带一份长文本既浪费也让「取消要丢弃编辑」变得不直观。
+    DailyBriefingPrompt,
 }
 
 #[derive(Clone)]

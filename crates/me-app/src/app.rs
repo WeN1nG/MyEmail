@@ -957,6 +957,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 attachment_dir,
                 music_dir,
                 music_order,
+                daily_briefing_prompt,
             } => {
                 self.state.theme = theme;
                 self.state.music.dir = music_dir;
@@ -976,6 +977,9 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 self.state.oauth_microsoft_client_id = oauth_microsoft_client_id;
                 self.state.oauth_microsoft_tenant = oauth_microsoft_tenant;
                 self.state.attachment_dir = Some(attachment_dir);
+                // 只回填已保存值，草稿留给弹窗打开时再拷——否则用户正在编辑的
+                // 内容会被一次设置重载悄悄覆盖。
+                self.state.daily_briefing_prompt = daily_briefing_prompt;
                 self.applied_theme = None;
             }
             Event::AttachmentDirChanged { dir } => {

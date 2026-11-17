@@ -338,6 +338,16 @@ where
         }
         let weather_key_present = self.weather_credential().await.is_some();
 
+        // 每日简报的自定义提示词：空串 = 内置默认。只读不写，界面据此显示
+        // 「使用默认」还是「已自定义」。
+        let daily_briefing_prompt = self
+            .db(|s| s.get_setting(me_core::settings_key::AI_DAILY_BRIEFING_PROMPT))
+            .await
+            .ok()
+            .flatten()
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+
         self.emit(Event::SettingsLoaded {
             theme,
             body_backfill,
@@ -354,6 +364,7 @@ where
             attachment_dir,
             music_dir,
             music_order,
+            daily_briefing_prompt,
         })
         .await;
 
@@ -1071,6 +1082,10 @@ where
             Command::GenerateDailyAiBriefing => {
                 let service = self.clone();
                 tokio::spawn(async move { service.handle_daily_ai_briefing().await });
+            }
+            Command::SetDailyBriefingPrompt { prompt } => {
+                let service = self.clone();
+                tokio::spawn(async move { service.handle_set_daily_briefing_prompt(prompt).await });
             }
         }
     }

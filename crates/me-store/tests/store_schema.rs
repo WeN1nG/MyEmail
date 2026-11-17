@@ -2043,3 +2043,128 @@ fn search_filters_combine_header_fields_and_unread() {
         .expect("search");
     assert!(no_hit.messages.is_empty(), "两个条件不匹配时不应有结果");
 }
+
+// ---------------------------------------------------------------------------
+// 发件人检索（v4debug01 D2 / D9）
+// ---------------------------------------------------------------------------
+
+/// `from` 必须能命中**显示名**：`from_addr` 列只存地址，姓名在 `from_name`。
+///
+/// 2026-11-17 的现场：按姓名搜恒 0 命中，AI 只能改口说「库里没有这个人」。
+#[test]
+fn search_from_matches_display_name() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+
+    let mut zhang = msg(1, "a@example.com", "hello", 10);
+    zhang.from = Some(Address::new(Some("张三".into()), "a@example.com"));
+    let mut li = msg(2, "b@example.com", "hello two", 20);
+    li.from = Some(Address::new(Some("李四".into()), "b@example.com"));
+    insert(&store, account, inbox, &[zhang, li]);
+    let writable = store.writable();
+
+    let by_name = writable
+        .search(&SearchQuery {
+            from: Some("张三".into()),
+            limit: 20,
+            ..Default::default()
+        })
+        .expect("search");
+    assert_eq!(by_name.total, 1, "按显示名应命中一封");
+    assert_eq!(
+        by_name.messages[0].from.as_ref().map(|a| a.addr.as_str()),
+        Some("a@example.com")
+    );
+
+    // 地址这条路不能因为加了显示名而坏掉。
+    let by_addr = writable
+        .search(&SearchQuery {
+            from: Some("b@example.com".into()),
+            limit: 20,
+            ..Default::default()
+        })
+        .expect("search");
+    assert_eq!(by_addr.total, 1, "按地址仍要命中");
+}
+
+/// 写法差异：`wangtao`（去掉空格）与 `tao.wang`（换序 + 点）都应该命中。
+#[test]
+fn search_from_normalized_ignores_spaces_and_punctuation() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+
+    let mut wang = msg(1, "wt@example.com", "first", 10);
+    wang.from = Some(Address::new(Some("Wang Tao".into()), "wangtao@example.com"));
+    let mut other = msg(2, "other@example.com", "second", 20);
+    other.from = Some(Address::new(Some("Li Ming".into()), "liming@example.com"));
+    insert(&store, account, inbox, &[wang, other]);
+    let writable = store.writable();
+    let hit = |value: &str| {
+        writable
+            .search(&SearchQuery {
+                from: Some(value.into()),
+                limit: 20,
+                ..Default::default()
+            })
+            .expect("search")
+            .total
+    };
+
+    assert_eq!(hit("wangtao"), 1, "去掉空格的写法要能命中");
+    assert_eq!(hit("Wang Tao"), 1, "原样写法要能命中");
+    assert_eq!(hit("WANG TAO"), 1, "大小写不同也要命中");
+    assert_eq!(hit("tao.wang"), 1, "换序 / 带点也要命中");
+    assert_eq!(hit("liming"), 1, "另一个人的地址归一化同样生效");
+}
+
+/// 多词取 AND：`Wang Tao` 与 `Tao Wang` 都命中同一个人，只叫 `Wang` 的另一个人不混进来。
+#[test]
+fn search_from_multiple_tokens_is_and() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+
+    let mut wang_tao = msg(1, "wt@example.com", "first", 10);
+    wang_tao.from = Some(Address::new(Some("Wang Tao".into()), "wt@example.com"));
+    let mut wang_li = msg(2, "wl@example.com", "second", 20);
+    wang_li.from = Some(Address::new(Some("Wang Li".into()), "wl@example.com"));
+    insert(&store, account, inbox, &[wang_tao, wang_li]);
+    let writable = store.writable();
+    let hit = |value: &str| {
+        writable
+            .search(&SearchQuery {
+                from: Some(value.into()),
+                limit: 20,
+                ..Default::default()
+            })
+            .expect("search")
+            .total
+    };
+
+    assert_eq!(hit("Wang Tao"), 1, "两个词都要出现，只算一个人");
+    assert_eq!(hit("Tao Wang"), 1, "换序仍是同一个人");
+    assert_eq!(hit("Wang"), 2, "单个词命中两位 Wang，这是预期");
+}
+
+/// 0 命中时给候选用的发件人列表：按地址去重、显示名优先、带信件数。
+#[test]
+fn senders_are_grouped_by_address() {
+    let (_dir, store) = open_store();
+    let (account, inbox) = setup(&store);
+
+    let mut first = msg(1, "wt1@example.com", "one", 10);
+    first.from = Some(Address::new(Some("Wang Tao".into()), "wt@example.com"));
+    let mut second = msg(2, "wt2@example.com", "two", 20);
+    second.from = Some(Address::new(Some("Wang Tao".into()), "wt@example.com"));
+    let mut third = msg(3, "lm@example.com", "three", 30);
+    third.from = Some(Address::new(Some("Li Ming".into()), "lm@example.com"));
+    insert(&store, account, inbox, &[first, second, third]);
+
+    let senders = store.writable().senders(10).expect("senders");
+    assert_eq!(senders.len(), 2, "同一地址的两封要合成一位");
+    let wang = senders
+        .iter()
+        .find(|sender| sender.addr == "wt@example.com")
+        .expect("wang tao");
+    assert_eq!(wang.display, "Wang Tao");
+    assert_eq!(wang.count, 2);
+}

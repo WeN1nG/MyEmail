@@ -15,7 +15,109 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::Contex
     credential_fallback(state, commands, ctx);
     oauth_login(state, commands, ctx);
     weather_config(state, commands, ctx);
+    daily_briefing_prompt(state, commands, ctx);
     confirm_dialog(state, commands, ctx);
+}
+
+/// 每日简报提示词的编辑弹窗。
+///
+/// 三个出口，语义各不相同：
+/// - **保存**：与内置默认逐字相同就存空串（等于用默认），否则存原文；
+/// - **恢复默认**：把已保存值清掉并关闭，不要求用户先把输入框删空；
+/// - **取消**：丢掉草稿，已保存值一个字都不动。
+///
+/// 弹窗里**不做长度拦截**：超长交给后端截断（`DAILY_BRIEFING_PROMPT_MAX_CHARS`），
+/// 在这里拦住只会让用户白写一段字。字数提示只是告知。
+fn daily_briefing_prompt(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::Context) {
+    if !matches!(state.dialog, Dialog::DailyBriefingPrompt) {
+        return;
+    }
+
+    let mut save = false;
+    let mut restore = false;
+    let mut cancel = false;
+    egui::Window::new("每日简报提示词")
+        .id(egui::Id::new("me_daily_briefing_prompt"))
+        .collapsible(false)
+        .resizable(true)
+        .default_width(560.0)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "每天第一次启动时，AI 就按这段话去取数据并写简报。\
+                     内置默认要求四段：未读邮件 / 近三天日程 / 近三天天气 / 今天要注意。",
+                )
+                .size(12.0)
+                .color(Color32::GRAY),
+            );
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("me_daily_briefing_prompt_scroll")
+                .max_height(280.0)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut state.daily_briefing_draft)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(12)
+                            .hint_text("写清要哪几段、每段怎么呈现"),
+                    );
+                });
+            ui.add_space(4.0);
+            let chars = state.daily_briefing_draft.trim().chars().count();
+            let limit = me_core::ai::DAILY_BRIEFING_PROMPT_MAX_CHARS;
+            ui.label(
+                RichText::new(format!("{chars} / {limit} 字（超出部分会被截断）"))
+                    .small()
+                    .color(if chars > limit {
+                        Color32::from_rgb(220, 130, 130)
+                    } else {
+                        Color32::GRAY
+                    }),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("保存").clicked() {
+                    save = true;
+                }
+                if ui.button("恢复默认").clicked() {
+                    restore = true;
+                }
+                if ui.button("取消").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+
+    if save {
+        let text = state.daily_briefing_draft.trim().to_string();
+        // 与内置默认逐字相同就存空：用户只是点开看一眼、原样保存，
+        // 不该把「自定义」这层状态莫名其妙地点亮。
+        let custom = text != me_core::ai::DAILY_BRIEFING_PROMPT.trim();
+        let value = if custom { text } else { String::new() };
+        state.daily_briefing_prompt = value.clone();
+        commands.push(Command::SetDailyBriefingPrompt { prompt: value });
+        state.dialog.close();
+        state.toast(
+            ToastKind::Info,
+            if custom {
+                "已保存每日简报提示词，下次启动生效"
+            } else {
+                "与内置默认一致，继续使用默认提示词"
+            },
+        );
+    }
+    if restore {
+        state.daily_briefing_prompt = String::new();
+        state.daily_briefing_draft = me_core::ai::DAILY_BRIEFING_PROMPT.to_string();
+        commands.push(Command::SetDailyBriefingPrompt {
+            prompt: String::new(),
+        });
+        state.dialog.close();
+        state.toast(ToastKind::Info, "已恢复默认提示词");
+    }
+    if cancel {
+        state.dialog.close();
+    }
 }
 
 fn credential_fallback(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::Context) {
@@ -527,6 +629,46 @@ mod tests {
         assert!(
             !texts.iter().any(|text| text.contains("配置和风天气")),
             "没打开时不该显示天气配置弹窗，实际 {texts:?}"
+        );
+    }
+
+    #[test]
+    fn daily_briefing_dialog_is_hidden_until_opened() {
+        let mut state = UiState::default();
+        let texts = dialog_texts(&mut state);
+        assert!(
+            !texts.iter().any(|text| text.contains("每日简报提示词")),
+            "没打开时不该显示简报提示词弹窗，实际 {texts:?}"
+        );
+    }
+
+    /// 弹窗要显示**实际会发出去**的那份提示词，而不是一个空框。
+    ///
+    /// 空框会让用户以为「现在是空的、要自己从头写」，于是要么不敢动，
+    /// 要么把原本好好的四段结构丢掉。
+    #[test]
+    fn daily_briefing_dialog_shows_the_effective_prompt() {
+        let mut state = UiState {
+            dialog: Dialog::DailyBriefingPrompt,
+            ..Default::default()
+        };
+        state.daily_briefing_draft = crate::views::settings::daily_briefing_text(&state);
+        let texts = dialog_texts(&mut state);
+        let joined = texts.join("\n");
+        assert!(joined.contains("每日简报提示词"), "要有标题：{texts:?}");
+        assert!(
+            joined.contains("未读邮件"),
+            "要预填实际会发的默认提示词：{texts:?}"
+        );
+        for button in ["保存", "恢复默认", "取消"] {
+            assert!(
+                texts.iter().any(|text| text == button),
+                "缺少「{button}」按钮：{texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().any(|text| text.contains("字")),
+            "要有字数提示：{texts:?}"
         );
     }
 

@@ -5,7 +5,7 @@
 //! - 流式期间用纯文本直出（每帧解析 Markdown 会卡），完成后解析一次并缓存；
 //! - 工具只展示摘要与邮件卡片，不展示完整正文。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
@@ -218,6 +218,12 @@ pub struct AiPageState {
     /// 已解析的 Markdown 缓存（见 [`BlocksCache`]）。
     blocks_cache: Option<BlocksCache>,
     pub loading: bool,
+    /// 已点开「展开全文」的用户消息。
+    ///
+    /// 键是消息 id：切会话再回来仍记得用户的选择，退出应用就丢——
+    /// 这是纯展示状态，没必要落库。超长输入默认折叠，避免一个气泡占满整屏
+    /// 把模型输出挤到很远的地方。
+    pub expanded_user_messages: HashSet<AiMessageId>,
 }
 
 impl AiPageState {
@@ -661,7 +667,15 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                         continue;
                     }
                     if message.role == AiRole::User {
-                        show_user_message(ui, message);
+                        let mut expanded = state.ai.expanded_user_messages.contains(&message.id);
+                        show_user_message(ui, message, &mut expanded);
+                        if expanded != state.ai.expanded_user_messages.contains(&message.id) {
+                            if expanded {
+                                state.ai.expanded_user_messages.insert(message.id);
+                            } else {
+                                state.ai.expanded_user_messages.remove(&message.id);
+                            }
+                        }
                         continue;
                     }
                     let turn = turn_from_message(message);
@@ -818,7 +832,12 @@ fn build_stream_message(state: &AiPageState) -> Option<AiMessage> {
 /// 每块没有就不画；历史与实时共用它，所以流式结束重载时不会跳变。
 fn render_turn(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
     ui.add_space(6.0);
-    let width = (ui.available_width() * 0.82).max(200.0);
+    // 与用户气泡同一套宽度口径：82%，但不超过可用宽度（窄窗口下 `.max(200)`
+    // 会让 200 宽的气泡比面板还宽，右侧被裁掉）。
+    let available = ui.available_width();
+    let width = (available * 0.82)
+        .max(160.0)
+        .min((available - 8.0).max(160.0));
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_max_width(width);
         if let Some(block) = &turn.message.thinking {
@@ -1025,7 +1044,11 @@ fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
     // 绘制，这些换行就是真的空行 —— 气泡于是靠空行一路长高，正文出现后上方
     // 还留一大片空白；而收尾后改走 Markdown 渲染，解析器把开头空行丢掉，
     // 空白又突然消失。这里统一按 trim 后的文本绘制，两边高度才对得上。
-    let live = message.content.trim();
+    // `[id=…]` 是给模型看的锚点，不进用户视线：**落库正文保留原文**
+    // （下一轮「把那封打开」要靠它直接调 `mail_read`），只在渲染这一层摘掉。
+    // 流式与收尾共用同一个字符串，否则流式期间会闪一下 `[id=150]`。
+    let stripped = me_core::ai::strip_mail_ids(message.content.trim());
+    let live = stripped.as_str();
     if live.is_empty() {
         if turn.streaming {
             ui.label(RichText::new("正在生成…").color(Color32::GRAY));
@@ -1050,10 +1073,10 @@ fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
         // `tail` 是四行字段之后的剩余正文。模型把 `[结果]` 放在回复**开头**时
         // （规范要求它收尾，但模型不总照做），用户要的答案就在 tail 里——
         // 它必须被渲染出来，否则整条回复只剩一个空结果框。
-        let split = split_result_block(&message.content);
+        let split = split_result_block(&stripped);
         let (body, tail, result) = match &split {
             Some(split) => (split.body, split.tail, Some(&split.block)),
-            None => (message.content.as_str(), "", None),
+            None => (stripped.as_str(), "", None),
         };
         let cache_hit = matches!(
             ctx.blocks_cache.as_ref(),
@@ -1103,33 +1126,122 @@ fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
     }
     ui.horizontal(|ui| {
         if ui.small_button("复制").clicked() {
-            ui.ctx().copy_text(message.content.clone());
+            // 复制也走摘过的文本：粘到别处不该带一串 `[id=150]`。
+            ui.ctx().copy_text(stripped.clone());
         }
     });
 }
 
 /// 用户消息走独立分支：`TurnView` 的四块全是 assistant 语义，
 /// 装不下 `context_refs`（引用快照），硬塞会丢掉「引用：xxx」。
-fn show_user_message(ui: &mut egui::Ui, message: &AiMessage) {
-    let width = (ui.available_width() * 0.82).max(200.0);
+/// 用户消息气泡的折叠阈值（字符数）。
+///
+/// 480 字约等于 12 行，一屏之内还看得完；再长就不是「回看自己说了什么」，
+/// 而是让一个气泡占满整屏、把模型输出挤到很远的地方。
+/// 超过就折到这个长度，末尾给「展开全文（共 N 字）」。
+const USER_MESSAGE_PREVIEW_CHARS: usize = 480;
+
+/// 连续 ASCII 片段多长算「长到无法在行内换行」。
+///
+/// 32 是经验阈值：正常单词与短标识符都在这之下，而一个 URL、一段 base64、
+/// 一串没有分隔符的英文通常远超它。
+const OVERLONG_RUN_CHARS: usize = 32;
+
+/// 有没有「长到无法在行内换行」的连续 ASCII 片段。
+fn has_overlong_ascii_run(text: &str) -> bool {
+    let mut run = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() && !ch.is_ascii_whitespace() {
+            run += 1;
+            if run >= OVERLONG_RUN_CHARS {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// 气泡正文的排版作业。
+///
+/// 默认走 egui 的断行规则（英文按词、中文按字）。**egui 0.32 遇到没有断点的
+/// 超长 ASCII 串时也会强行折断**（实测 215 字符的 URL 排 4 行、宽度没超气泡），
+/// 所以这里不是修溢出，而是修**填充率**：强制断行模式下同一段只排 2 行，
+/// 默认模式保守地留下大量行尾空白。长 URL、base64、无空格英文串都属于这种形态。
+///
+/// 只在命中超长串时才开：正常中英文混排仍按词换行，不会莫名其妙把
+/// `something` 拆成 `some` / `thing`。
+fn bubble_job(ui: &egui::Ui, text: &str, max_width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = max_width.max(80.0);
+    job.wrap.break_anywhere = has_overlong_ascii_run(text);
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::TextStyle::Body.resolve(ui.style()),
+            color: ui.visuals().text_color(),
+            ..Default::default()
+        },
+    );
+    job
+}
+
+fn show_user_message(ui: &mut egui::Ui, message: &AiMessage, expanded: &mut bool) {
+    // 气泡宽度：面板的 82%，但要给右侧留一点余量，也不能窄到放不下两个字。
+    let available = ui.available_width();
+    let width = (available * 0.82)
+        .max(160.0)
+        .min((available - 8.0).max(160.0));
     ui.add_space(6.0);
+    let total = message.content.chars().count();
+    let foldable = total > USER_MESSAGE_PREVIEW_CHARS;
     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
         egui::Frame::group(ui.style())
             .fill(ui.visuals().faint_bg_color)
             .show(ui, |ui| {
                 ui.set_max_width(width);
-                ui.label(&message.content);
-                for reference in &message.context_refs {
-                    ui.label(
-                        RichText::new(format!(
-                            "引用：{}（{}）",
-                            truncate_chars(&reference.subject, 30),
-                            reference.mode.as_str()
-                        ))
-                        .small()
-                        .color(Color32::GRAY),
-                    );
-                }
+                // **必须在 RTL 里再套一层 vertical**（top_down）。
+                // `right_to_left` 下 `ui.label` 拿不到右侧边界，换行宽度算成无限大，
+                // 于是一整段输入排成一行、从右边界往左溢出：用户只看得见气泡右半截，
+                // 模型输出被推出可视区（2026-11-12 的实测：1280 的窗口画出 2340 宽的文本）。
+                // 套一层 top_down 之后 `available_width` 才等于 `set_max_width` 给的值。
+                ui.vertical(|ui| {
+                    ui.set_max_width(width);
+                    let text = if foldable && !*expanded {
+                        truncate_chars(&message.content, USER_MESSAGE_PREVIEW_CHARS)
+                    } else {
+                        message.content.clone()
+                    };
+                    let job = bubble_job(ui, &text, ui.available_width());
+                    ui.add(egui::Label::new(job));
+                    for reference in &message.context_refs {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "引用：{}（{}）",
+                                    truncate_chars(&reference.subject, 30),
+                                    reference.mode.as_str()
+                                ))
+                                .small()
+                                .color(Color32::GRAY),
+                            )
+                            .wrap(),
+                        );
+                    }
+                    if foldable {
+                        ui.add_space(2.0);
+                        let label = if *expanded {
+                            format!("收起（全文 {total} 字）")
+                        } else {
+                            format!("展开全文（共 {total} 字）")
+                        };
+                        if ui.small_button(label).clicked() {
+                            *expanded = !*expanded;
+                        }
+                    }
+                });
             });
     });
 }
@@ -2317,6 +2429,194 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    /// 跑一帧，收集绘制出来的 galley（带换行信息与最终宽度）。
+    ///
+    /// 只看文本收集不够：这个 bug 的症状是「文本都在、但排成一行撑出屏幕」，
+    /// 必须拿到 `rows` 与 `rect` 才看得见。
+    fn run_frame_galleys(
+        mut body: impl FnMut(&egui::Context),
+    ) -> Vec<std::sync::Arc<egui::Galley>> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), &mut body);
+        let output = ctx.run(input(), body);
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            collect_galleys(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn collect_galleys(shape: &egui::Shape, out: &mut Vec<std::sync::Arc<egui::Galley>>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.clone()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_galleys(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 用户输入很长时，气泡必须换行并且留在面板内。
+    ///
+    /// 2026-11-12 的 bug：粘一大段文字后，用户只看得见自己气泡的右半截，
+    /// 模型输出被推出可视区。根因是气泡在 `right_to_left` 布局里按单行排，
+    /// 宽度可以无限长——RTL 从右边界往左铺，超宽部分直接溢出到屏幕左侧。
+    #[test]
+    fn long_user_message_wraps_inside_the_panel() {
+        let mut state = ready();
+        // 没有空格的连续中文：最容易被排成一整行的形状。
+        let long: String = "这是一段很长的用户输入没有空格".repeat(12);
+        state.ai.messages = vec![user_message(&long)];
+        let mut commands = Vec::new();
+        let galleys = run_frame_galleys(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(&mut state, &mut commands, ui);
+            });
+        });
+        let bubble = galleys
+            .iter()
+            .find(|galley| galley.text().contains("这是一段很长的用户输入"))
+            .expect("用户消息要画出来");
+        assert!(
+            bubble.rows.len() > 1,
+            "长输入必须换行，实际只有 {} 行、宽 {:.1}",
+            bubble.rows.len(),
+            bubble.rect.width()
+        );
+        assert!(
+            bubble.rect.width() <= 1280.0,
+            "气泡宽度不能超出窗口：{:.1}",
+            bubble.rect.width()
+        );
+    }
+
+    /// 超长输入默认折叠：一个气泡不该占满整屏、把模型输出挤到很远的地方。
+    ///
+    /// 折叠是「显示长度限制」的落点：换行只保证不横向溢出，粘三千字仍然会
+    /// 纵向铺满好几屏。折到 480 字 + 一个展开按钮，用户想看再点。
+    #[test]
+    fn overlong_user_message_is_folded_with_an_expand_button() {
+        let mut state = ready();
+        let long: String = "很长的输入".repeat(300); // 1500 字
+        state.ai.messages = vec![user_message(&long)];
+        let mut commands = Vec::new();
+        let texts = run_frame_galleys(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(&mut state, &mut commands, ui);
+            });
+        })
+        .into_iter()
+        .map(|galley| galley.text().to_string())
+        .collect::<Vec<_>>();
+        let joined = texts.join("\n");
+        assert!(joined.contains("展开全文"), "折叠时要给展开入口：{joined}");
+        assert!(
+            joined.contains("共 1500 字"),
+            "要说明全文有多少字：{joined}"
+        );
+        let shown: String = texts
+            .iter()
+            .filter(|text| text.contains("很长的输入"))
+            .cloned()
+            .collect();
+        assert!(
+            shown.chars().count() < long.chars().count(),
+            "折叠后不该把整段都画出来（画了 {} 字）",
+            shown.chars().count()
+        );
+        assert!(
+            shown.chars().count() >= USER_MESSAGE_PREVIEW_CHARS,
+            "折叠后至少要保留 {} 字，实际 {} 字",
+            USER_MESSAGE_PREVIEW_CHARS,
+            shown.chars().count()
+        );
+
+        // 点过「展开全文」之后要真的给全文，而不是还折着。
+        state.ai.expanded_user_messages.insert(AiMessageId(1));
+        let texts = run_frame_galleys(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(&mut state, &mut commands, ui);
+            });
+        })
+        .into_iter()
+        .map(|galley| galley.text().to_string())
+        .collect::<Vec<_>>();
+        let shown: String = texts
+            .iter()
+            .filter(|text| text.contains("很长的输入"))
+            .cloned()
+            .collect();
+        assert!(
+            shown.chars().count() > USER_MESSAGE_PREVIEW_CHARS,
+            "展开后要给全文，实际只有 {} 字",
+            shown.chars().count()
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("收起")),
+            "展开后按钮要变成「收起」：{texts:?}"
+        );
+    }
+
+    /// 长 URL 这类「没有可断点的连续 ASCII」必须留在气泡里。
+    ///
+    /// egui 0.32 自己也会强行折断（不会真的溢出），但填得很松：同一段 215 字符
+    /// 的 URL 默认排 4 行、开 `break_anywhere` 只排 2 行。这条测试同时锁两件事——
+    /// 宽度不许超窗口（防退化回真溢出），行数要够少（证明强制断行确实生效）。
+    #[test]
+    fn overlong_url_stays_inside_the_bubble() {
+        let mut state = ready();
+        let url = format!("https://example.com/{}", "a".repeat(180));
+        state.ai.messages = vec![user_message(&format!("帮我看看这个链接 {url} 能不能打开"))];
+        let mut commands = Vec::new();
+        let galleys = run_frame_galleys(|ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(&mut state, &mut commands, ui);
+            });
+        });
+        let bubble = galleys
+            .iter()
+            .find(|galley| galley.text().contains("example.com"))
+            .expect("用户消息要画出来");
+        assert!(
+            bubble.rect.width() <= 1280.0,
+            "长 URL 不能顶出气泡：宽 {:.1}",
+            bubble.rect.width()
+        );
+        assert!(
+            bubble.rows.len() <= 3,
+            "强制断行后应该排得很紧，实际 {} 行（默认模式是 4 行）",
+            bubble.rows.len()
+        );
+    }
+
+    /// 只有真的出现长 ASCII 串才启用强制断行——否则英文单词会被行尾拆开。
+    #[test]
+    fn overlong_run_detection_only_fires_on_long_ascii() {
+        assert!(!has_overlong_ascii_run(""));
+        assert!(
+            !has_overlong_ascii_run("hello world，中文混排也没问题"),
+            "普通中英文混排不该触发"
+        );
+        let chinese = "短".repeat(100);
+        assert!(!has_overlong_ascii_run(&chinese), "中文本来就按字断行");
+        let thirty_one = "a".repeat(OVERLONG_RUN_CHARS - 1);
+        assert!(!has_overlong_ascii_run(&thirty_one), "刚好不到阈值");
+        let thirty_two = "a".repeat(OVERLONG_RUN_CHARS);
+        assert!(has_overlong_ascii_run(&thirty_two), "到阈值就该触发");
+        assert!(has_overlong_ascii_run(
+            "https://example.com/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
     }
 
     /// 跑一帧，收集所有绘制出来的文本。

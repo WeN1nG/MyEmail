@@ -207,6 +207,11 @@ struct StreamSetup {
     /// 走的是另一条路径，必须在这里也有一份，否则「所有工具都成功、
     /// 最后一轮请求被 400」会一直存在。
     input_budget: usize,
+    /// 这一轮是不是「每日简报」（由应用自己发起、没有用户提问的那种）。
+    ///
+    /// **只用于日志标记**，不再决定要不要对账：用户把提示词粘进输入框时
+    /// `insert_user=true`，而那次照样编造，所以判据改成了「本轮有没有邮件回执」。
+    daily_briefing: bool,
 }
 
 impl Default for AiState {
@@ -955,6 +960,22 @@ where
             tracing::warn!(error = %err.user_message(), "写晨间简报标记失败");
         }
 
+        // 提示词：用户自定义优先，空/缺失回退内置默认。
+        // 读失败不当致命错误——读不到就用默认，总比当天不发简报强。
+        let custom_prompt = match self
+            .db(|s| s.get_setting(settings_key::AI_DAILY_BRIEFING_PROMPT))
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err.user_message(),
+                    "读取自定义简报提示词失败，改用默认"
+                );
+                None
+            }
+        };
+
         tracing::info!(conversation = conversation.id.0, "发起晨间简报");
         self.emit(Event::AiConversationsChanged).await;
         self.emit(Event::AiDailyBriefingStarted {
@@ -963,12 +984,32 @@ where
         .await;
         self.start_ai_turn(
             conversation.id,
-            me_core::ai::DAILY_BRIEFING_PROMPT.to_string(),
+            me_core::ai::daily_briefing_prompt(custom_prompt.as_deref()),
             Vec::new(),
             false,
             false,
         )
         .await;
+    }
+
+    /// 保存 / 清除用户自定义的每日简报提示词。
+    ///
+    /// 只写 `meta`，不重跑、不发事件：简报是「下一次启动才用」的东西，
+    /// 保存完就触发一份会让用户莫名其妙多出一次模型调用。
+    /// 空串照写（而不是删键）：`None` 与 `Some("")` 在读取端都归到默认，
+    /// 但写空串能让「用户明确点过恢复默认」这件事在库里留下痕迹。
+    pub(crate) async fn handle_set_daily_briefing_prompt(&self, prompt: String) {
+        let value = me_core::ai::truncate_chars(
+            prompt.trim(),
+            me_core::ai::DAILY_BRIEFING_PROMPT_MAX_CHARS,
+        );
+        if let Err(err) = self
+            .db(move |s| s.set_setting(settings_key::AI_DAILY_BRIEFING_PROMPT, &value))
+            .await
+        {
+            tracing::warn!(error = %err.user_message(), "保存每日简报提示词失败");
+            self.emit_ai_error(err).await;
+        }
     }
 
     pub(crate) async fn handle_delete_ai_entity(&self, entity: i64) {
@@ -1269,6 +1310,9 @@ where
                         user_input: content.clone(),
                         resumable,
                         input_budget: model.max_input_chars as usize,
+                        // AI 自己开口的那一轮就是每日简报：`insert_user=false` 且
+                        // 不是「重新生成」（重新生成会带 `replay_only`）。
+                        daily_briefing: !insert_user && !replay_only,
                     },
                 )
                 .await;
@@ -1443,6 +1487,7 @@ where
             user_input,
             mut resumable,
             input_budget,
+            daily_briefing,
         } = setup;
         let started = Instant::now();
         let permit = self
@@ -1634,6 +1679,9 @@ where
         let mut retryable = false;
 
         'rounds: for _round in 0..MAX_TOOL_ROUNDS {
+            // 本轮的「强制收尾」标记：无进展闸触发后不立刻断线，而是切到 Final
+            // 让模型把已有结果写成答复（见下方无进展闸）。
+            let mut force_final = false;
             if token.is_cancelled() {
                 status = AiMessageStatus::Cancelled;
                 break;
@@ -1755,7 +1803,7 @@ where
                 result = provider.stream_chat(request.clone(), sink.clone(), cancel.clone()) => result,
             };
 
-            let turn = match turn {
+            let mut turn = match turn {
                 Ok(turn) => turn,
                 Err(err) if err.is_cancelled() => {
                     status = AiMessageStatus::Cancelled;
@@ -1768,6 +1816,25 @@ where
                     break;
                 }
             };
+
+            // 参数类型归一化：模型经常把 `7` 写成 `"7"`、`true` 写成 `"True"`。
+            // 放在**这里**（拿到回复、进入任何分支之前）而不是每个工具里各做一遍：
+            // 之后读参数、算失败指纹、落 trace、回灌 assistant 消息看到的都是同一份
+            // 干净参数——否则「`"7"` 与 `7`」会被当成两份不同的调用，熔断判断都会漏。
+            for call in &mut turn.tool_calls {
+                let (coerced, fixed) =
+                    me_core::ai::coerce_tool_arguments(call.name, &call.arguments);
+                if fixed.is_empty() {
+                    continue;
+                }
+                tracing::debug!(
+                    conversation = conversation.0,
+                    tool = call.name.as_str(),
+                    fields = ?fixed,
+                    "工具参数已按 schema 归一化"
+                );
+                call.arguments = coerced;
+            }
 
             {
                 let mut usage_slot = usage.lock().expect("usage 锁");
@@ -2532,7 +2599,17 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         error_text = Some(format!(
                             "连续 {MAX_NO_PROGRESS_ROUNDS} 轮没有拿到新的工具结果，已提前收尾"
                         ));
-                        break;
+                        // 这里不能直接 `break`：收尾请求只在 `Phase::Final` 下发，
+                        // 而走到这一步时通常还停在 `Execute`——一断线，模型就再没有
+                        // 「把结果写出来」的机会，正文为空、用户只看到工具原文。
+                        // 2026-11-12 的「每日简报」就是这么交的白卷：10 轮里
+                        // 一次都没进过 Final。给一轮收尾，预算用完才真断线。
+                        if phase != Phase::Final && final_retries < MAX_FINAL_RETRIES {
+                            final_retries += 1;
+                            force_final = true;
+                        } else {
+                            break;
+                        }
                     }
                 }
             } else {
@@ -2553,6 +2630,27 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         content: result.content,
                         is_error: result.is_error,
                     });
+            }
+
+            // 强制收尾：必须在工具结果之后切阶段，否则 `assistant(tool_calls)`
+            // 后面会插进一条 user，协议对不上号。
+            if force_final {
+                phase = Phase::Final;
+                request.messages.push(me_core::ai::AiWireMessage::User {
+                    content: "工具已经用完了，停下来。请**只**把现在已经拿到的结果写成答复：\
+找到了什么、没找到什么、还差什么。不要再调用任何工具，也不要再更新清单。"
+                        .to_string(),
+                });
+            }
+            // 轮次预算只剩最后一轮时同样强制收尾：把最后的预算留给答复，
+            // 而不是让它继续在一个已经死锁的步骤上记账。
+            if phase == Phase::Execute && _round + 1 >= MAX_TOOL_ROUNDS {
+                phase = Phase::Final;
+                request.messages.push(me_core::ai::AiWireMessage::User {
+                    content: "这是最后一次机会了。请**只**把现在已经拿到的结果写成答复：\
+找到了什么、没找到什么、还差什么。不要再调用任何工具。"
+                        .to_string(),
+                });
             }
 
             // 阶段推进放在工具结果**之后**：`assistant(tool_calls)` 后面必须紧跟
@@ -2825,7 +2923,14 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
             content = fallback_answer(plan.as_ref(), &traces, &deliveries);
             // 文案要跟兜底的实际行为一致：现在优先直接交付工具正文，
             // 只有没有正文可交时才退回「回执摘要」。
-            error_text = Some("模型未输出正文，已直接交付工具结果".to_string());
+            //
+            // 不能直接覆盖 `error_text`：那里可能已经写着「连续 N 轮没有拿到
+            // 新的工具结果」这类**真正原因**。覆盖掉之后，事后看库只知道
+            // 「模型没写正文」，查不到为什么没写（2026-11-12 那次就是这样）。
+            error_text = Some(match error_text.take() {
+                Some(reason) => format!("{reason}；模型未输出正文，已直接交付工具结果"),
+                None => "模型未输出正文，已直接交付工具结果".to_string(),
+            });
         }
 
         // 兜底之二：模型给了正文，却没按规范写 `[结果]` 段落。
@@ -2839,6 +2944,34 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
         if status == AiMessageStatus::Complete && executed_calls > 0 && !has_result_block(&content)
         {
             content.push_str(&synthesized_result_block(plan.as_ref(), &traces));
+        }
+
+        // 兜底之三：把回复里说到的邮件与本轮工具回执对账。
+        //
+        // 2026-11-17 的两次事故：简报编了两封「Wang Tao」；隔天用户把提示词
+        // 粘进输入框，简报又把回执的 4 封数成「另有 3 封」——后一次因为
+        // `insert_user=true` 被判成普通对话，一道校验都没跑。
+        //
+        // 所以判据**不是「谁发起的」而是「这一轮有没有邮件回执」**：只要有，
+        // 落库前一定对账。邮件行没写 id 只在「未读邮件」段补标（自然语言里
+        // 硬标会误伤合理改写），但假 id 与「另有 N 封」的数错是全篇都查。
+        if status == AiMessageStatus::Complete
+            && traces
+                .iter()
+                .any(|trace| trace.tool.is_email() && !trace.cards.is_empty())
+        {
+            let (aligned, audit) = me_core::ai::align_email_citations(&content, &traces);
+            if aligned != content {
+                content = aligned;
+            }
+            tracing::info!(
+                cited = audit.cited,
+                unknown = audit.unknown,
+                unmarked = audit.unmarked,
+                mismatched = audit.mismatched,
+                briefing = daily_briefing,
+                "邮件引用对账"
+            );
         }
 
         let usage = *usage.lock().unwrap_or_else(|e| e.into_inner());

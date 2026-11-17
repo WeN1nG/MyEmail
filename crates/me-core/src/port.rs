@@ -662,10 +662,25 @@ pub struct SearchOutcome {
     pub body_total: u32,
 }
 
+/// 缓存里出现过的一个发件人（按地址去重）。
+///
+/// 只用于「检索 0 命中时给候选」：让模型看见库里真实存在哪些人，
+/// 而不是拿 `wangtao` / `tao.wang` 换个拼写反复试。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderSummary {
+    /// 显示名优先，没有显示名就用地址。
+    pub display: String,
+    pub addr: String,
+    /// 这个地址的邮件数，用来把「常来往的人」排在前面。
+    pub count: u32,
+}
+
 pub trait SearchRepo {
     fn search(&self, query: &SearchQuery) -> Result<SearchOutcome, CoreError>;
     /// 清空并重建 FTS；返回重建条数。
     fn rebuild_index(&self) -> Result<u32, CoreError>;
+    /// 缓存里出现过的发件人，按最近一封的时间倒序，最多 `limit` 条。
+    fn senders(&self, limit: u32) -> Result<Vec<SenderSummary>, CoreError>;
 }
 
 /// 保存的搜索的仓储（`saved_searches` 表）。

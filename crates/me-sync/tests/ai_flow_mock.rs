@@ -4272,6 +4272,9 @@ async fn stalled_progress_stops_the_loop_early() {
         stall("stall-1"),
         stall("stall-2"),
         stall("stall-3"),
+        // 三轮空转后引擎不再直接断线，而是切到收尾阶段再问一次——这一轮
+        // 才是用户真正看到的东西。以前这里会 break，正文留白。
+        Turn::text("这轮没查到邮件：工具一直卡在清单记账上，我没有拿到任何邮件数据。"),
     ]);
     let (commands, mut rx) = start_service(&store, provider.clone(), true);
     let conversation = new_conversation(&commands, &mut rx, &store).await;
@@ -4297,9 +4300,16 @@ async fn stalled_progress_stops_the_loop_early() {
         "要留下提前收尾的痕迹：{:?}",
         message.error
     );
-    // 三轮空转之后必须停：没有第 4 次模型往返。
+    // 空转不该直接把用户扔在空白上：引擎切到收尾阶段再问了一次，
+    // 模型因此有机会把「什么都没拿到」说清楚（2026-11-12 的简报就是断在这里）。
     assert!(
-        provider.message_bodies.lock().unwrap().len() <= 4,
+        message.content.contains("工具一直卡在清单记账上"),
+        "收尾轮必须真的发生，正文不能是兜底的工具原文：{:?}",
+        message.content
+    );
+    // 三轮空转 + 一次收尾：没有第 6 次模型往返。
+    assert!(
+        provider.message_bodies.lock().unwrap().len() <= 5,
         "达到上限就该收尾，不该继续追问"
     );
     // 一次业务工具都没调过——这正是「没进展」的定义。
@@ -4310,6 +4320,208 @@ async fn stalled_progress_stops_the_loop_early() {
             .any(|trace| trace.tool == AiToolName::EmailSearch),
         "这一轮本来就没查过邮件：{:?}",
         message.tool_trace
+    );
+}
+
+/// 参数错三次之后终于对了：成功必须**回写**到那一步，而不是永远显示失败。
+///
+/// 2026-11-12 的「每日简报」：`calendar_list` 的 `from` 被拒三次（每次错误文案
+/// 都一模一样），第四次模型写对了、也查到了「没有日程」，但该步早已因为
+/// `MAX_STEP_ATTEMPTS` 用尽变成终态 failed，引擎不再绑定它；`plan_update`
+/// 想把状态改成 done 又被「已经是失败」挡回。模型于是被锁死在一个它自己
+/// 解不开的状态里，折腾到轮次用尽，连正文都没写出来。
+#[tokio::test]
+async fn a_successful_retry_reclaims_the_failed_step() {
+    let (_dir, store) = open();
+    let bad = |id: &str, when: &str| Turn {
+        text: String::new(),
+        thinking: String::new(),
+        tool_calls: vec![tool_call(
+            id,
+            AiToolName::CalendarList,
+            json!({ "motive": "第 1 步：查看日程", "from": when, "to": when }),
+        )],
+        error: None,
+        hold: false,
+    };
+    let provider = MockAiProvider::new(vec![
+        // 清单留一个「归纳」步不收尾，否则第 3 次失败后清单就没有开着的步，
+        // 引擎会立刻转去自检阶段——那样第 4 次调用根本轮不到执行。
+        Turn::with_tool(tool_call(
+            "plan",
+            AiToolName::PlanSubmit,
+            json!({
+                "motive": "先给出计划再执行",
+                "goal": "看看这三天有什么安排",
+                "steps": [
+                    {
+                        "id": 1,
+                        "title": "查看日程",
+                        "kind": "tool",
+                        "capability": "calendar",
+                        "tool": "calendar_list",
+                        "args": { "keyword": "复盘" },
+                        "expect": "列出三天内的日程"
+                    },
+                    {
+                        "id": 2,
+                        "title": "归纳安排",
+                        "kind": "reason",
+                        "expect": "用一句话总结"
+                    }
+                ]
+            }),
+        )),
+        bad("cal-1", "下周三"),
+        bad("cal-2", "明天"),
+        bad("cal-3", "后天"),
+        // 第四次终于写对：这一跳必须把第 1 步从「失败」拉回「完成」。
+        Turn::with_tool(tool_call(
+            "cal-4",
+            AiToolName::CalendarList,
+            json!({ "motive": "第 1 步：查看日程", "from": "2026-11-12T00:00+08:00" }),
+        )),
+        Turn::with_tool(tool_call(
+            "upd",
+            AiToolName::PlanUpdate,
+            json!({
+                "motive": "第 2 步：归纳安排",
+                "steps": [{ "id": 2, "status": "done", "evidence": "近三天没有日程" }]
+            }),
+        )),
+        Turn::text("近三天没有日程安排。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "这三天有什么安排".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let plan = message.plan.as_ref().expect("必须有清单");
+    assert_eq!(
+        plan.steps[0].status,
+        me_core::ai_plan::PlanStatus::Done,
+        "第 4 次成功必须回写到那一步：{:?}",
+        plan.steps[0]
+    );
+    assert!(
+        plan.steps[0].failure.is_none(),
+        "成功要清掉失败原因：{:?}",
+        plan.steps[0].failure
+    );
+    assert!(
+        message.content.contains("没有日程安排"),
+        "正文要由模型自己写出来，而不是兜底直出工具原文：{:?}",
+        message.content
+    );
+    assert!(
+        !message
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("未输出正文"),
+        "不该走「模型未输出正文」的兜底：{:?}",
+        message.error
+    );
+}
+
+/// 模型把参数类型写歪时，引擎在**入口**纠正一次，工具照常跑起来。
+///
+/// 2026-11-12 的简报：`plan_submit` 的 `"id":"1"` 与 `email_search` 的
+/// `{"days":"7","unread_only":"True"}` 都被判参数错误——值与期望的一模一样，
+/// 差的只是 JSON 类型。归一化放在拿到回复之后、进入任何分支之前，
+/// 于是计划校验、执行、指纹、trace 看到的是同一份干净参数。
+#[tokio::test]
+async fn string_typed_arguments_are_coerced_before_execution() {
+    let (_dir, store) = open();
+    let now = me_core::now_unix();
+    // flags 0 = 未读（`FLAG_SEEN` 位没置）。
+    seed_mail(
+        &store,
+        &[
+            ("近的那封", "a@example.com", now - 3600, 0),
+            ("远的那封", "b@example.com", now - 86400 * 3, 0),
+        ],
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(tool_call(
+            "plan",
+            AiToolName::PlanSubmit,
+            json!({
+                "motive": "先给出计划再执行",
+                "goal": "看看最近的未读邮件",
+                "steps": [{
+                    "id": "1",
+                    "title": "检索未读邮件",
+                    "kind": "tool",
+                    "capability": "mail",
+                    "tool": "email_search",
+                    "args": { "days": "7", "unread_only": "True" },
+                    "expect": "列出近 7 天的未读邮件"
+                }]
+            }),
+        )),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "第 1 步：检索未读邮件", "days": "7", "unread_only": "True" }),
+        )),
+        Turn::text("近 7 天有 2 封未读。"),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider, true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "看看最近的未读邮件".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let plan = message
+        .plan
+        .as_ref()
+        .expect("步骤号写成字符串不该导致清单被拒");
+    assert_eq!(
+        plan.steps[0].status,
+        me_core::ai_plan::PlanStatus::Done,
+        "第 1 步要真的跑完：{:?}",
+        plan.steps[0]
+    );
+    let trace = message
+        .tool_trace
+        .iter()
+        .find(|trace| trace.tool == AiToolName::EmailSearch)
+        .expect("要有 email_search 的 trace");
+    assert_eq!(
+        trace.status,
+        me_core::ai::AiToolStatus::Ok,
+        "类型漂移不该让工具失败：{trace:?}"
+    );
+    let args = trace.args.as_deref().expect("trace 要留参数");
+    assert!(
+        args.contains("\"days\":7"),
+        "落库的参数要是纠正后的数字：{args}"
+    );
+    assert!(
+        !args.contains("\"days\":\"7\""),
+        "不该留着字符串形态：{args}"
     );
 }
 
@@ -5130,4 +5342,108 @@ async fn daily_briefing_skips_quietly_without_privacy_ack() {
             "启动阶段不该因为跳过简报弹错误：{event:?}"
         );
     }
+}
+
+/// 设置页保存的自定义提示词必须真的被用上。
+///
+/// 「保存了但不生效」是这类设置项最常见的失败方式：UI 写了 meta、
+/// 发起时仍读常量，用户改完看不到任何变化，还以为是自己没保存。
+#[tokio::test]
+async fn daily_briefing_uses_the_custom_prompt() {
+    let (_dir, store) = open();
+    let provider = MockAiProvider::new(vec![Turn::text("简报正文")]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+
+    let custom = "只列三封最重要的邮件，别的都不要";
+    commands
+        .send(Command::SetDailyBriefingPrompt {
+            prompt: format!("  {custom}  "),
+        })
+        .expect("send prompt");
+    // 命令是异步落库的：不等写进去就触发简报，会读到旧值而白跑一轮。
+    for _ in 0..100 {
+        let stored = store
+            .writable()
+            .get_setting(me_core::settings_key::AI_DAILY_BRIEFING_PROMPT)
+            .expect("get");
+        if stored.as_deref() == Some(custom) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    commands
+        .send(Command::GenerateDailyAiBriefing)
+        .expect("briefing");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiDailyBriefingStarted { .. })
+    })
+    .await;
+    assert!(wait_for_completion(&mut rx, 30).await, "简报这一轮必须收尾");
+
+    let bodies = provider.message_bodies.lock().expect("lock").clone();
+    let first = bodies.first().expect("至少一轮请求");
+    assert!(first.contains(custom), "自定义提示词没生效：{first}");
+    assert!(
+        !first.contains("近三天天气"),
+        "自定义后不该再把内置默认塞进去：{first}"
+    );
+}
+
+/// 端到端：本轮调过邮件工具，正文里的**假锚点**必须在落库前被换掉。
+///
+/// 这条钉的是**接线**（`me-sync/src/ai.rs` 收尾兜底区），不是纯函数。
+/// 2026-11-17 的教训：11 个单测全绿，对账却一次都没在真机跑过——
+/// 触发条件绑在「是不是每日简报」上，用户把提示词粘进输入框就绕过去了。
+#[tokio::test]
+async fn mail_citations_are_aligned_before_persisting() {
+    let (_dir, store) = open();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    let ids = seed_mail(
+        &store,
+        &[("2027 校招启动", "hr@taomee.com", now - 3_600, 0)],
+    );
+    let real = ids[0].0;
+
+    let answer = format!(
+        "## 今日简报\n\n**未读邮件**\n\
+         - 淘米网络 · 2027 校招启动 [id={real}]\n\
+         - Wang Tao · 实习申请 [id=999]\n\
+         \n**近三天日程**\n- 没有日程安排。"
+    );
+    let provider = MockAiProvider::new(vec![
+        Turn::with_tool(plan_submit_for(&[AiToolName::EmailSearch])),
+        Turn::with_tool(tool_call(
+            "c1",
+            AiToolName::EmailSearch,
+            json!({ "motive": "查未读", "unread_only": true, "days": 7, "limit": 5 }),
+        )),
+        Turn::text(&answer),
+    ]);
+    let (commands, mut rx) = start_service(&store, provider.clone(), true);
+    let conversation = new_conversation(&commands, &mut rx, &store).await;
+
+    commands
+        .send(Command::SendAiMessage {
+            conversation,
+            content: "来份今日简报".to_string(),
+            context: Vec::new(),
+        })
+        .expect("send");
+    let _ = wait_for(&mut rx, |event| {
+        matches!(event, Event::AiMessageCompleted { .. })
+    })
+    .await;
+
+    let message = last_assistant_message(&store, conversation);
+    let body = &message.content;
+    assert!(
+        body.contains(&format!("[id={real}]")),
+        "真锚点要原样留着：{body}"
+    );
+    assert!(!body.contains("[id=999]"), "假锚点必须在落库前摘掉：{body}");
+    assert!(body.contains("（未核实）"), "编造的那行要标出来：{body}");
 }
