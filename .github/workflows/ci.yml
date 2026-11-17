@@ -9,7 +9,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # 版本写死，不用 `@stable`：stable 漂移会让「本地全绿、CI 突然红」。
+      # 2026-11-17 就踩过——CI 解析到 1.100.0，新 `clippy::needless_range_loop`
+      # 判了 `for i in 0..n { v[i] }`，而本机 stable 卡在 1.99.1（镜像未同步），
+      # 本地根本复现不出来（连 `rustup toolchain install 1.100.0` 都是 404）。
+      # 升级步骤：`rustup update stable` → 本地跑一遍三道门禁 → 改这里的版本号。
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2

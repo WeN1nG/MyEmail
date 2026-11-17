@@ -252,7 +252,7 @@ me-app ──Command/Event──► me-sync ──► me-proto
 
 ## 其他
 
-- 工具链由 [rust-toolchain.toml](rust-toolchain.toml) 固定为 `stable`（不写死版本，避免镜像缺包）；edition 2024，MSRV 1.89（`rusqlite 0.41` / `libsqlite3-sys 0.39` 的要求，见 `cargo deny` 的 SQLite 说明）。
+- 工具链由 [rust-toolchain.toml](rust-toolchain.toml) 固定为 `stable`（不写死版本，避免镜像缺包）；edition 2024，MSRV 1.89（`rusqlite 0.41` / `libsqlite3-sys 0.39` 的要求，见 `cargo deny` 的 SQLite 说明）。**CI 的 clippy 版本单独写死在 [ci.yml](.github/workflows/ci.yml)（当前 `1.99.1`）**——本机 stable 受镜像限制常落后于官方 stable，`@stable` 会让新 lint 只在 CI 冒出来（2026-11-17：`needless_range_loop` 在 1.100.0 新增，本机 1.99.1 复现不出）。升 CI 版本时同步升本机再跑一遍门禁。
 - 新增依赖先核对 [deny.toml](deny.toml) 的许可证白名单，并跑 `cargo deny check`。CI 工作流见 [.github/workflows/ci.yml](.github/workflows/ci.yml)（**只在 windows-latest 上跑** fmt / clippy / test / deny）。
 - HTML v2 依赖 `scraper`（html5ever/selectors）、`cssparser`、`url`；不引入 WebView 或 JS 引擎。邮件正文字体族（`myemail-email` / `-bold` / `-mono`）在运行时从系统字体装配，找不到时回退内置字体。OAuth/HTML 的令牌与正文都不得进入日志。
 - `target/`、`dist/`、`checktemp/`、`.review/` 是本机构建产物、发布包与审查报告，不是源码。
