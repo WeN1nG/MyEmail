@@ -280,6 +280,8 @@ def check_notes(report, notes, version):
 def main():
     parser = argparse.ArgumentParser(description='发布前信息泄露自检')
     parser.add_argument('--dist', help='dist 下的版本目录，缺省取最新')
+    parser.add_argument('--version', help='真实版本号（如 0.5.0）。'
+                                       '目录名是快照形式（v05）时用它，否则会拿目录名去比对')
     args = parser.parse_args()
 
     dist = args.dist
@@ -290,8 +292,9 @@ def main():
     if not dist or not os.path.isdir(dist):
         sys.exit('找不到发布目录：用 --dist 指定（例如 --dist dist/0.3.0）')
 
-    version = os.path.basename(dist.rstrip('/\\'))
-    print(f'发布前信息泄露自检\n目录：{os.path.relpath(dist, ROOT)}\n')
+    # 目录名可能是快照形式（v05），不是版本号。取版本号做比对时要以真实版本为准。
+    version = args.version or os.path.basename(dist.rstrip('/\\'))
+    print(f'发布前信息泄露自检\n目录：{os.path.relpath(dist, ROOT)}\n版本：{version}\n')
 
     report = Report()
     check_exe(report, os.path.join(dist, 'myemail.exe'))

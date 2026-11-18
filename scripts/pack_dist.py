@@ -14,6 +14,13 @@
 用法：
     python scripts/pack_dist.py --version 0.3.0
     python scripts/pack_dist.py --version 0.3.0 --skip-build-check   # 明确知道 exe 是新的
+    python scripts/pack_dist.py --version 0.5.0 --dist-name v05       # 快照目录名与版本号不同
+
+**目录名与版本号为什么可以不同**：`dist/<版本>/` 是正式交付包（目录名 = 版本号，
+发布说明文件名 = `doc/<版本>发布说明.md`）；`dist/v01..v05/` 是**过程快照**
+（沿用旧版命名习惯，zip 叫 `v05code.zip`）。两者产物结构一致，只是命名不同。
+`--dist-name` 就是这个开关：版本号仍决定「取哪份发布说明」与「Cargo.toml 版本一致性检查」，
+`--dist-name` 只决定目录名与 zip 名。
 """
 
 import argparse
@@ -85,12 +92,14 @@ def newest_source_mtime(files):
 def main():
     parser = argparse.ArgumentParser(description='打发布包')
     parser.add_argument('--version', required=True, help='版本号，同时用作 dist 子目录名，例如 0.3.0')
+    parser.add_argument('--dist-name', help='dist 子目录名与 zip 名，缺省等于版本号（快照用，如 v05）')
     parser.add_argument('--skip-build-check', action='store_true', help='跳过「exe 是否比源码旧」的检查')
     args = parser.parse_args()
 
+    dist_name = args.dist_name or args.version
     exe_src = os.path.join(ROOT, 'target', 'release', 'myemail.exe')
-    dist = os.path.join(ROOT, 'dist', args.version)
-    zip_path = os.path.join(dist, f'{args.version}code.zip')
+    dist = os.path.join(ROOT, 'dist', dist_name)
+    zip_path = os.path.join(dist, f'{dist_name}code.zip')
     notes_src = os.path.join(ROOT, 'doc', f'{args.version}发布说明.md')
 
     if not os.path.exists(exe_src):
@@ -136,7 +145,7 @@ def main():
     print(f'exe     : {mb(exe_dst):.2f} MB')
     if os.path.exists(notes_dst):
         print(f'说明    : {os.path.relpath(notes_dst, ROOT)}')
-    print('\n下一步：python scripts/check_leak.py')
+    print('\n下一步：python scripts/check_leak.py --dist ' + os.path.relpath(dist, ROOT).replace('\\', '/'))
 
 
 if __name__ == '__main__':
