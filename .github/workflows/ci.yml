@@ -25,6 +25,14 @@ jobs:
       - name: Test
         run: cargo test --workspace
       - name: cargo-deny
+        # 版本写死，同上：cargo-deny 每次发新版都可能带来新的 lint 或配置字段，
+        # 而本机装的是 0.20.2，CI 若取最新版就会出现「本地全绿、CI 突然红」，
+        # 且**本地根本复现不出来**——deny.toml 里若用了新版才有的字段，
+        # 0.20.2 会报 unexpected-keys，反之亦然。
+        # 2026-11-18 实测：0.21.0 的 [advisories] 新增 ignore-expiry / ignore.allow，
+        # 0.20.2 不认，所以版本必须两边一致。
+        # 升级步骤：cargo install cargo-deny --version <新版本> --locked --root <临时目录>
+        # → 用该版本跑一遍 cargo deny check → 改这里的版本号。
         run: |
-          cargo install cargo-deny --locked
+          cargo install cargo-deny --version 0.21.0 --locked
           cargo deny check

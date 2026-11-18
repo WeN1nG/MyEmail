@@ -10,6 +10,27 @@ unmaintained = "workspace"
 # libsqlite3-sys 0.38 一直被拖进依赖树；连接工厂改为 `me-store/src/db.rs`
 # 里自实现的 `SqliteConnectionManager`（语义与原来完全一致）。
 # 升级 rusqlite 时先跑：cargo tree -i libsqlite3-sys，确认只剩一个 0.39+。
+#
+# **显式豁免**（不是关掉检查）：这两条是 `unmaintained` 类的 informational
+# advisory——上游 chronotope 宣布停止维护，**没有可用的修复版本**
+# （advisory 原文 "all versions are affected"），官方只推荐迁移到 jiff / time。
+# 它们**不是安全漏洞**，没有 CVE，也不影响构建与运行。
+#
+#   RUSTSEC-2026-0543  chrono      （2026-11-17 进 rustsec-db，故 CI 当天才红）
+#   RUSTSEC-2026-0555  chrono-tz
+#
+# 为什么不立刻迁移：`chrono` 在本项目里承载了日历重复规则展开与 DST 歧义处理
+# （`LocalResult::Ambiguous` / `None` 的择一策略，见 me-app/src/views/calendar.rs），
+# `time` / `jiff` 在这几点上的语义与 chrono 不同，贸然迁移会让**日程时间偏移**——
+# 那是个静默的、用户很难察觉的正确性 bug，比「上游停维护」严重得多。
+# 迁移应当作为独立一轮改动做（配套日历回归测试），不能夹在 CI 抢修里。
+#
+# 注意：豁免的是**这两条具体的 advisory**，不是整个 crate——
+# `chrono` 将来若出现真正的安全 advisory，cargo-deny 仍会照报。
+ignore = [
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
+]
 
 [licenses]
 confidence-threshold = 0.93
