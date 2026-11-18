@@ -21,6 +21,7 @@ pub enum Page {
     Weather,
     AiChat,
     Music,
+    Knowledge,
     Accounts,
     Settings,
 }
@@ -33,6 +34,7 @@ impl Page {
             Page::Weather => "天气",
             Page::AiChat => "AI",
             Page::Music => "音乐",
+            Page::Knowledge => "知识库",
             Page::Accounts => "账户",
             Page::Settings => "设置",
         }
@@ -361,6 +363,8 @@ pub struct UiState {
     pub attachment_dir: Option<PathBuf>,
     /// 用户自定义的每日简报提示词；**空串表示使用内置默认**。
     pub daily_briefing_prompt: String,
+    /// 系统通知的类别开关（v0.5）。默认全开，缺失类别按开处理。
+    pub notification_prefs: me_core::NotificationPrefs,
     /// 简报提示词的编辑草稿（弹窗打开时从上一行复制）。
     ///
     /// 与已保存值分开：点「取消」要能整份丢掉，半截编辑不该污染已保存的内容。
@@ -380,6 +384,11 @@ pub struct UiState {
     pub load_more_requested: bool,
     /// 保存草稿后关闭窗口。
     pub exit_requested: bool,
+
+    /// 知识库页状态（列表、筛选、详情、导入确认、下载进度）。
+    pub knowledge: crate::views::knowledge::KnowledgeState,
+    /// 待跳转的知识库文档（AI 回答里的 `[kb:N]` chip 点出来的）。
+    pub pending_kb_doc: Option<me_core::knowledge::KnowledgeDocId>,
 
     pub dialog: Dialog,
 
@@ -469,6 +478,8 @@ impl Default for UiState {
             calendar: crate::views::calendar::CalendarState::default(),
             weather: crate::views::weather::WeatherState::default(),
             music: MusicState::default(),
+            knowledge: crate::views::knowledge::KnowledgeState::default(),
+            pending_kb_doc: None,
             ai: crate::views::ai::AiPageState::default(),
             search: SearchState::default(),
             sync_progress: None,
@@ -488,6 +499,7 @@ impl Default for UiState {
             oauth_microsoft_tenant: String::new(),
             attachment_dir: None,
             daily_briefing_prompt: String::new(),
+            notification_prefs: me_core::NotificationPrefs::default(),
             daily_briefing_draft: String::new(),
             disk_low: false,
             folders_dirty: true,

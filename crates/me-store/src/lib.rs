@@ -19,6 +19,7 @@ mod contacts;
 mod db;
 mod drafts;
 mod folders;
+mod knowledge;
 mod messages;
 mod migrations;
 mod pending;

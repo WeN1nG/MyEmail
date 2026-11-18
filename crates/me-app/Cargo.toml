@@ -32,6 +32,7 @@ futures-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
+notify-rust = { workspace = true }
 tokio = { workspace = true }
 dirs = { workspace = true }
 rodio = { workspace = true }

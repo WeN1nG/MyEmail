@@ -10,6 +10,7 @@ mod audio;
 mod browser;
 mod fonts;
 mod images;
+mod notify;
 mod state;
 mod views;
 

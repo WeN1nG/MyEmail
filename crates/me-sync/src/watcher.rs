@@ -76,6 +76,10 @@ where
         {
             old.cancel();
         }
+        // 留一条启动日志：它是「watcher 到底有没有起来」的唯一直接证据。
+        // IDLE 连不上只会在失败时打日志，成功时静默——没有这条，
+        // 「后台收不到信」就分不清是「没起 watcher」还是「起了但不推送」。
+        tracing::info!(account = account.0, "watcher 已启动");
         let service = self.clone();
         tokio::spawn(async move { service.watch_loop(account, token).await });
     }
@@ -322,6 +326,19 @@ where
         self.emit_realtime(account.id, RealtimeMode::Idle, true, None)
             .await;
 
+        // **IDLE 的等待上限跟着轮询间隔走**，不再是固定 29 分钟。
+        //
+        // 原来等 29 分钟：服务器不推送（QQ 常见）或连接半死时，这 29 分钟里
+        // 既拿不到新邮件，也**没有任何日志**，表现就是「挂后台一直不更新」。
+        // 压到轮询间隔后，超时即当作一次轮询主动同步；服务器推得及时的话
+        // 仍然是秒级到达。
+        let wait_secs = IDLE_TIMEOUT_SECS.min(self.effective_poll_secs(account).max(1));
+        tracing::info!(
+            account = %me_core::mask_email(&account.email),
+            wait_secs,
+            "IDLE 已连接，开始监听 INBOX"
+        );
+
         loop {
             if token.is_cancelled() || !self.realtime_enabled() {
                 let _ = session.logout().await;
@@ -333,7 +350,7 @@ where
                     // IDLE 半状态连接不可复用；直接丢弃，不 logout。
                     return WatchOutcome::Stopped;
                 }
-                outcome = session.wait_for_changes(Duration::from_secs(IDLE_TIMEOUT_SECS)) => outcome,
+                outcome = session.wait_for_changes(Duration::from_secs(wait_secs)) => outcome,
             };
 
             match waited {
@@ -341,6 +358,10 @@ where
                     let now = now_unix();
                     self.emit_realtime(account.id, RealtimeMode::Idle, true, Some(now))
                         .await;
+                    tracing::info!(
+                        account = %me_core::mask_email(&account.email),
+                        "IDLE 收到服务器推送，触发同步"
+                    );
                     if !sleep_or_cancel(token, IDLE_DEBOUNCE_MS).await {
                         // 去抖期间被取消：连接已完成 DONE，可正常 logout。
                         let _ = session.logout().await;
@@ -349,7 +370,13 @@ where
                     self.request_realtime_sync(account.id, token.clone());
                 }
                 Ok(IdleOutcome::Timeout | IdleOutcome::ManualInterrupt) => {
-                    // wait_for_changes 已完成 DONE，连接可继续下一轮 IDLE。
+                    // **IDLE 超时 = 一次轮询**：连接已完成 DONE，可继续下一轮；
+                    // 同时主动同步一次，兜住「服务器压根不推送」的账户。
+                    tracing::debug!(
+                        account = %me_core::mask_email(&account.email),
+                        "IDLE 等待超时，按轮询处理"
+                    );
+                    self.request_realtime_sync(account.id, token.clone());
                 }
                 Err(err) => {
                     let _ = session.logout().await;
@@ -360,6 +387,11 @@ where
     }
 
     async fn polling_loop(&self, account: &Account, token: &CancellationToken) {
+        tracing::info!(
+            account = %me_core::mask_email(&account.email),
+            poll_secs = self.effective_poll_secs(account),
+            "进入轮询模式"
+        );
         self.emit_realtime(account.id, RealtimeMode::Polling, false, None)
             .await;
         loop {
@@ -387,6 +419,11 @@ where
                 .lock()
                 .expect("realtime syncing poisoned");
             if !syncing.insert(account) {
+                // 这条日志很关键：`realtime_syncing` 里还留着该账户时，
+                // 之后每一次实时同步都会**静默**变成「标记待重跑」。
+                // 如果它永远清不掉（下游任务 panic 等），表现就是
+                // 「后台再也不更新邮件，而且一条日志都没有」。
+                tracing::info!(account = account.0, "实时同步：已有任务在跑，标记待重跑");
                 self.inner
                     .realtime_pending
                     .lock()
@@ -395,6 +432,7 @@ where
                 return;
             }
         }
+        tracing::info!(account = account.0, "实时同步：开始");
 
         let service = self.clone();
         tokio::spawn(async move {
@@ -409,6 +447,7 @@ where
                     .expect("manual syncing poisoned")
                     .contains(&account);
                 if manual {
+                    tracing::info!(account = account.0, "实时同步：手动同步进行中，跳过本次");
                     break;
                 }
                 service.cancel_backfill(account);

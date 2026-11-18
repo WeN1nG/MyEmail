@@ -402,6 +402,91 @@ CREATE TABLE IF NOT EXISTS saved_searches (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_saved_searches_name ON saved_searches(name);
 "#;
 
+/// v9 DDL（v0.5 知识库）。**纯建表**：不 ALTER、不加列、不动既有索引，
+/// 老库升级只是多出几张空表，回滚就是删表。
+///
+/// 向量虚表 `kbvec.vec_chunks` **不在这里**：它建在独立的 `kb.sqlite` 里，
+/// 由 `ensure_vector_store()` 负责（删掉该文件等于删索引，主库毫发无损）。
+pub(crate) const SCHEMA_V9_DDL: &str = r#"
+-- 知识库文档（一份导入物 / 一封邮件 / 一次 AI 写入 = 一行）
+CREATE TABLE IF NOT EXISTS kb_documents (
+    id            INTEGER PRIMARY KEY,
+    -- file = 本地文件；mail = 邮件自动入库；ai = 工具写入
+    origin        TEXT NOT NULL DEFAULT 'file'
+                  CHECK (origin IN ('file','mail','ai')),
+    -- file: 规范化绝对路径；mail: 消息 id 的**字符串形式**；ai: 工具的 slug。
+    -- mail 也写字符串是必须的：UNIQUE(origin, source_ref) 要能成立，
+    -- 留空会让所有邮件记录互撞（第二条就报唯一约束）。
+    source_ref    TEXT NOT NULL DEFAULT '',
+    title         TEXT NOT NULL,
+    -- md / txt / docx / pdf / pptx / mail / text
+    kind          TEXT NOT NULL,
+    -- **邮件来源的整数外键**：删邮件时靠它兜底清掉知识库条目，
+    -- 不去解析 source_ref 字符串。非邮件来源为 NULL。这也是本表唯一的外键。
+    --
+    -- 注意：CASCADE 只会删掉本表的行，**向量与 FTS 都不会跟着删**，
+    -- 而且删完就再也拿不到 chunk_id——所以删邮件必须先跑 delete_doc_deep
+    -- （决策 O-26）。级联在这里只是「别留孤儿文档」的兜底。
+    mail_id       INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+    size_bytes    INTEGER NOT NULL DEFAULT 0,
+    -- sha256(内容指纹)。正文变化后重新入库靠它判定，不去比全文。
+    content_hash  TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','extracted','chunked','embedded',
+                                    'skipped','failed')),
+    skip_reason   TEXT,
+    chunk_count   INTEGER NOT NULL DEFAULT 0,
+    char_count    INTEGER NOT NULL DEFAULT 0,
+    -- rule（本地结构拆）/ llm（模型拆）
+    splitter      TEXT,
+    embed_model   TEXT,
+    embed_dim     INTEGER NOT NULL DEFAULT 0,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    error         TEXT,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    UNIQUE(origin, source_ref)
+);
+CREATE INDEX IF NOT EXISTS ix_kb_documents_status
+    ON kb_documents(status, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_kb_documents_mail
+    ON kb_documents(mail_id) WHERE mail_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_kb_documents_origin
+    ON kb_documents(origin, id DESC);
+
+CREATE TABLE IF NOT EXISTS kb_chunks (
+    id         INTEGER PRIMARY KEY,
+    doc_id     INTEGER NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+    ord        INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    char_count INTEGER NOT NULL,
+    -- pdf 页码 / pptx 幻灯片号 / md 标题路径 / 邮件段落序号
+    locator    TEXT,
+    embedded   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(doc_id, ord)
+);
+CREATE INDEX IF NOT EXISTS ix_kb_chunks_doc ON kb_chunks(doc_id, ord);
+CREATE INDEX IF NOT EXISTS ix_kb_chunks_pending
+    ON kb_chunks(doc_id) WHERE embedded = 0;
+
+-- 语块级全文检索。**普通 FTS5，不是外部内容表**：多存一份文本换「删除逻辑
+-- 简单一个数量级」，语块总量通常只几十 MB。
+--
+-- tokenizer **不是 trigram**：实测 trigram 对中文 2 字词（合同/预算/审查）
+-- 全部 0 命中。改用 unicode61 + 中文逐字空格化 + 短语查询（决策 O-20），
+-- 写入与查询都必须过 me_core::text::fts_fold。
+CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts USING fts5(text, tokenize='unicode61');
+
+CREATE TABLE IF NOT EXISTS kb_doc_entities (
+    doc_id    INTEGER NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+    entity_id INTEGER NOT NULL REFERENCES ai_entities(id) ON DELETE CASCADE,
+    -- 命中的语块数：用来排「这份文档主要讲谁」
+    hits      INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (doc_id, entity_id)
+);
+CREATE INDEX IF NOT EXISTS ix_kb_doc_entities_entity ON kb_doc_entities(entity_id);
+"#;
+
 /// v1 → v2 的纯加列 + 索引 + 数据整理。
 ///
 /// 注意：`messages` 清理依赖 `ON DELETE CASCADE`，调用方必须保持外键开启。
@@ -504,10 +589,11 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
             migrate_v7_to_v8(&mut conn)?;
+            migrate_v8_to_v9(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 backup = %backup.display(),
-                "database migrated v1 -> v8"
+                "database migrated v1 -> v9"
             );
             Ok(conn)
         }
@@ -519,9 +605,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
             migrate_v7_to_v8(&mut conn)?;
+            migrate_v8_to_v9(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v2 -> v8"
+                "database migrated v2 -> v9"
             );
             Ok(conn)
         }
@@ -532,9 +619,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
             migrate_v7_to_v8(&mut conn)?;
+            migrate_v8_to_v9(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v3 -> v8"
+                "database migrated v3 -> v9"
             );
             Ok(conn)
         }
@@ -544,9 +632,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
             migrate_v7_to_v8(&mut conn)?;
+            migrate_v8_to_v9(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v4 -> v8"
+                "database migrated v4 -> v9"
             );
             Ok(conn)
         }
@@ -555,9 +644,10 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             migrate_v5_to_v6(&mut conn)?;
             migrate_v6_to_v7(&mut conn)?;
             migrate_v7_to_v8(&mut conn)?;
+            migrate_v8_to_v9(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v5 -> v8"
+                "database migrated v5 -> v9"
             );
             Ok(conn)
         }
@@ -565,18 +655,29 @@ pub(crate) fn ensure_schema(mut conn: Connection, db_path: &Path) -> Result<Conn
             let started = std::time::Instant::now();
             migrate_v6_to_v7(&mut conn)?;
             migrate_v7_to_v8(&mut conn)?;
+            migrate_v8_to_v9(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v6 -> v8"
+                "database migrated v6 -> v9"
             );
             Ok(conn)
         }
         Some(7) => {
             let started = std::time::Instant::now();
             migrate_v7_to_v8(&mut conn)?;
+            migrate_v8_to_v9(&mut conn)?;
             tracing::info!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
-                "database migrated v7 -> v8"
+                "database migrated v7 -> v9"
+            );
+            Ok(conn)
+        }
+        Some(8) => {
+            let started = std::time::Instant::now();
+            migrate_v8_to_v9(&mut conn)?;
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "database migrated v8 -> v9"
             );
             Ok(conn)
         }
@@ -599,6 +700,11 @@ fn create_schema(conn: &mut Connection) -> Result<(), CoreError> {
     // 新建库走的是「累积式 DDL」，与 v4/v5 的列一样直接进主 DDL。
     tx.execute_batch(SCHEMA_V7_DDL)
         .map_err(|e| storage(format!("创建 v7 schema 失败: {e}")))?;
+    // v9 是**新建表**，必须显式加进这条累积链：v8 只是加列，
+    // 由 SCHEMA_V3_DDL 带上；而知识库的表没有任何旧 DDL 会顺带创建，
+    // 漏了这一步新装用户就没有知识库表。
+    tx.execute_batch(SCHEMA_V9_DDL)
+        .map_err(|e| storage(format!("创建 v9 schema 失败: {e}")))?;
     tx.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?1)",
         params![SCHEMA_VERSION.to_string()],
@@ -941,6 +1047,31 @@ fn migrate_v7_to_v8(conn: &mut Connection) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// v8 → v9：知识库**纯建表**。不动任何既有表、不加列、不改索引。
+///
+/// 失败即整个事务回滚，`schema_version` 保持 8，下次启动可重试。
+fn migrate_v8_to_v9(conn: &mut Connection) -> Result<(), CoreError> {
+    const TARGET: u32 = 9;
+    let tx = conn
+        .transaction()
+        .map_err(|e| storage(format!("开始 v8→v9 迁移事务失败: {e}")))?;
+
+    tx.execute_batch(SCHEMA_V9_DDL)
+        .map_err(|e| storage(format!("执行 v8→v9 迁移失败: {e}")))?;
+
+    // 版本号写 meta 表，不是 PRAGMA user_version —— 与既有迁移保持一致。
+    tx.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+        params![TARGET.to_string()],
+    )
+    .map_err(|e| storage(format!("写入 schema_version 失败: {e}")))?;
+
+    check_foreign_keys(&tx)?;
+    tx.commit()
+        .map_err(|e| storage(format!("提交 v8→v9 迁移失败: {e}")))?;
+    Ok(())
+}
+
 /// 迁移必须保持 `foreign_keys = ON`；任何悬空子行都会在这里暴露。
 fn check_foreign_keys(tx: &rusqlite::Transaction<'_>) -> Result<(), CoreError> {
     let mut stmt = tx
@@ -1001,6 +1132,13 @@ impl MetaRepo for WritableStore {
     fn get_setting(&self, key: &str) -> Result<Option<String>, CoreError> {
         let conn = self.lock();
         read_setting_conn(&conn, key)
+    }
+
+    fn delete_setting(&self, key: &str) -> Result<(), CoreError> {
+        let conn = self.lock();
+        conn.execute("DELETE FROM meta WHERE key = ?1", params![key])
+            .map_err(|e| storage(format!("删除 meta.{key} 失败: {e}")))?;
+        Ok(())
     }
 
     fn available_bytes(&self) -> Result<Option<u64>, CoreError> {

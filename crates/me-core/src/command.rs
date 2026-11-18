@@ -343,6 +343,71 @@ pub enum Command {
     SetDailyBriefingPrompt {
         prompt: String,
     },
+    /// 单个通知类别的开关。
+    ///
+    /// 只写 `meta.notify_<kind>`，不发事件：设置页提交时乐观更新，
+    /// 启动时的回显由 `Event::SettingsLoaded` 的 `notification_prefs` 负责。
+    /// 真正决定「发不发」的仍然是界面（它才知道窗口是不是在前台）。
+    SetNotificationPref {
+        kind: crate::notify::NotificationKind,
+        on: bool,
+    },
+
+    // ---- 知识库（v0.5）----
+    /// 导入一个本地文件。**只接受路径，不接受内容**：文件选择只能由用户在界面上做。
+    ///
+    /// 前端在发这条命令之前必须先过两道闸门（决策 O-18）：
+    /// 1. pdf/pptx 需要可用模型（不支持文档输入时在对话框阶段就拦住）；
+    /// 2. 一次性总确认（费用 + 隐私）与每一次的预估（页数 / 批数 / token 区间）。
+    ImportKnowledgeFile {
+        path: String,
+    },
+    /// 只探测、不导入：为了在预估框里显示页数/批数，必须在发送前先拿到这些数。
+    ProbeKnowledgeFile {
+        path: String,
+    },
+    DeleteKnowledgeDoc {
+        doc: crate::knowledge::KnowledgeDocId,
+    },
+    /// 重建索引（重新提取 → 重新拆分 → 重新向量化）。
+    RebuildKnowledgeDoc {
+        doc: crate::knowledge::KnowledgeDocId,
+    },
+    UpdateKnowledgeDoc {
+        doc: crate::knowledge::KnowledgeDocId,
+        /// 三态：`Some/None` 区分「改」与「不改」，不要用空串表示不改。
+        title: Option<String>,
+        enabled: Option<bool>,
+    },
+    /// 界面搜索框用。**AI 工具内部不走这条命令**（它直接调检索）。
+    SearchKnowledge {
+        query: String,
+        limit: u32,
+    },
+    /// 下载外置嵌入模型。用户必须在界面上显式确认后才发。
+    DownloadEmbedModel,
+    CancelEmbedModelDownload,
+    /// 邮件自动入库的容量上限（决策 O-16）。
+    /// `0` = 关闭自动入库；>0 = 只索引**最新的前 N 封**，超出容量的旧文档连带向量一起清掉。
+    SetKnowledgeMailCapacity {
+        capacity: u32,
+    },
+    /// PDF / PPT 需要大模型分析的**一次性总确认**（决策 O-18）。
+    /// 写 `meta.kb_llm_ack`；`accepted = false` 等于清掉标记（设置页「重新显示提示」）。
+    SetKbLlmAck {
+        accepted: bool,
+    },
+    /// 用户在确认卡片上点了「确认删除」。
+    ConfirmKnowledgeDelete {
+        doc: crate::knowledge::KnowledgeDocId,
+    },
+    /// 重新探测老格式转换器（soffice / Office COM）。
+    RecheckKbConverter,
+    /// 用户点了「暂不启用语义检索」（`true`）或后来的「启用」（`false`）。
+    /// 只控制**引导卡的显示**，不改变模型文件是否存在。
+    SetKbEmbedDeclined {
+        declined: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -532,6 +597,10 @@ pub enum Event {
         /// 空串而不是 `Option`：设置页要拿它做输入框初值，`String` 少一层解包；
         /// 「是否自定义」用 `is_empty()` 判断即可。
         daily_briefing_prompt: String,
+        /// 各类系统通知的开关（v0.5）。缺失的类别按**开**处理。
+        notification_prefs: crate::notify::NotificationPrefs,
+        /// 知识库设置快照（容量、LLM 确认、嵌入模型、转换器）。
+        knowledge: crate::knowledge::KnowledgeSettings,
     },
     /// 附件缓存目录已迁移到新位置；旧文件已搬移、数据库路径已更新。
     AttachmentDirChanged {
@@ -763,6 +832,14 @@ pub enum Event {
     // ---- AI（v0.3）----
     /// 会话列表变化（新建 / 重命名 / 删除 / `updated_at` 变化）。
     AiConversationsChanged,
+    /// 会话已建（用户点了「＋ 新对话」）。
+    ///
+    /// 与 `AiConversationsChanged` 分开：那个只表示「列表要重拉」，不带 id，
+    /// 界面据此无法切到新会话（v0.5 之前新建完仍停在旧会话上）。
+    /// 也**不能复用** `AiDailyBriefingStarted`——那个语义含「AI 主动开口」。
+    AiConversationCreated {
+        conversation: crate::ai::AiConversationId,
+    },
     /// 「今日简报」已经发起（会话已建、流马上开始）。
     ///
     /// 与 `AiStreamStarted` 分开：那个事件用户主动提问时也会发，界面不能
@@ -938,6 +1015,69 @@ pub enum Event {
         privacy_ack_openai: bool,
         entity_count: u32,
     },
+    // ---- 知识库（v0.5）----
+    /// 知识库有变化（新增 / 状态变化 / 删除）。**带一份进度快照**，
+    /// 界面不必回查就能画出「已索引 180 / 200 封」。
+    KnowledgeChanged {
+        stats: crate::knowledge::KnowledgeStats,
+    },
+    /// 摄入进度。**必须进 `is_progress()`**（可丢）——几千块逐批发进度，
+    /// 不设成可丢会把 1024 容量的事件队列占死。
+    KnowledgeProgress {
+        doc: crate::knowledge::KnowledgeDocId,
+        stage: crate::knowledge::KbStage,
+        done: u32,
+        total: u32,
+    },
+    KnowledgeDocFailed {
+        doc: crate::knowledge::KnowledgeDocId,
+        message: String,
+        stage: crate::knowledge::KbStage,
+    },
+    /// 判定为无效内容。**这是正常结果，不是错误**，界面显示「未索引」。
+    KnowledgeDocSkipped {
+        doc: crate::knowledge::KnowledgeDocId,
+        reason: crate::knowledge::SkipReason,
+    },
+    /// AI 调 `kb_delete` 时发出。界面出确认卡片，用户点了才真删。
+    KnowledgeDeleteRequested {
+        doc: crate::knowledge::KnowledgeDocId,
+        title: String,
+        chunks: u32,
+    },
+    /// 导入前的探测结果：预估框靠它显示「300 页 / 3 批 / 约 $1.4~2.7」。
+    KnowledgeFileProbed {
+        path: String,
+        kind: crate::knowledge::KbKind,
+        bytes: u64,
+        pages: u32,
+        batches: u32,
+        tokens_low: u32,
+        tokens_high: u32,
+        /// 内置价表里的参考美元区间；模型不在表里时是 `None`（界面只说 token 区间）。
+        cost_usd: Option<(f32, f32)>,
+        /// 为什么不能导入（例如「当前模型不具备文档识别能力」）。
+        blocked: Option<String>,
+    },
+    /// 界面搜索框的结果。
+    KnowledgeSearchResults {
+        query: String,
+        hits: Vec<crate::knowledge::KbSearchHit>,
+        mode: crate::knowledge::RetrievalMode,
+        /// 检索失败时的说明（降级成 `fts_only` 不算失败，`mode` 已经表达）。
+        error: Option<String>,
+    },
+    EmbedModelDownloadProgress {
+        done: u64,
+        total: Option<u64>,
+    },
+    EmbedModelReady {
+        model: String,
+        dim: u32,
+    },
+    EmbedModelFailed {
+        message: String,
+    },
     Error {
         scope: ErrorScope,
         message: String,
@@ -957,6 +1097,10 @@ impl Event {
                 | Event::AiStreamDelta { .. }
                 // 尝试角标是可丢的：丢一次只是少一个「第 2/3 次」，不影响最终态。
                 | Event::AiPlanStepAttempt { .. }
+                // 摄入进度与模型下载进度同理：它们是「几千块逐批发」的高频事件，
+                // 不进白名单就会把 1024 容量的事件队列占死，关键事件全被卡住。
+                | Event::KnowledgeProgress { .. }
+                | Event::EmbedModelDownloadProgress { .. }
         )
     }
 
@@ -1199,6 +1343,8 @@ mod tests {
             music_dir: Some(PathBuf::from("C:/music")),
             music_order: MusicOrder::Shuffle,
             daily_briefing_prompt: String::new(),
+            notification_prefs: crate::notify::NotificationPrefs::default(),
+            knowledge: crate::knowledge::KnowledgeSettings::default(),
         };
         let json = serde_json::to_string(&settings).unwrap();
         let back: Event = serde_json::from_str(&json).unwrap();

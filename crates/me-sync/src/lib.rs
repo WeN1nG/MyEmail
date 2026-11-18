@@ -11,6 +11,7 @@ pub mod drafts;
 pub mod engine;
 pub mod events;
 pub mod indexer;
+pub mod knowledge;
 pub mod oauth_flow;
 pub mod tasks;
 mod threads;
@@ -95,6 +96,8 @@ pub struct Inner<S, F, M> {
         Mutex<HashMap<String, tokio::sync::oneshot::Sender<me_core::MusicOutcome>>>,
     /// 线程头回填正在跑（本地任务，全局单飞）。
     pub(crate) threads_running: AtomicBool,
+    /// 知识库：嵌入器、摄入队列、模型下载与容量缓存。
+    pub(crate) knowledge: knowledge::KnowledgeState,
 }
 
 /// 用于比较目录归属：优先规范化（Windows 下同时统一大小写与分隔符），
@@ -184,6 +187,7 @@ where
                 ai_state: Mutex::new(AiState::default()),
                 ai_music_pending: Mutex::new(HashMap::new()),
                 threads_running: AtomicBool::new(false),
+                knowledge: knowledge::KnowledgeState::default(),
             }),
         }
     }
@@ -348,6 +352,29 @@ where
             .map(|value| value.trim().to_string())
             .unwrap_or_default();
 
+        // 通知开关：每类一个 `meta` 键，**缺失按开处理**（默认全开，
+        // 升级后不会因为多出一个类别就突然收不到通知）。
+        let kinds = me_core::notify::NotificationKind::ALL;
+        let notify_values = self
+            .db(move |s| {
+                let mut values = Vec::with_capacity(kinds.len());
+                for kind in kinds {
+                    values.push((kind, s.get_setting(&kind.meta_key())?));
+                }
+                Ok(values)
+            })
+            .await
+            .ok()
+            .unwrap_or_default();
+        let notification_prefs = me_core::notify::NotificationPrefs::from_meta(&notify_values);
+
+        // 知识库：容量、确认标记、模型是否就绪、转换器探测结果。
+        // 同时做三件启动期的事：清 kb/tmp、按容量把邮件排进队列、唤醒 worker。
+        self.load_knowledge_settings().await;
+        knowledge::extract::clean_tmp(self.inner.paths.kb_tmp_dir());
+        let knowledge = self.knowledge_settings();
+        self.sync_mail_documents().await;
+
         self.emit(Event::SettingsLoaded {
             theme,
             body_backfill,
@@ -365,6 +392,8 @@ where
             music_dir,
             music_order,
             daily_briefing_prompt,
+            notification_prefs,
+            knowledge,
         })
         .await;
 
@@ -702,6 +731,12 @@ where
     // -----------------------------------------------------------------------
 
     fn dispatch(&self, command: Command) {
+        // 知识库命令自成一套（异步、独立队列），先交给它处理；
+        // 命中就不进下面那个巨大的 match，避免再散十几个分支进去。
+        if Self::is_knowledge_command(&command) {
+            self.handle_knowledge_command(command);
+            return;
+        }
         match command {
             Command::AddAccount(draft) => {
                 let service = self.clone();
@@ -794,6 +829,18 @@ where
                 tokio::spawn(async move {
                     let _ = service
                         .db(move |s| s.set_setting(me_core::settings_key::THEME, mode.as_str()))
+                        .await;
+                });
+            }
+            Command::SetNotificationPref { kind, on } => {
+                // 存 `1` / `0` 而不是 `true` / `false`：`from_meta` 两种都认，
+                // 但短字符串更好读日志。**键名由 `NotificationKind::meta_key` 生成**，
+                // 别在这里手写 `format!`——那边是持久化格式的唯一来源。
+                let service = self.clone();
+                tokio::spawn(async move {
+                    let value = if on { "1" } else { "0" };
+                    let _ = service
+                        .db(move |s| s.set_setting(&kind.meta_key(), value))
                         .await;
                 });
             }
@@ -1083,6 +1130,22 @@ where
                 let service = self.clone();
                 tokio::spawn(async move { service.handle_daily_ai_briefing().await });
             }
+            // 知识库命令在上面已经交给 `handle_knowledge_command`。这里逐个列出
+            // 只是为了 match 的穷尽性——**刻意不用 `_ => {}`**：以后再加命令时，
+            // 编译期会强制你想清楚「它归谁处理」。
+            Command::ImportKnowledgeFile { .. }
+            | Command::ProbeKnowledgeFile { .. }
+            | Command::DeleteKnowledgeDoc { .. }
+            | Command::ConfirmKnowledgeDelete { .. }
+            | Command::RebuildKnowledgeDoc { .. }
+            | Command::UpdateKnowledgeDoc { .. }
+            | Command::SearchKnowledge { .. }
+            | Command::DownloadEmbedModel
+            | Command::CancelEmbedModelDownload
+            | Command::SetKnowledgeMailCapacity { .. }
+            | Command::SetKbLlmAck { .. }
+            | Command::RecheckKbConverter
+            | Command::SetKbEmbedDeclined { .. } => {}
             Command::SetDailyBriefingPrompt { prompt } => {
                 let service = self.clone();
                 tokio::spawn(async move { service.handle_set_daily_briefing_prompt(prompt).await });
@@ -1135,6 +1198,8 @@ where
         tokio::spawn(async move {
             tracing::info!(task = %task_id, account = account.0, "sync task started");
             service.sync_account(account, only_folder, token).await;
+            // 同步收尾：按容量窗口把新邮件排进知识库队列（决策 O-08/O-16）。
+            service.sync_mail_documents().await;
             service
                 .inner
                 .manual_syncing
@@ -1249,6 +1314,8 @@ where
 
     async fn handle_delete_account(&self, id: AccountId, delete_drafts: bool) {
         let account = self.account(id).await.ok();
+        // 同理：账户删除会级联删掉该账户所有邮件，知识库条目必须先自己清。
+        let _ = self.db(move |s| s.purge_mail_account(id)).await;
         match self.db(move |s| s.delete_account(id, delete_drafts)).await {
             Ok(me_core::port::DeleteAccountOutcome::Deleted) => {
                 self.inner.tasks.cancel(id);
@@ -1505,6 +1572,9 @@ where
                     .or_default()
                     .push(message.id);
             }
+            // 删消息前先把知识库条目深删（决策 O-26）：`mail_id` 的 CASCADE
+            // 只删文档行，向量与 FTS 会留在原地，而且删完就再也拿不到 chunk_id。
+            self.purge_mail_documents(&permanent).await;
             let permanent_for_db = permanent.clone();
             match self
                 .db(move |s| s.delete_permanent(&permanent_for_db))
@@ -1665,6 +1735,7 @@ where
         if ids.is_empty() {
             return;
         }
+        self.purge_mail_documents(&ids).await;
         let ids_for_db = ids.clone();
         match self.db(move |s| s.delete_permanent(&ids_for_db)).await {
             Ok(_) => {

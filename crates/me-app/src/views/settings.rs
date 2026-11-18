@@ -39,6 +39,10 @@ pub fn show(
     ui.heading("设置");
     ui.add_space(6.0);
 
+    // 容量下拉的本地草稿：只有用户真选了别的值才发命令，
+    // 否则每次重绘都会推一次设置（ComboBox 打开时也会触发）。
+    let mut capacity = state.knowledge.settings.mail_capacity;
+
     page_scroll_area().show(ui, |ui| {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("AI 服务").strong());
@@ -91,6 +95,29 @@ pub fn show(
 
         ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("通知").strong());
+            // 只画 `WIRED`：知识库那两类要等批 4 / 批 7 接上，
+            // 先摆一个勾了也不生效的开关比不摆更糟。
+            for kind in me_core::NotificationKind::WIRED {
+                let mut on = state.notification_prefs.is_on(kind);
+                if ui.checkbox(&mut on, kind.label()).changed() {
+                    state.notification_prefs.set(kind, on);
+                    commands.push(Command::SetNotificationPref { kind, on });
+                }
+            }
+            ui.label(
+                RichText::new(
+                    "系统通知只在应用不在前台时发（前台有应用内提示）。同类通知有冷却：\
+                     新邮件 5 分钟、同步失败 30 分钟，避免同步多个文件夹时连弹。\
+                     点击通知不会跳转。",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+        });
+
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new("同步与索引").strong());
             let mut backfill = state.body_backfill;
             if ui
@@ -131,7 +158,9 @@ pub fn show(
             });
             ui.label(
                 RichText::new(
-                    "只监听收件箱（INBOX）；IDLE 连续失败 3 次后自动改用轮询。轮询会与手动同步共用连接。",
+                    "只监听收件箱（INBOX）；IDLE 连续失败 3 次后自动改用轮询。\
+                     服务器不推送时，IDLE 空闲到「默认轮询间隔」也会强制同步一次——\
+                     所以背景收信的最差延迟就是这个间隔（默认 60 秒）。轮询会与手动同步共用连接。",
                 )
                 .small()
                 .color(Color32::GRAY),
@@ -178,6 +207,111 @@ pub fn show(
                 RichText::new("用于兜底修复：清空 FTS 后按已缓存正文重新导入。")
                     .small()
                     .color(Color32::GRAY),
+            );
+        });
+
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new("知识库").strong());
+
+            // ---- 邮件自动入库容量 ----
+            ui.horizontal(|ui| {
+                ui.label("邮件自动入库");
+                let current = state.knowledge.settings.mail_capacity;
+                egui::ComboBox::from_id_salt("kb_mail_capacity")
+                    .selected_text(capacity_label(current))
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        for option in [0u32, 50, 100, 200, 500, 1000] {
+                            ui.selectable_value(
+                                &mut capacity,
+                                option,
+                                capacity_label(option),
+                            );
+                        }
+                    });
+                if capacity != current {
+                    commands.push(Command::SetKnowledgeMailCapacity { capacity });
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "只索引最新 N 封邮件（全局总量，不是每个账户各 N 封）。\
+                     超出容量的旧条目会连同向量一起清掉；调小容量会立刻触发清理。\
+                     设为「关闭」后不再自动入库，已有条目仍可搜索。",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+
+            // ---- 语义检索状态 ----
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("语义检索");
+                match state.knowledge.settings.embed_model.as_deref() {
+                    Some(model) => {
+                        ui.label(
+                            RichText::new(format!("已就绪（{model}）"))
+                                .color(Color32::from_rgb(0x2E, 0x9E, 0x5B)),
+                        );
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("未启用（仅关键词检索）")
+                                .color(Color32::from_rgb(0xE0, 0x8A, 0x1E)),
+                        );
+                    }
+                }
+                if state.knowledge.settings.embed_declined
+                    && ui.button("重新启用").clicked() {
+                        commands.push(Command::SetKbEmbedDeclined { declined: false });
+                        state.knowledge.settings.embed_declined = false;
+                        state.knowledge.settings.embed_model = None;
+                    }
+            });
+            ui.label(
+                RichText::new(
+                    "嵌入模型是外置文件（约 96 MB，来自 ModelScope），只在本机推理，\
+                     邮件与文档内容不会因此上传。模型就绪后，之前只分块的条目会自动补向量。",
+                )
+                .small()
+                .color(Color32::GRAY),
+            );
+
+            // ---- 导入确认与转换器 ----
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if !state.knowledge.settings.llm_ack {
+                    ui.label(
+                        RichText::new("尚未确认 PDF/PPT 的模型费用与隐私提示")
+                            .small()
+                            .color(Color32::from_rgb(0xE0, 0x8A, 0x1E)),
+                    );
+                    if ui.small_button("重新显示提示").clicked() {
+                        commands.push(Command::SetKbLlmAck { accepted: false });
+                        state.knowledge.settings.llm_ack = false;
+                    }
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "老格式转换器：{}",
+                        converter_label(state.knowledge.settings.converter.as_deref())
+                    ))
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                if ui.small_button("重新检测").clicked() {
+                    commands.push(Command::RecheckKbConverter);
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "转换器用于 .doc / .ppt 等老格式：优先用 LibreOffice（soffice），\
+                     没有就用本机 Word / PowerPoint。两者都没有时，这些格式无法导入——\
+                     先转成 .docx / .pptx 即可。",
+                )
+                .small()
+                .color(Color32::GRAY),
             );
         });
 
@@ -470,6 +604,25 @@ pub fn open_path(path: &Path) {
     #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
     {
         let _ = path;
+    }
+}
+
+/// 容量下拉的显示文本。`0` 是「关闭」，其余是「最近 N 封」。
+fn capacity_label(capacity: u32) -> String {
+    if capacity == 0 {
+        "关闭".to_string()
+    } else {
+        format!("最近 {capacity} 封")
+    }
+}
+
+/// 转换器探测结果的中文名。
+fn converter_label(converter: Option<&str>) -> &'static str {
+    match converter {
+        Some("soffice") => "LibreOffice",
+        Some("office") => "本机 Office",
+        Some("none") => "不可用",
+        _ => "未探测",
     }
 }
 

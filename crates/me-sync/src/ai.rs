@@ -415,7 +415,7 @@ where
         self.clone()
     }
 
-    fn ai_provider(&self) -> Option<Arc<dyn AiProvider>> {
+    pub(crate) fn ai_provider(&self) -> Option<Arc<dyn AiProvider>> {
         self.inner
             .ai_provider
             .read()
@@ -424,7 +424,7 @@ where
     }
 
     /// 模型档案快照（调用方要跨 await 使用时用）。
-    fn models_snapshot(&self) -> (Vec<AiModel>, Option<String>) {
+    pub(crate) fn models_snapshot(&self) -> (Vec<AiModel>, Option<String>) {
         match self.inner.ai_state.lock() {
             Ok(state) => (state.models.clone(), state.active.clone()),
             Err(_) => (Vec::new(), None),
@@ -435,7 +435,7 @@ where
     ///
     /// key 就在模型档案里，和其他参数一起读——没有缓存、没有密钥库、
     /// 也没有「档案里改了 key 但缓存还是旧的」这类状态。
-    fn ai_credential(model: &AiModel) -> Option<AiCredential> {
+    pub(crate) fn ai_credential(model: &AiModel) -> Option<AiCredential> {
         if model.has_key() {
             Some(AiCredential::new(model.api_key.trim().to_string()))
         } else {
@@ -548,6 +548,8 @@ where
                         // 旧版 key 只在系统密钥库里，而 key 现在是普通参数，
                         // 读不回来也不编造：留空，界面提示用户重新填一次。
                         api_key: String::new(),
+                        // 旧档案没有这个能力位：Anthropic 原生支持文档输入，其余按不支持算。
+                        pdf_input: matches!(config.kind, AiProviderKind::Anthropic),
                     }
                 }
                 None => AiModel::preset(
@@ -848,7 +850,16 @@ where
             .db(move |s| s.create_conversation("新对话", Some(&model_id), &config))
             .await
         {
-            Ok(_) => self.emit(Event::AiConversationsChanged).await,
+            Ok(conversation) => {
+                // **先把 id 发出去再发列表变更**：列表变更只置脏，界面拿不到
+                // 「新建的是哪一个」，会停留在旧会话上。顺序也固定——
+                // 两个事件都进同一个通道，UI 按到达顺序处理。
+                self.emit(Event::AiConversationCreated {
+                    conversation: conversation.id,
+                })
+                .await;
+                self.emit(Event::AiConversationsChanged).await;
+            }
             Err(err) => self.emit_ai_error(err).await,
         }
     }
@@ -1603,6 +1614,14 @@ where
         let mut final_allows_bookkeeping = false;
         // 这个出口只开一次：用完之后就不再下发，免得模型在收尾期反复记账。
         let mut final_bookkeeping_used = false;
+        // 观测到「模型在收尾期想调只读业务工具」之后，给它补一次的机会。
+        //
+        // 2026-11-18：模型在 Final 阶段才发现计划漏了天气数据，但收尾阶段
+        // 一个业务工具都不给，它只能编一个理由（「查询受限」）交差。
+        // 只读工具没有副作用，补一次是安全的；写工具仍然一律禁。
+        let mut final_allows_readonly = false;
+        // 这个出口同样只开一次：补完就必须收尾，不能在收尾期反复查。
+        let mut final_readonly_used = false;
         // 成功调用的工具正文。兜底时原样交给用户——数据在手就不该说「没拿到」。
         // 只留非清单类工具，且不进 `tool_trace`（那会把上下文顶爆）。
         let mut deliveries: Vec<(AiToolName, String)> = Vec::new();
@@ -1739,12 +1758,25 @@ where
                 Phase::Replan => replan_tools.clone(),
                 // 收尾阶段原则上不给工具：只要一段答复。
                 //
-                // 例外是**已经观测到**模型在这里想调 `plan_update` 的情形
+                // 例外一：已经观测到模型在这里想调 `plan_update` 的情形
                 // （`dropped_calls > 0`）：它是纯内存、无 IO、不占工具预算，
                 // 收回它只会让模型把最后一轮花在「汇报完成」上，然后交出空白。
-                // 只放这一个，业务工具仍然一律禁——放业务工具等于绕过执行期。
-                Phase::Final if final_allows_bookkeeping && !final_bookkeeping_used => {
+                //
+                // 例外二：已经观测到模型想调**只读业务工具**的情形
+                // （`final_allows_readonly`）：那是它发现计划漏了数据。
+                // 2026-11-18 的事故里，模型在收尾阶段才发现少查了天气，
+                // 而收尾阶段一个业务工具都不给，它只能自己编一个理由——
+                // 回复里写下「天气详情未能获取（查询受限）」，而接口一直是好的。
+                // 只读工具没有副作用，放行一次是安全的；写工具仍然一律禁。
+                Phase::Final
+                    if final_allows_bookkeeping
+                        && !final_bookkeeping_used
+                        && !final_allows_readonly =>
+                {
                     final_bookkeeping_tools(&execute_tools)
+                }
+                Phase::Final if final_allows_readonly && !final_readonly_used => {
+                    final_readonly_tools(&execute_tools)
                 }
                 Phase::Reflect | Phase::Final => Vec::new(),
             };
@@ -1753,10 +1785,18 @@ where
             // 2026-11-07 的事故：收尾阶段模型仍按系统提示第 10 条去调
             // `plan_update`，而这一阶段根本没有下发工具——它只好把调用写成
             // 正文里的一段标签，用户看到的是一坨 XML。
-            request.system = match phase_system_suffix(phase) {
-                Some(suffix) => format!("{base_system}\n\n{suffix}"),
-                None => base_system.clone(),
-            };
+            //
+            // 收尾阶段**补数据**时换成另一句：这时工具是放行的，
+            // 再说「不许调工具」会和实际下发的工具打架。
+            request.system =
+                if phase == Phase::Final && final_allows_readonly && !final_readonly_used {
+                    format!("{base_system}\n\n{}", final_readonly_suffix())
+                } else {
+                    match phase_system_suffix(phase) {
+                        Some(suffix) => format!("{base_system}\n\n{suffix}"),
+                        None => base_system.clone(),
+                    }
+                };
 
             // 请求体预算：`build_chat_request` 的 `trim_history` 只管进对话那一刻，
             // 工具循环里追加的 `tool_result` 走的是另一条路径。
@@ -2143,6 +2183,20 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 if asked_to_bookkeep {
                     final_allows_bookkeeping = true;
                 }
+                // 想补一份只读数据 → 下一轮把只读工具放回去，让它自己补。
+                //
+                // 2026-11-18 的事故：模型在收尾阶段才发现计划里少查了天气，
+                // 但收尾阶段一个业务工具都不给，它只好自己编一个理由——
+                // 回复里写下「天气详情未能获取（查询受限）」，而接口一直是好的。
+                // 这里给它一次补的机会：只读工具没有副作用，补一次是安全的。
+                let asked_for_readonly = phase == Phase::Final
+                    && turn
+                        .tool_calls
+                        .iter()
+                        .any(|call| !call.name.is_bookkeeping() && !call.name.has_side_effect());
+                if asked_for_readonly {
+                    final_allows_readonly = true;
+                }
                 // 每一次被丢弃的调用都留一条 trace：状态用 `Skipped` 而不是
                 // `Error`——它没有被执行，记成失败会让 `[结果]` 变成「部分完成」，
                 // 反而制造一条新的矛盾。
@@ -2163,6 +2217,7 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                         step_id: None,
                         attempt: None,
                         cards: Vec::new(),
+                        kb_refs: Vec::new(),
                     });
                 }
                 // 把这一轮模型说的话原样带回上下文，但**不带**工具调用：
@@ -2175,14 +2230,20 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     });
                 final_retries += 1;
                 if final_retries <= MAX_FINAL_RETRIES {
-                    let hint = if asked_to_bookkeep {
+                    let hint = if asked_for_readonly {
+                        // 它想补的是**数据**，不是记账：明确告诉它「可以补一次」，
+                        // 免得它以为工具坏了，转而去编一个「查询受限」的理由。
+                        final_readonly_retry_hint().to_string()
+                    } else if asked_to_bookkeep {
                         "清单已经由引擎记好了，不要再更新清单。请直接把最终答复写给用户，\
 并按 [结果] 格式收尾。"
+                            .to_string()
                     } else if phase == Phase::Final {
                         "现在是收尾阶段，不需要再调用工具。请直接把最终答复写给用户，\
 并按 [结果] 格式收尾。"
+                            .to_string()
                     } else {
-                        "现在是自检阶段，不需要调用工具。请只输出那段 JSON 自检结论。"
+                        "现在是自检阶段，不需要调用工具。请只输出那段 JSON 自检结论。".to_string()
                     };
                     request.messages.push(me_core::ai::AiWireMessage::User {
                         content: hint.to_string(),
@@ -2242,6 +2303,7 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                     phase,
                     call.name,
                     final_allows_bookkeeping && !final_bookkeeping_used,
+                    final_allows_readonly && !final_readonly_used,
                 ) {
                     self.emit(Event::AiToolStarted {
                         conversation,
@@ -2541,6 +2603,15 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
                 }
                 if phase == Phase::Final && call.name == AiToolName::PlanUpdate {
                     final_bookkeeping_used = true;
+                }
+                // 收尾阶段补的只读工具也只放行一次：补完就必须收尾，
+                // 不能让它在收尾期反复查、反复刷。
+                if phase == Phase::Final
+                    && final_allows_readonly
+                    && !call.name.is_bookkeeping()
+                    && !call.name.has_side_effect()
+                {
+                    final_readonly_used = true;
                 }
                 // 成功调用的正文留一份给兜底：模型交白卷时原样直出，
                 // 用户至少能看到温度 / 邮件主题，而不是一句「没拿到结果」。
@@ -2974,6 +3045,30 @@ plan_submit 把要做的事写成 1–8 步（每步写清 tool / args / expect�
             );
         }
 
+        // 兜底之四：知识库引用对账（决策 O-13）。
+        //
+        // 判据与邮件一样是「这一轮有没有真的检索过」：只有调过
+        // `kb_search` / `kb_read` 的那一轮才校验，没调过就别动正文
+        //（模型可能只是在描述知识库里有什么）。
+        //
+        // 处理比邮件轻：编造的锚点直接摘掉，不留「未核实」标记——
+        // 知识库锚点只是引用标记，摘掉之后正文照旧，读者不会察觉。
+        let kb_refs: Vec<me_core::ai::KbRef> = traces
+            .iter()
+            .flat_map(|trace| trace.kb_refs.iter().cloned())
+            .collect();
+        if status == AiMessageStatus::Complete && !kb_refs.is_empty() {
+            let (aligned, audit) = me_core::ai::align_kb_citations(&content, &kb_refs);
+            if aligned != content {
+                content = aligned;
+            }
+            tracing::info!(
+                cited = audit.cited,
+                unknown = audit.unknown,
+                "知识库引用对账"
+            );
+        }
+
         let usage = *usage.lock().unwrap_or_else(|e| e.into_inner());
         let error_for_db = error_text.clone();
         // 清单必须是**最终态**再落库：取消时只把「进行中」的步标跳过，
@@ -3170,6 +3265,34 @@ fn phase_system_suffix(phase: Phase) -> Option<&'static str> {
     }
 }
 
+/// 收尾阶段**补数据**时的系统提示补充。
+///
+/// 与 [`phase_system_suffix`] 的 Final 分支正好相反：那里说「不许调工具」，
+/// 这里必须说「可以调只读工具」——两句话同时出现，模型会无所适从，
+/// 于是干脆不调，2026-11-18 的事故就是这么发生的。
+fn final_readonly_suffix() -> &'static str {
+    "现在处于收尾阶段，但**缺了数据**：如果上一轮还有没查到的内容，\
+     你可以调用只读工具（检索类、查询类）把它补上——只读工具没有副作用，可以放心调用。\
+     补完之后再用自然语言写最终答复，并按 [结果] 格式收尾。\
+     如果数据已经齐了，就直接写答复，不要再调工具。\
+     另外：**没有调用过**的工具不要说成「查询失败」「查询受限」——\
+     那样用户会以为工具坏了；如实说明「没有取到数据」即可。"
+}
+
+/// 收尾阶段丢弃了一个只读调用后，回给模型的提示。
+///
+/// 说清两件事：**可以再调一次**（工具是开着的），以及**别把「没调用」
+/// 说成「查询失败」**（否则用户以为工具坏了）。
+///
+/// 2026-11-18 的事故：模型在收尾阶段发现少查了天气，调用被丢弃后，
+/// 它在 thinking 里写「用户明确说不要调用工具了」，
+/// 然后自己编了一个「查询受限」的理由交差。
+fn final_readonly_retry_hint() -> &'static str {
+    "你刚才请求的工具是只读查询，本轮允许你**再调一次**来补上这份数据\
+     （只读工具没有副作用，可以放心调用）。请重新发起那个调用，拿到结果后再写最终答复。\
+     不要把「没调用」写成「查询失败」或「查询受限」——那会让用户以为工具坏了。"
+}
+
 /// 这个阶段允许执行哪些工具。
 ///
 /// 工具集随阶段变化：**这一阶段没下发的工具就不该被调用**。
@@ -3179,7 +3302,12 @@ fn phase_system_suffix(phase: Phase) -> Option<&'static str> {
 ///
 /// 2026-11-07 的事故：`plan_submit` 在 EXECUTE 阶段没下发，但它一旦被执行就等于
 /// 绕过了「重列不超过 2 次」的上限；收尾阶段更是完全不该有工具。
-fn phase_allows(phase: Phase, tool: AiToolName, final_bookkeeping: bool) -> bool {
+fn phase_allows(
+    phase: Phase,
+    tool: AiToolName,
+    final_bookkeeping: bool,
+    final_readonly: bool,
+) -> bool {
     match phase {
         // 计划期只认清单类工具：业务工具一次都别想调。
         // `plan_update` 也在其中——模型有时用旧接口直接交一份完整清单。
@@ -3190,9 +3318,19 @@ fn phase_allows(phase: Phase, tool: AiToolName, final_bookkeeping: bool) -> bool
         Phase::Replan => tool == AiToolName::PlanSubmit,
         // 自检阶段一律不给工具：它只要一段 JSON 结论。
         Phase::Reflect => false,
-        // 收尾阶段：只在「已经观测到模型想记账」时放行 `plan_update` 这一个。
-        // 它是纯内存操作，没有副作用，也不会绕过任何上限。
-        Phase::Final => final_bookkeeping && tool == AiToolName::PlanUpdate,
+        // 收尾阶段有两个「先观测再放行」的出口：
+        //
+        // · `final_bookkeeping`：`plan_update`，纯内存记账。
+        // · `final_readonly`：只读业务工具。2026-11-18 的事故里，模型在
+        //   收尾阶段才发现计划漏了天气数据，这里不放行它就只好编一个
+        //   「查询受限」的理由交差。只读工具没有副作用，补一次是安全的。
+        //
+        // 写工具（`calendar_create` / `kb_delete` 等）**永远不放**：
+        // 在收尾阶段执行它们，等于绕过了执行期的清单与确认流程。
+        Phase::Final => {
+            (final_bookkeeping && tool == AiToolName::PlanUpdate)
+                || (final_readonly && !tool.is_bookkeeping() && !tool.has_side_effect())
+        }
     }
 }
 
@@ -3205,6 +3343,29 @@ fn final_bookkeeping_tools(
     execute_tools
         .iter()
         .filter(|spec| spec.name == AiToolName::PlanUpdate)
+        .cloned()
+        .collect()
+}
+
+/// 收尾阶段**补一次**业务工具时，只放**只读**的那些。
+///
+/// 2026-11-18 的事故：模型在 Final 阶段才发现少查了天气（计划里第 3 步
+/// 选的是 `weather_locations` 而不是 `weather_get`），但收尾阶段不执行
+/// 任何业务工具，它只能自己编一个理由——回复里写下了「天气详情未能获取
+/// （查询受限）」，而天气接口一直是好的。
+///
+/// 放行只读工具是安全的：没有副作用，不改本地状态，失败了也只是白跑一次。
+/// **写工具绝不放开**：收尾阶段执行 `calendar_create` / `kb_delete` 这类
+/// 动作，等于绕过了执行期的清单与确认流程。
+fn final_readonly_tools(execute_tools: &[me_core::ai::AiToolSpec]) -> Vec<me_core::ai::AiToolSpec> {
+    execute_tools
+        .iter()
+        .filter(|spec| {
+            spec.name != AiToolName::PlanUpdate
+                && spec.name != AiToolName::PlanSubmit
+                && spec.name != AiToolName::AnswerDirectly
+                && !spec.name.has_side_effect()
+        })
         .cloned()
         .collect()
 }
@@ -3644,5 +3805,131 @@ mod throttle_tests {
     #[test]
     fn thinking_accumulator_returns_none_when_empty() {
         assert!(ThinkingAccumulator::new().finish().is_none());
+    }
+}
+
+#[cfg(test)]
+mod phase_gate_tests {
+    use super::*;
+    use me_core::ai::{AiToolName, AiToolPermissions};
+
+    /// 收尾阶段默认**一个业务工具都不放行**。
+    ///
+    /// 这是 2026-11-07 定下的规矩：收尾阶段只要一段答复，
+    /// 放业务工具等于绕过执行期。
+    #[test]
+    fn final_phase_blocks_business_tools_by_default() {
+        for tool in [
+            AiToolName::WeatherGet,
+            AiToolName::EmailSearch,
+            AiToolName::KbSearch,
+            AiToolName::CalendarCreate,
+            AiToolName::KbDelete,
+        ] {
+            assert!(
+                !phase_allows(Phase::Final, tool, false, false),
+                "收尾阶段不该放行 {tool:?}"
+            );
+        }
+    }
+
+    /// 观测到「模型想补只读数据」之后，收尾阶段放行**只读**工具。
+    ///
+    /// 2026-11-18 的事故：模型在收尾阶段才发现计划漏了天气，
+    /// 而收尾阶段一个业务工具都不给，它只好编一个「查询受限」的理由交差。
+    #[test]
+    fn final_phase_allows_readonly_tools_when_observed() {
+        for tool in [
+            AiToolName::WeatherGet,
+            AiToolName::EmailSearch,
+            AiToolName::KbSearch,
+            AiToolName::KbList,
+        ] {
+            assert!(
+                phase_allows(Phase::Final, tool, false, true),
+                "补数据时该放行只读工具 {tool:?}"
+            );
+        }
+    }
+
+    /// **写工具永远不放行**，哪怕观测到了补数据的需求。
+    ///
+    /// 在收尾阶段执行 `calendar_create` / `kb_delete`，
+    /// 等于绕过了执行期的清单与确认流程。
+    #[test]
+    fn final_phase_never_allows_write_tools() {
+        for tool in [
+            AiToolName::CalendarCreate,
+            AiToolName::CalendarUpdate,
+            AiToolName::CalendarDelete,
+            AiToolName::KbAdd,
+            AiToolName::KbUpdate,
+            AiToolName::KbDelete,
+            AiToolName::MemoryUpsert,
+            AiToolName::MusicPlay,
+        ] {
+            assert!(
+                !phase_allows(Phase::Final, tool, false, true),
+                "收尾阶段绝不能放行写工具 {tool:?}"
+            );
+        }
+    }
+
+    /// 「补数据」的出口只放只读工具——写工具一个都不下发。
+    #[test]
+    fn final_readonly_tools_excludes_every_write_tool() {
+        let execute = me_core::ai::execute_phase_tool_specs(&AiToolPermissions::default());
+        let readonly = final_readonly_tools(&execute);
+        assert!(!readonly.is_empty(), "只读工具不该是空的");
+        for spec in &readonly {
+            assert!(
+                !spec.name.has_side_effect(),
+                "补数据时不能下发有副作用的工具：{:?}",
+                spec.name
+            );
+            assert!(
+                !spec.name.is_bookkeeping(),
+                "补数据时不能下发记账工具：{:?}",
+                spec.name
+            );
+        }
+        // 天气检索必须在里面——那正是 2026-11-18 事故里缺的那一个。
+        assert!(
+            readonly
+                .iter()
+                .any(|spec| spec.name == AiToolName::WeatherGet),
+            "weather_get 要能补：{:?}",
+            readonly.iter().map(|s| s.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// 补数据时的系统提示必须说「可以调只读工具」，不能还说「不许调工具」。
+    ///
+    /// 两句话同时出现会让模型无所适从，于是干脆不调——
+    /// 2026-11-18 事故里模型就是这么放弃的。
+    #[test]
+    fn final_readonly_suffix_allows_readonly_calls() {
+        let suffix = final_readonly_suffix();
+        assert!(suffix.contains("只读工具"), "{suffix}");
+        assert!(
+            !suffix.contains("不要调用任何工具"),
+            "补数据时不能说「不要调用任何工具」：{suffix}"
+        );
+        // 还要堵住「没调用就说成查询失败」这个坑。
+        assert!(
+            suffix.contains("查询受限") || suffix.contains("查询失败"),
+            "要提醒模型别把「没调用」说成「查询失败」：{suffix}"
+        );
+    }
+
+    /// 收尾阶段补数据的提示语要说清「可以再调一次」。
+    #[test]
+    fn dropped_readonly_call_hint_tells_the_model_it_may_retry() {
+        let hint = final_readonly_retry_hint();
+        assert!(hint.contains("再调一次"), "{hint}");
+        assert!(
+            hint.contains("查询失败") || hint.contains("查询受限"),
+            "要提醒模型别把「没调用」说成「查询失败」：{hint}"
+        );
     }
 }

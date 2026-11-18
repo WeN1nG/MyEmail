@@ -64,6 +64,14 @@ pub struct MyEmailApp<R: ReadOnlyRepo + Clone + 'static> {
     /// **只管一个进程内只问一次**：真正的「今天发过没有」由后端看
     /// `meta.ai_daily_briefing` 判断——同一天开两次应用只会有一份简报。
     daily_briefing_requested: bool,
+    /// 窗口是否在前台。系统通知只在**后台**发（前台有应用内 toast）。
+    ///
+    /// 每帧开头从 `ctx.input` 取一次：`handle_event` 拿不到 `egui::Context`，
+    /// 而通知的判定发生在事件处理里。
+    focused: bool,
+    /// 每个账户**连续**同步失败的次数。达到 3 次才发通知
+    /// （`ConnectionState::Backoff` 只带 `retry_at`、不带次数，只能自己数）。
+    sync_failures: std::collections::BTreeMap<me_core::AccountId, u32>,
 }
 
 /// AI 主动开口（每日晨间简报）时界面要做的两件事：**切到 AI 页**并**打开这份会话**。
@@ -75,6 +83,48 @@ fn apply_daily_briefing_event(state: &mut UiState, conversation: me_core::ai::Ai
     views::switch_page(state, Page::AiChat);
     state.select_ai_conversation(Some(conversation));
     state.ai_conversations_dirty = true;
+}
+
+/// 新邮件通知的**纯判定**：该不该发、发什么。`None` = 不发。
+///
+/// 三条缺一不可，任何一条不满足都**静默跳过**（这条链路没有错误路径）：
+///
+/// 1. 目录**已知**且 `role = Inbox`。未知说明目录还没加载（首次同步时
+///    `state.folders` 是空的），那时本来也不该弹「5000 封新邮件」；
+///    收件箱之外（废件箱 / 已发送 / 草稿）也不弹。
+/// 2. 至少一封**未读**。全是已读说明这是补拉历史，不是新到。
+/// 3. 未读邮件里第一封的发件人与主题做正文，多封只说数量。
+///
+/// 抽成自由函数是为了能离屏测：`MyEmailApp` 需要整个 eframe 上下文与后端通道。
+fn new_mail_toast(
+    folders: &std::collections::BTreeMap<me_core::AccountId, Vec<me_core::Folder>>,
+    folder: me_core::FolderId,
+    messages: &[me_core::MessageSummary],
+) -> Option<(String, String)> {
+    let is_inbox = folders
+        .values()
+        .flatten()
+        .any(|known| known.id == folder && known.role == me_core::FolderRole::Inbox);
+    if !is_inbox {
+        return None;
+    }
+    let unread: Vec<&me_core::MessageSummary> = messages
+        .iter()
+        .filter(|message| !message.flags.is_seen())
+        .collect();
+    let first = unread.first()?;
+    let body = if unread.len() == 1 {
+        let from = first
+            .from
+            .as_ref()
+            .map(|address| address.name.as_deref().unwrap_or(&address.addr))
+            .unwrap_or("未知发件人");
+        let subject = first.subject.as_deref().unwrap_or("(无主题)");
+        format!("{from} · {}", me_core::truncate_chars(subject, 40))
+    } else {
+        format!("{} 封新邮件", unread.len())
+    };
+    Some(("新邮件".to_string(), body))
 }
 
 impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
@@ -102,10 +152,91 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             applied_theme: None,
             player: None,
             daily_briefing_requested: false,
+            focused: false,
+            sync_failures: std::collections::BTreeMap::new(),
         };
         app.refresh_accounts();
         app.refresh_settings();
+        // 启动留一条：日志里能直接对上「这个 exe 到底有没有通知代码」，
+        // 排「改了没生效」比读二进制快。
+        tracing::info!(
+            wired = ?me_core::NotificationKind::WIRED,
+            "系统通知已接线（仅后台弹、同类有冷却）"
+        );
         app
+    }
+
+    // -----------------------------------------------------------------------
+    // 系统通知（v0.5）
+    // -----------------------------------------------------------------------
+
+    /// 统一的发送口：把「开关 + 前台 + 冷却」交给 `crate::notify`。
+    ///
+    /// 界面这一层只决定**说什么**，不重复判断该不该说。
+    fn notify(&self, kind: me_core::NotificationKind, title: &str, body: &str) {
+        crate::notify::dispatch(
+            &self.state.notification_prefs,
+            kind,
+            self.focused,
+            title,
+            body,
+        );
+    }
+
+    /// 新邮件：**只对收件箱**、**只在有未读**时发。
+    ///
+    /// 判定本身抽成 [`new_mail_toast`]（纯函数、可单测），这里只负责记日志与发送。
+    /// 日志是刻意留的：这条链路的失败是**静默**的（目录不认识 / 全是已读 /
+    /// 窗口在前台都会被跳过），没有日志就只能靠猜。
+    fn notify_new_mail(&self, folder: me_core::FolderId, messages: &[me_core::MessageSummary]) {
+        let unread = messages.iter().filter(|m| !m.flags.is_seen()).count();
+        let Some((title, body)) = new_mail_toast(&self.state.folders, folder, messages) else {
+            tracing::info!(
+                folder = folder.0,
+                appended = messages.len(),
+                unread,
+                "新邮件通知：不满足条件（非收件箱 / 无未读 / 目录未知）"
+            );
+            return;
+        };
+        tracing::info!(
+            folder = folder.0,
+            appended = messages.len(),
+            unread,
+            focused = self.focused,
+            %body,
+            "新邮件通知：进入发送判定"
+        );
+        self.notify(me_core::NotificationKind::NewMail, &title, &body);
+    }
+
+    /// 记一次连接状态，连续失败到第 3 次才发通知。
+    ///
+    /// `ConnectionState::Backoff` 只带 `retry_at`、不带重试次数，所以只能自己数。
+    /// 「连续」的语义是：中间只要出现过一次 `Online` 就清零。
+    fn note_sync_status(&mut self, account: me_core::AccountId, status: &me_core::ConnectionState) {
+        use me_core::ConnectionState;
+        match status {
+            ConnectionState::Error { .. } | ConnectionState::Backoff { .. } => {
+                let count = {
+                    let entry = self.sync_failures.entry(account).or_insert(0);
+                    *entry += 1;
+                    *entry
+                };
+                if count >= 3 {
+                    // 文案不写具体错误：用户要的是「去账户页看看」，不是堆栈。
+                    self.notify(
+                        me_core::NotificationKind::SyncFailed,
+                        "同步失败",
+                        &format!("连续 {count} 次无法连接服务器，稍后会自动重试"),
+                    );
+                }
+            }
+            ConnectionState::Online => {
+                self.sync_failures.remove(&account);
+            }
+            _ => {}
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -125,8 +256,22 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 }
                 self.state.accounts = accounts;
                 self.state.folders_dirty = true;
+                self.refresh_all_folder_roles();
             }
             Err(err) => self.report_error(ErrorScope::Global, err),
+        }
+    }
+
+    /// 把**所有账户**的目录表读进 `state.folders`。
+    ///
+    /// 侧栏只画当前账户（`folders_of(selected)`），但「新邮件要不要弹通知」得能
+    /// 认出**任意**账户的收件箱——只加载选中账户时，另一个账户收信永远不通知。
+    /// 目录数量是几十条，两个账户各一次短查询，启动时付得起。
+    fn refresh_all_folder_roles(&mut self) {
+        for account in self.state.accounts.clone() {
+            if let Ok(folders) = self.repo.list_folders_readonly(account.id) {
+                self.state.folders.insert(account.id, folders);
+            }
         }
     }
 
@@ -389,6 +534,45 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
 
                 self.state.ai.messages = messages;
                 self.state.ai.loading = false;
+            }
+            Err(err) => self.report_error(ErrorScope::Global, err),
+        }
+    }
+
+    /// 重拉知识库列表与详情。
+    ///
+    /// 只读侧**不做 FTS / KNN**：这里的 filter 只按标题 `LIKE` 与来源/状态筛，
+    /// 真正的检索走 `Command::SearchKnowledge`。
+    fn refresh_knowledge(&mut self) {
+        self.state.knowledge.dirty = false;
+        let filter = self.state.knowledge.filter();
+        match self.repo.list_knowledge_readonly(&filter, 200, 0) {
+            Ok(docs) => self.state.knowledge.docs = docs,
+            Err(err) => {
+                self.report_error(ErrorScope::Global, err);
+                return;
+            }
+        }
+        let Some(id) = self.state.knowledge.selected else {
+            return;
+        };
+        match self.repo.knowledge_doc_readonly(id) {
+            Ok(Some(doc)) => {
+                let page = self.state.knowledge.chunk_page;
+                let from = page * 20;
+                self.state.knowledge.chunks = self
+                    .repo
+                    .knowledge_chunks_readonly(id, from, 20)
+                    .unwrap_or_default();
+                self.state.knowledge.entities = self
+                    .repo
+                    .knowledge_entity_names_readonly(id)
+                    .unwrap_or_default();
+                self.state.knowledge.doc = Some(doc);
+            }
+            Ok(None) => {
+                // 文档被删了（可能来自另一个入口）：退回列表。
+                self.state.knowledge.reset_detail();
             }
             Err(err) => self.report_error(ErrorScope::Global, err),
         }
@@ -958,6 +1142,8 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 music_dir,
                 music_order,
                 daily_briefing_prompt,
+                notification_prefs,
+                knowledge,
             } => {
                 self.state.theme = theme;
                 self.state.music.dir = music_dir;
@@ -980,6 +1166,13 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 // 只回填已保存值，草稿留给弹窗打开时再拷——否则用户正在编辑的
                 // 内容会被一次设置重载悄悄覆盖。
                 self.state.daily_briefing_prompt = daily_briefing_prompt;
+                self.state.notification_prefs = notification_prefs;
+                // 知识库：容量、确认标记、模型是否就绪、转换器探测结果。
+                // 模型状态变了要重拉列表（列表里的「向量」一栏依赖它）。
+                let embed_changed =
+                    self.state.knowledge.settings.embed_model != knowledge.embed_model;
+                self.state.knowledge.settings = knowledge;
+                self.state.knowledge.dirty |= embed_changed;
                 self.applied_theme = None;
             }
             Event::AttachmentDirChanged { dir } => {
@@ -1177,6 +1370,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 if finished {
                     self.state.sync_progress = None;
                 }
+                self.note_sync_status(id, &status);
                 self.state.connection.insert(id, status);
             }
             Event::RealtimeStatus {
@@ -1229,6 +1423,9 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 }
             }
             Event::MessagesAppended { folder, messages } => {
+                // 通知**先于**搜索态判断：正在搜索时列表不该动，但「来了新邮件」
+                // 这件事照样值得告诉用户。
+                self.notify_new_mail(folder, &messages);
                 if self.state.search.active {
                     return;
                 }
@@ -1591,6 +1788,13 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
             Event::AiConversationsChanged => {
                 self.state.ai_conversations_dirty = true;
             }
+            Event::AiConversationCreated { conversation } => {
+                // 新建完必须**切到新会话**，否则用户点「＋ 新对话」看到的还是
+                // 上一轮的对话；`select_ai_conversation` 会同时置 `ai_messages_dirty`，
+                // 新会话查出来是空列表（一帧空白是正常的：列表重拉是异步的）。
+                self.state.ai_conversations_dirty = true;
+                self.state.select_ai_conversation(Some(conversation));
+            }
             Event::AiDailyBriefingStarted { conversation } => {
                 // AI 主动开口：把主区切到 AI 页并打开这份简报，否则它只是
                 // 会话列表里多出来的一行，用户根本不会注意到。
@@ -1639,6 +1843,23 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 }
                 self.state.ai_messages_dirty = true;
                 self.state.ai_conversations_dirty = true;
+                // 只报「正常完成」：失败与用户主动停止在界面上已经有提示，
+                // 再弹系统通知只是噪音。
+                if status == me_core::ai::AiMessageStatus::Complete {
+                    let title = self
+                        .state
+                        .ai
+                        .conversations
+                        .iter()
+                        .find(|item| item.id == conversation)
+                        .map(|item| item.title.clone())
+                        .unwrap_or_else(|| "新对话".to_string());
+                    self.notify(
+                        me_core::NotificationKind::AiReply,
+                        "AI 已回复",
+                        &me_core::truncate_chars(&title, 40),
+                    );
+                }
             }
             Event::AiStreamFailed {
                 conversation,
@@ -1721,6 +1942,9 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                     step_id,
                     attempt,
                     cards: trace_cards,
+                    // 实时活动条只用于显示「正在做什么」，不参与引用校验：
+                    // 校验用的是**落库时**me-sync 写进消息的那份 trace。
+                    kb_refs: Vec::new(),
                 });
             }
             Event::AiToolEmailResults {
@@ -1810,6 +2034,105 @@ impl<R: ReadOnlyRepo + Clone + 'static> MyEmailApp<R> {
                 if !text.is_empty() {
                     self.state.toast(kind, text);
                 }
+            }
+            Event::KnowledgeChanged { stats } => {
+                let capacity_changed =
+                    self.state.knowledge.stats.mail_capacity != stats.mail_capacity;
+                self.state.knowledge.stats = stats;
+                self.state.knowledge.dirty = true;
+                if capacity_changed {
+                    // 容量变了，导入中的条目也要重新算配额提示。
+                    self.state.knowledge.dirty = true;
+                }
+            }
+            Event::KnowledgeProgress {
+                doc,
+                stage,
+                done,
+                total,
+            } => {
+                // 只给「正在看的那一份」画进度；否则几千条进度会把界面刷成噪音。
+                if self.state.knowledge.selected == Some(doc) {
+                    self.state.knowledge.progress = Some((stage, done, total));
+                }
+            }
+            Event::KnowledgeDocFailed {
+                doc,
+                message,
+                stage,
+            } => {
+                self.state.knowledge.progress = None;
+                self.state.toast(
+                    ToastKind::Error,
+                    format!("知识库索引失败（{}）：{message}", stage.label()),
+                );
+                if self.state.knowledge.selected == Some(doc) {
+                    self.state.knowledge.dirty = true;
+                }
+            }
+            Event::KnowledgeDocSkipped { doc, reason } => {
+                self.state.knowledge.progress = None;
+                // 「跳过」是正常结果，用 Info 而不是 Warn：空模板、纯通知邮件都走这里。
+                self.state
+                    .toast(ToastKind::Info, format!("未索引：{}", reason.label()));
+                if self.state.knowledge.selected == Some(doc) {
+                    self.state.knowledge.dirty = true;
+                }
+            }
+            Event::KnowledgeDeleteRequested { doc, title, chunks } => {
+                self.state.knowledge.pending_delete = Some((doc, title, chunks));
+            }
+            Event::KnowledgeFileProbed {
+                path,
+                kind,
+                bytes,
+                pages,
+                batches,
+                tokens_low,
+                tokens_high,
+                cost_usd,
+                blocked,
+            } => {
+                views::knowledge::on_probed(
+                    &mut self.state,
+                    views::knowledge::ProbeView {
+                        path,
+                        kind,
+                        bytes,
+                        pages,
+                        batches,
+                        tokens_low,
+                        tokens_high,
+                        cost_usd,
+                        blocked,
+                    },
+                );
+            }
+            Event::KnowledgeSearchResults {
+                hits, mode, error, ..
+            } => {
+                self.state.knowledge.searching = false;
+                self.state.knowledge.hits = hits;
+                self.state.knowledge.search_mode = mode;
+                self.state.knowledge.search_error = error;
+            }
+            Event::EmbedModelDownloadProgress { done, total } => {
+                self.state.knowledge.download = Some((done, total));
+            }
+            Event::EmbedModelReady { model, dim } => {
+                self.state.knowledge.download = None;
+                self.state.knowledge.settings.embed_model = Some(model.clone());
+                self.state.knowledge.settings.embed_declined = false;
+                self.state.toast(
+                    ToastKind::Success,
+                    format!("嵌入模型已就绪：{model}（{dim} 维）"),
+                );
+                self.state.knowledge.dirty = true;
+            }
+            Event::EmbedModelFailed { message } => {
+                self.state.knowledge.download = None;
+                self.state
+                    .toast(ToastKind::Error, format!("模型下载失败：{message}"));
             }
             Event::CalendarReminder {
                 summary,
@@ -1914,6 +2237,24 @@ pub fn human_bytes(bytes: u64) -> String {
 
 impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 0. 记下窗口是否在前台：系统通知只在后台发，而通知的判定发生在
+        // 下面的事件循环里（`handle_event` 拿不到 `ctx`）。
+        //
+        // **最小化必须算「不在前台」**：Windows 上最小化不一定把 `focused`
+        // 变成 false，只看 `focused` 会让「挂到后台收邮件」永远不弹通知。
+        let now_focused = ctx.input(|input| {
+            let viewport = input.viewport();
+            let focused = viewport.focused.unwrap_or(input.focused);
+            let minimized = viewport.minimized.unwrap_or(false);
+            focused && !minimized
+        });
+        if now_focused != self.focused {
+            // 只在**变化时**记一条：这条日志是排查「明明是后台却没弹通知」的
+            // 唯一依据——它证明窗口状态到底有没有被识别出来。
+            tracing::info!(focused = now_focused, "窗口前台状态变化");
+            self.focused = now_focused;
+        }
+
         // 0. 第二个实例请求激活：把已有窗口带到前台。
         if self.activation.swap(false, Ordering::Relaxed) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1981,6 +2322,16 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
                 self.refresh_ai_entities();
             }
         }
+        if let Some(doc) = self.state.pending_kb_doc.take() {
+            // AI 回答里的 `[kb:N]` chip 点出来：切到知识库并打开详情。
+            views::switch_page(&mut self.state, Page::Knowledge);
+            self.state.knowledge.selected = Some(doc);
+            self.state.knowledge.chunk_page = 0;
+            self.state.knowledge.dirty = true;
+        }
+        if self.state.page == Page::Knowledge && self.state.knowledge.dirty {
+            self.refresh_knowledge();
+        }
         if let Some(event) = self.state.calendar.pending_open.take() {
             self.open_calendar_event(event);
         }
@@ -2039,6 +2390,7 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
             Page::Weather => views::weather::show(&mut self.state, &mut commands, ui),
             Page::AiChat => views::ai::show(&mut self.state, &mut commands, ui),
             Page::Music => views::music::show(&mut self.state, &mut commands, ui),
+            Page::Knowledge => views::knowledge::show(&mut self.state, &mut commands, ui),
             Page::Accounts => views::accounts::show(&mut self.state, &mut commands, ui),
             Page::Settings => views::settings::show(
                 &mut self.state,
@@ -2069,6 +2421,8 @@ impl<R: ReadOnlyRepo + Clone + 'static> eframe::App for MyEmailApp<R> {
         if self.state.page == Page::AiChat {
             views::ai::settings_modal(&mut self.state, &mut commands, ctx);
         }
+        // 导入确认（总确认 + 预估）与删除确认：与页面无关，收事件就该弹。
+        views::knowledge::modals(&mut self.state, &mut commands, ctx);
         views::toasts(&mut self.state, ctx);
 
         // 4. 分发命令。
@@ -2384,5 +2738,121 @@ mod tests {
         );
         assert!(state.ai_conversations_dirty, "会话列表要重拉");
         assert!(state.ai_messages_dirty, "消息要重拉");
+    }
+
+    // -----------------------------------------------------------------------
+    // 新邮件通知的判定
+    // -----------------------------------------------------------------------
+
+    fn folder(id: i64, account: i64, role: me_core::FolderRole) -> me_core::Folder {
+        me_core::Folder {
+            id: me_core::FolderId(id),
+            account: me_core::AccountId(account),
+            name: format!("folder-{id}"),
+            delimiter: Some('/'),
+            role,
+            uid_validity: 1,
+            last_uid: 1,
+            deleted_on_server: false,
+        }
+    }
+
+    fn mail(id: i64, folder_id: i64, subject: &str, seen: bool) -> me_core::MessageSummary {
+        me_core::MessageSummary {
+            id: me_core::MessageId(id),
+            account: me_core::AccountId(1),
+            folder: me_core::FolderId(folder_id),
+            uid: Some(id as u32),
+            message_id: None,
+            subject: Some(subject.to_string()),
+            from: Some(me_core::Address::new(
+                Some("AAA建材王哥".to_string()),
+                "sender@example.com",
+            )),
+            to: Vec::new(),
+            cc: Vec::new(),
+            date: Some(id),
+            date_source: me_core::DateSource::Header,
+            size: None,
+            flags: if seen {
+                me_core::Flags::SEEN
+            } else {
+                me_core::Flags::NONE
+            },
+            snippet: None,
+            has_attachment: false,
+            body_cached: false,
+            in_reply_to: None,
+            references: Vec::new(),
+        }
+    }
+
+    fn folders_with_inbox() -> std::collections::BTreeMap<me_core::AccountId, Vec<me_core::Folder>>
+    {
+        let mut folders = std::collections::BTreeMap::new();
+        folders.insert(
+            me_core::AccountId(1),
+            vec![
+                folder(2, 1, me_core::FolderRole::Inbox),
+                folder(3, 1, me_core::FolderRole::Sent),
+            ],
+        );
+        folders
+    }
+
+    #[test]
+    fn new_mail_toast_names_the_sender_and_subject() {
+        let folders = folders_with_inbox();
+        let toast = new_mail_toast(
+            &folders,
+            me_core::FolderId(2),
+            &[mail(1, 2, "季度复盘", false)],
+        );
+        let (title, body) = toast.expect("收件箱里的未读邮件必须通知");
+        assert_eq!(title, "新邮件");
+        assert_eq!(body, "AAA建材王哥 · 季度复盘");
+    }
+
+    #[test]
+    fn new_mail_toast_counts_batches() {
+        let folders = folders_with_inbox();
+        let toast = new_mail_toast(
+            &folders,
+            me_core::FolderId(2),
+            &[mail(1, 2, "a", false), mail(2, 2, "b", false)],
+        );
+        assert_eq!(toast.unwrap().1, "2 封新邮件");
+    }
+
+    /// 非收件箱（已发送 / 废件箱）不通知。
+    #[test]
+    fn new_mail_toast_ignores_non_inbox() {
+        let folders = folders_with_inbox();
+        assert!(
+            new_mail_toast(&folders, me_core::FolderId(3), &[mail(1, 3, "回复", false)]).is_none()
+        );
+    }
+
+    /// 目录还没加载（首次同步）时 `folders` 是空的——不能把它当成收件箱。
+    #[test]
+    fn new_mail_toast_requires_known_folder() {
+        let empty = std::collections::BTreeMap::new();
+        assert!(new_mail_toast(&empty, me_core::FolderId(2), &[mail(1, 2, "x", false)]).is_none());
+    }
+
+    /// 全是已读说明是补拉历史，不是新到。
+    #[test]
+    fn new_mail_toast_skips_seen_only_batches() {
+        let folders = folders_with_inbox();
+        assert!(
+            new_mail_toast(&folders, me_core::FolderId(2), &[mail(1, 2, "旧信", true)]).is_none()
+        );
+        // 混着来时按未读算，已读那封不进数量。
+        let toast = new_mail_toast(
+            &folders,
+            me_core::FolderId(2),
+            &[mail(1, 2, "旧信", true), mail(2, 2, "新信", false)],
+        );
+        assert_eq!(toast.unwrap().1, "AAA建材王哥 · 新信");
     }
 }

@@ -1796,7 +1796,17 @@ fn infer_capability(tool: AiToolName) -> Capability {
         | AiToolName::MusicState
         | AiToolName::MusicControl => Capability::Music,
         // 记账类工具不进计划；落到这里说明模型写错了工具名。
+        //
+        // 知识库工具归 `General`：`Capability` 是计划里给用户看的「这是哪一类工作」，
+        // 目前只有邮件/天气/日历/音乐四个领域；知识库是「资料」，与记忆同类，
+        // 强行新增一个变体会牵动计划提示词与校验规则，收益不抵风险。
         AiToolName::MemoryUpsert
+        | AiToolName::KbSearch
+        | AiToolName::KbRead
+        | AiToolName::KbList
+        | AiToolName::KbAdd
+        | AiToolName::KbUpdate
+        | AiToolName::KbDelete
         | AiToolName::PlanUpdate
         | AiToolName::PlanSubmit
         | AiToolName::AnswerDirectly => Capability::General,

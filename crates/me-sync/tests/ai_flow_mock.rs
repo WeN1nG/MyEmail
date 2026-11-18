@@ -852,11 +852,12 @@ async fn disabled_tools_are_removed_from_the_request() {
 
     let counts = provider.tool_counts.lock().unwrap().clone();
     // 第一轮是 PLAN 阶段（只有 plan_submit / answer_directly）；
-    // 第二轮是执行阶段：16 个工具 - 天气两个 - 创建日程一个 - 两个计划工具 = 11。
+    // 第二轮是执行阶段：22 个工具（v0.4 的 16 个 + v0.5 的 6 个知识库工具）
+    // - 天气两个 - 创建日程一个 - 两个计划工具 = 17。
     assert_eq!(
         counts,
-        vec![2, 11],
-        "执行阶段应剩十一个业务工具，实际：{counts:?}"
+        vec![2, 17],
+        "执行阶段应剩十七个业务工具，实际：{counts:?}"
     );
 }
 
@@ -5150,6 +5151,7 @@ async fn repeated_tool_failure_becomes_a_lesson_in_the_next_system_prompt() {
         step_id: None,
         attempt: None,
         cards: Vec::new(),
+        kb_refs: Vec::new(),
     };
     let writable = store.writable();
     let message = writable

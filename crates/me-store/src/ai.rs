@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use me_core::ai::{
     AiConversation, AiConversationId, AiEntity, AiEntityKind, AiEntitySource, AiMemoryRepo,
     AiMessage, AiMessageId, AiMessageStatus, AiProviderConfig, AiProviderKind, AiRepo, AiRole,
-    AiToolName, AiToolStatus, AiToolTrace, MAX_ENTITIES, MAX_MESSAGE_CHARS, MailCardRef,
+    AiToolName, AiToolStatus, AiToolTrace, KbRef, MAX_ENTITIES, MAX_MESSAGE_CHARS, MailCardRef,
     MotiveSource, NewAiEntity, NewAiMessage, ThinkingBlock, normalize_entity_name,
 };
 use me_core::ai_plan::Plan;
@@ -138,6 +138,9 @@ struct ToolTraceRow {
     /// v8 起才有：这次检索挑出来的邮件卡片（id + 命中理由）。老行读成空数组。
     #[serde(default)]
     cards: Vec<MailCardRef>,
+    /// v9 起才有：这一轮检索到的知识库语块。老行读成空数组。
+    #[serde(default)]
+    kb_refs: Vec<KbRef>,
 }
 
 impl ToolTraceRow {
@@ -154,6 +157,7 @@ impl ToolTraceRow {
             step_id: trace.step_id,
             attempt: trace.attempt,
             cards: trace.cards.clone(),
+            kb_refs: trace.kb_refs.clone(),
         }
     }
 
@@ -172,6 +176,7 @@ impl ToolTraceRow {
             step_id: self.step_id,
             attempt: self.attempt,
             cards: self.cards,
+            kb_refs: self.kb_refs,
         })
     }
 }

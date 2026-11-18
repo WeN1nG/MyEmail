@@ -953,14 +953,20 @@ impl ImapSession for ImapConnection {
 
         // 无论超时还是变化，都必须发送 DONE 才能复用连接；失败则保持半状态，
         // 由调用方丢弃连接。
+        //
+        // **DONE 要有超时**：半死的连接上写得出去、却永远等不到 tagged OK，
+        // 没有上限的话整个 watcher 会永久挂死在这里，而且一条日志都没有——
+        // 表现就是「挂后台再也不更新邮件」。
         match outcome {
-            Ok(outcome) => match handle.done().await {
-                Ok(session) => {
-                    self.session = Some(session);
-                    Ok(outcome)
+            Ok(outcome) => {
+                match with_timeout(async { handle.done().await.map_err(map_imap_error) }).await {
+                    Ok(session) => {
+                        self.session = Some(session);
+                        Ok(outcome)
+                    }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(map_imap_error(err)),
-            },
+            }
             Err(err) => Err(err),
         }
     }

@@ -139,6 +139,7 @@ fn messages_keep_chronological_order_and_round_trip_json() {
         step_id: None,
         attempt: None,
         cards: Vec::new(),
+        kb_refs: Vec::new(),
     };
     writable
         .finish_assistant_message(
@@ -254,6 +255,7 @@ fn unknown_tool_names_in_trace_are_dropped_not_fatal() {
         step_id: None,
         attempt: None,
         cards: Vec::new(),
+        kb_refs: Vec::new(),
     };
     writable
         .finish_assistant_message(
@@ -905,6 +907,7 @@ fn tool_trace_cards_round_trip() {
                 reason: "近 7 天未读".to_string(),
             },
         ],
+        kb_refs: Vec::new(),
     };
     writable
         .finish_assistant_message(

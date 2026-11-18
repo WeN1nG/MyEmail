@@ -719,6 +719,8 @@ pub trait MetaRepo {
     fn schema_version(&self) -> Result<u32, CoreError>;
     fn set_setting(&self, key: &str, value: &str) -> Result<(), CoreError>;
     fn get_setting(&self, key: &str) -> Result<Option<String>, CoreError>;
+    /// 删掉一个设置键（「重新显示提示」这类可撤销的确认用它，而不是写空串）。
+    fn delete_setting(&self, key: &str) -> Result<(), CoreError>;
     /// 缓存目录所在文件系统的可用字节数；平台不支持时返回 `None`。
     fn available_bytes(&self) -> Result<Option<u64>, CoreError>;
 }
@@ -795,6 +797,29 @@ pub trait ReadOnlyRepo: Send + Sync {
     fn get_ai_message_readonly(&self, id: AiMessageId) -> Result<Option<AiMessage>, CoreError>;
     fn list_ai_entities_readonly(&self, limit: u32) -> Result<Vec<AiEntity>, CoreError>;
     fn count_ai_entities_readonly(&self) -> Result<u32, CoreError>;
+
+    // ---- 知识库（v0.5）：只读列表与语块，**不做 FTS / KNN** ----
+    fn list_knowledge_readonly(
+        &self,
+        filter: &crate::knowledge::KbFilter,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<crate::knowledge::KnowledgeDoc>, CoreError>;
+    fn knowledge_doc_readonly(
+        &self,
+        id: crate::knowledge::KnowledgeDocId,
+    ) -> Result<Option<crate::knowledge::KnowledgeDoc>, CoreError>;
+    fn knowledge_chunks_readonly(
+        &self,
+        id: crate::knowledge::KnowledgeDocId,
+        from: u32,
+        count: u32,
+    ) -> Result<Vec<crate::knowledge::KnowledgeChunk>, CoreError>;
+    /// 详情页的实体标签（名称，不是 id）。
+    fn knowledge_entity_names_readonly(
+        &self,
+        id: crate::knowledge::KnowledgeDocId,
+    ) -> Result<Vec<String>, CoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +939,7 @@ pub trait StorePort:
     + WeatherRepo
     + crate::ai::AiRepo
     + crate::ai::AiMemoryRepo
+    + crate::knowledge::KnowledgeRepo
     + MetaRepo
     + Clone
     + Send
@@ -936,6 +962,7 @@ impl<T> StorePort for T where
         + WeatherRepo
         + crate::ai::AiRepo
         + crate::ai::AiMemoryRepo
+        + crate::knowledge::KnowledgeRepo
         + MetaRepo
         + Clone
         + Send

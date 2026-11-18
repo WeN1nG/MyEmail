@@ -101,6 +101,8 @@ pub struct AiModelDraft {
     pub tools: AiToolPermissions,
     /// API Key。与其他参数一样随「保存」一起写入，不单独保存。
     pub api_key: String,
+    /// 这个模型能不能直接吃 PDF / 文档输入。没有它，PDF/PPT 导入会明确失败。
+    pub pdf_input: bool,
 }
 
 impl AiModelDraft {
@@ -124,6 +126,7 @@ impl AiModelDraft {
             max_output: DEFAULT_MAX_OUTPUT_TOKENS.to_string(),
             tools: AiToolPermissions::default(),
             api_key: String::new(),
+            pdf_input: matches!(kind, AiProviderKind::Anthropic),
         }
     }
 
@@ -138,6 +141,7 @@ impl AiModelDraft {
             max_output: model.max_output_tokens.to_string(),
             tools: model.tools,
             api_key: model.api_key.clone(),
+            pdf_input: model.pdf_input,
         }
     }
 
@@ -160,6 +164,7 @@ impl AiModelDraft {
                 .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS),
             tools: self.tools,
             api_key: self.api_key.trim().to_string(),
+            pdf_input: self.pdf_input,
         }
     }
 }
@@ -508,6 +513,8 @@ struct TurnCtx<'a> {
     blocks_cache: &'a mut Option<BlocksCache>,
     /// 点卡片「打开邮件」时记下 id，渲染循环外统一发 Command。
     open_message: &'a mut Option<MessageId>,
+    /// 点回答里的 `[kb:N]` chip 时记下文档 id，渲染循环外切到知识库页。
+    open_kb_doc: &'a mut Option<me_core::knowledge::KnowledgeDocId>,
     /// 当前已缓存摘要的卡片（按 message id 查；历史消息可能查不到，需降级）。
     cards: &'a [AiCard],
 }
@@ -639,6 +646,7 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
             let mut blocks_cache = std::mem::take(&mut state.ai.blocks_cache);
             let cards = std::mem::take(&mut state.ai.cards);
             let mut open_message: Option<MessageId> = None;
+            let mut open_kb_doc: Option<me_core::knowledge::KnowledgeDocId> = None;
 
             let stream_message = build_stream_message(&state.ai);
             let live_tool = state
@@ -658,6 +666,7 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
                 let mut ctx = TurnCtx {
                     blocks_cache: &mut blocks_cache,
                     open_message: &mut open_message,
+                    open_kb_doc: &mut open_kb_doc,
                     cards: &cards,
                 };
                 for message in &messages {
@@ -696,6 +705,9 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
             state.ai.blocks_cache = blocks_cache;
 
             show_delete_confirm(state, commands, ui);
+            if let Some(doc) = open_kb_doc {
+                state.pending_kb_doc = Some(doc);
+            }
             if let Some(id) = open_message {
                 state.selected_message = Some(id);
                 state.reader_open = true;
@@ -731,7 +743,11 @@ pub fn settings_modal(state: &mut UiState, commands: &mut Vec<Command>, ctx: &eg
         ui.add_space(4.0);
         egui::ScrollArea::vertical()
             .id_salt("ai_settings_scroll")
-            .max_height(520.0)
+            // 520 → 700：v0.5 在工具开关后面加了「知识库」一行与
+            // 「支持 PDF / 文档输入」一行，内容变高，原来 520 会把
+            // 「最长输出」与下方按钮挤到折叠区外。700 仍小于常见屏幕高度，
+            // 弹窗本身不会被顶出屏幕。
+            .max_height(700.0)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -828,7 +844,8 @@ fn build_stream_message(state: &AiPageState) -> Option<AiMessage> {
     })
 }
 
-/// 四个区块的顺序只在**这一个函数**里定义：思考 → 清单 → 工具 → 回答。
+/// 五个区块的顺序只在**这一个函数**里定义：
+/// 思考 → 清单 → 工具 → 检索到的邮件 → 回答。
 /// 每块没有就不画；历史与实时共用它，所以流式结束重载时不会跳变。
 fn render_turn(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
     ui.add_space(6.0);
@@ -848,17 +865,22 @@ fn render_turn(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
         }
         show_tools(
             ui,
-            ctx,
             &turn.message.tool_trace,
             turn.live_tool,
             turn.message.id,
         );
+        // 卡片从工具区移出来后放在这里：工具区回答「AI 做了什么」，
+        // 这一块回答「它到底找到了什么」，后者才是用户要的产出。
+        show_mail_cards(ui, ctx, &turn.message.tool_trace, turn.message.id);
         show_answer(ui, ctx, turn);
     });
 }
 
-/// 思考过程。完成态默认折叠，流式中默认展开；不跑 Markdown
-/// （思考里常有未闭合的代码块，硬解析会吞掉半屏）。
+/// 思考过程。**始终默认折叠**（v0.5 改）：流式期间它会一帧一帧地长，
+/// 展开着会把正在生成的回答一路往下推。`default_open` 只在这个 id
+/// 第一次被创建时生效，所以同一条消息流式中途不会自己展开；
+/// 用户手动展开过的，重进仍保持展开（尊重用户操作）。
+/// 不跑 Markdown（思考里常有未闭合的代码块，硬解析会吞掉半屏）。
 fn show_thinking(ui: &mut egui::Ui, block: &ThinkingBlock, live: bool, message_id: AiMessageId) {
     if block.segments.is_empty() && !block.truncated {
         return;
@@ -879,7 +901,7 @@ fn show_thinking(ui: &mut egui::Ui, block: &ThinkingBlock, live: bool, message_i
     egui::CollapsingHeader::new(title)
         // 每条消息一个 id：共用一个 salt 会让折叠状态在所有消息之间串。
         .id_salt(("ai_thinking", message_id.0))
-        .default_open(live)
+        .default_open(false)
         .show(ui, |ui| {
             for (index, segment) in block.segments.iter().enumerate() {
                 if block.segments.len() > 1 {
@@ -916,10 +938,12 @@ fn show_thinking(ui: &mut egui::Ui, block: &ThinkingBlock, live: bool, message_i
         });
 }
 
-/// 工具调用区：已完成的 trace + 正在跑的那一条 + 每次检索命中的卡片。
+/// 工具调用区：已完成的 trace + 正在跑的那一条。
+///
+/// **默认折叠**（v0.5 改）：工具调用是过程信息，用户要看的是产出（见
+/// `show_mail_cards`）。折叠后「还在跑」这件事会看不见，所以状态写进标题。
 fn show_tools(
     ui: &mut egui::Ui,
-    ctx: &mut TurnCtx<'_>,
     traces: &[AiToolTrace],
     live_tool: Option<&LiveTool>,
     message_id: AiMessageId,
@@ -928,10 +952,14 @@ fn show_tools(
         return;
     }
     let total = traces.len() + usize::from(live_tool.is_some());
-    egui::CollapsingHeader::new(format!("工具调用（{total}）"))
+    let title = if live_tool.is_some() {
+        format!("工具调用（{total}）· 执行中")
+    } else {
+        format!("工具调用（{total}）")
+    };
+    egui::CollapsingHeader::new(title)
         .id_salt(("ai_tool_activity", message_id.0))
-        // 工具正在跑时展开：用户不必点一下才知道 AI 在做什么。
-        .default_open(live_tool.is_some())
+        .default_open(false)
         .show(ui, |ui| {
             for trace in traces {
                 let mark = match trace.status {
@@ -968,7 +996,6 @@ fn show_tools(
                     label = label.color(Color32::GRAY);
                 }
                 ui.label(label);
-                show_trace_cards(ui, ctx, &trace.cards);
             }
             if let Some(live) = live_tool {
                 ui.horizontal(|ui| {
@@ -989,49 +1016,81 @@ fn show_tools(
         });
 }
 
-/// 卡片只存 `id + 命中理由`，摘要按 id 去缓存里找。
-/// 历史回看时缓存可能没有（当时那封不在当前列表），降级成一行理由 + 打开按钮，
-/// 不报错也不画空卡片。
-fn show_trace_cards(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, cards: &[MailCardRef]) {
-    for card in cards.iter().take(MAX_CARDS) {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            if let Some(summary) = ctx.cards.iter().find(|item| item.message == card.message) {
+/// [检索到的邮件] 区：本轮**所有**工具回执里命中的邮件，合并去重后独立成区。
+///
+/// 卡片原先画在工具调用区内部（每个 trace 各画一组），两个后果：同一封被
+/// 两次检索命中会出现两遍；卡片还被折叠在没人展开的工具区里。用户最关心的
+/// 产出不该藏在过程信息里，所以独立成块、默认展开。
+fn show_mail_cards(
+    ui: &mut egui::Ui,
+    ctx: &mut TurnCtx<'_>,
+    traces: &[AiToolTrace],
+    message_id: AiMessageId,
+) {
+    // 按 `message` 去重，保留**首次**命中的理由（后面的重复命中不再补理由）。
+    // 非邮件工具的 `cards` 是空切片，`flat_map` 自动跳过。
+    let mut seen: HashSet<MessageId> = HashSet::new();
+    let merged: Vec<&MailCardRef> = traces
+        .iter()
+        .flat_map(|trace| trace.cards.iter())
+        .filter(|card| seen.insert(card.message))
+        .collect();
+    if merged.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new(format!("检索到的邮件（{}）", merged.len()))
+        .id_salt(("ai_mail_cards", message_id.0))
+        // 这是用户最关心的产出，默认展开。
+        .default_open(true)
+        .show(ui, |ui| {
+            // 截断口径从「每个 trace 各 5 张」改成「合并后 5 张」。
+            for card in merged.iter().take(MAX_CARDS) {
+                show_mail_card(ui, ctx, card);
+            }
+            if merged.len() > MAX_CARDS {
                 ui.label(
-                    RichText::new(truncate_chars(&summary.subject, 50))
-                        .small()
-                        .strong(),
-                );
-                ui.label(
-                    RichText::new(truncate_chars(&summary.snippet, 100))
-                        .small()
-                        .color(Color32::GRAY),
-                );
-            } else {
-                ui.label(
-                    RichText::new("（摘要已不在缓存，仍可打开）")
+                    RichText::new(format!("还有 {} 封", merged.len() - MAX_CARDS))
                         .small()
                         .color(Color32::GRAY),
                 );
             }
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(truncate_chars(&card.reason, 60))
-                        .small()
-                        .color(Color32::from_rgb(0x3B, 0x82, 0xF6)),
-                );
-                if ui.small_button("打开邮件").clicked() {
-                    *ctx.open_message = Some(card.message);
-                }
-            });
         });
-    }
-    if cards.len() > MAX_CARDS {
-        ui.label(
-            RichText::new(format!("还有 {} 封", cards.len() - MAX_CARDS))
-                .small()
-                .color(Color32::GRAY),
-        );
-    }
+}
+
+/// 单张邮件卡片。只存 `id + 命中理由`，摘要按 id 去缓存里找。
+/// 历史回看时缓存可能没有（当时那封不在当前列表），降级成一行理由 + 打开按钮，
+/// 不报错也不画空卡片。
+fn show_mail_card(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, card: &MailCardRef) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        if let Some(summary) = ctx.cards.iter().find(|item| item.message == card.message) {
+            ui.label(
+                RichText::new(truncate_chars(&summary.subject, 50))
+                    .small()
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(truncate_chars(&summary.snippet, 100))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        } else {
+            ui.label(
+                RichText::new("（摘要已不在缓存，仍可打开）")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(truncate_chars(&card.reason, 60))
+                    .small()
+                    .color(Color32::from_rgb(0x3B, 0x82, 0xF6)),
+            );
+            if ui.small_button("打开邮件").clicked() {
+                *ctx.open_message = Some(card.message);
+            }
+        });
+    });
 }
 
 /// 回答区：正文、[结果] 块、错误/取消、token 用量、复制按钮。
@@ -1047,7 +1106,9 @@ fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
     // `[id=…]` 是给模型看的锚点，不进用户视线：**落库正文保留原文**
     // （下一轮「把那封打开」要靠它直接调 `mail_read`），只在渲染这一层摘掉。
     // 流式与收尾共用同一个字符串，否则流式期间会闪一下 `[id=150]`。
-    let stripped = me_core::ai::strip_mail_ids(message.content.trim());
+    // `[kb:12]` 与 `[id=150]` 同一套处理：落库保留原文，渲染层摘掉换成 chip。
+    let (without_kb, kb_anchors) = me_core::ai::parse_kb_anchors(message.content.trim());
+    let stripped = me_core::ai::strip_mail_ids(&without_kb);
     let live = stripped.as_str();
     if live.is_empty() {
         if turn.streaming {
@@ -1126,10 +1187,52 @@ fn show_answer(ui: &mut egui::Ui, ctx: &mut TurnCtx<'_>, turn: &TurnView<'_>) {
     }
     ui.horizontal(|ui| {
         if ui.small_button("复制").clicked() {
-            // 复制也走摘过的文本：粘到别处不该带一串 `[id=150]`。
+            // 复制也走摘过的文本：粘到别处不该带一串 `[id=150]` / `[kb:3]`。
             ui.ctx().copy_text(stripped.clone());
         }
     });
+    // 知识库引用：只在**非流式**时画——流式期间锚点还没稳定，chip 会来回跳。
+    //
+    // 文案是「标题 · 第 N 块」而不是裸 id（决策 O-13）：裸 id 对用户
+    // 没有任何意义，标题才能让人判断这条引用值不值得点。
+    //
+    // 标题从**本轮回执**里取（`kb_refs`），不是回查知识库：
+    // 回执里有的就是这一轮真的检索过的，回执里没有的就是编造的
+    // （me-sync 落库前已经摘掉，这里最多显示成「已失效」）。
+    if !kb_anchors.is_empty() && !turn.streaming {
+        let refs: Vec<&me_core::ai::KbRef> = message
+            .tool_trace
+            .iter()
+            .flat_map(|trace| trace.kb_refs.iter())
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("知识库引用：").small().color(Color32::GRAY));
+            for anchor in &kb_anchors {
+                let matched = refs.iter().find(|item| item.doc == anchor.doc);
+                let label = match matched {
+                    Some(reference) => {
+                        // 块号优先用锚点里带的（`[kb:12:3]`），
+                        // 没有就用回执里那条的序号。
+                        let ord = anchor.ord.or(Some(reference.ord));
+                        match ord {
+                            Some(ord) => format!("{} · 第 {ord} 块", reference.title),
+                            None => reference.title.clone(),
+                        }
+                    }
+                    // 回执里没有：这一轮没检索过它（老消息，或它已被删）。
+                    None => format!("文档 #{}（已失效）", anchor.doc),
+                };
+                let id = me_core::knowledge::KnowledgeDocId(anchor.doc);
+                let hover = match matched {
+                    Some(reference) => format!("{}（点击打开）", reference.title),
+                    None => "这一轮没有检索到这份文档".to_string(),
+                };
+                if ui.small_button(label).on_hover_text(hover).clicked() {
+                    *ctx.open_kb_doc = Some(id);
+                }
+            }
+        });
+    }
 }
 
 /// 用户消息走独立分支：`TurnView` 的四块全是 assistant 语义，
@@ -1246,7 +1349,8 @@ fn show_user_message(ui: &mut egui::Ui, message: &AiMessage, expanded: &mut bool
     });
 }
 
-/// 任务清单条。全部结束之后收成一行，避免常驻占地方。
+/// 任务清单条。**结束之后也默认展开**（v0.5 按产品要求改，与 v0.3 的
+/// 「全部结束之后收成一行，避免常驻占地方」相悖——不是 bug，别改回去）。
 ///
 /// 这一步是整轮对话里**信息密度最高**的地方：用户不该等到最后一段文字
 /// 才发现 AI 理解错了需求。所以未完成时默认展开，且每一步都写清
@@ -1260,7 +1364,7 @@ fn show_plan(ui: &mut egui::Ui, plan: &me_core::ai_plan::Plan) {
             truncate_chars(&plan.goal, 36)
         ))
         .id_salt(("ai_plan_done", plan.id.clone()))
-        .default_open(false)
+        .default_open(true)
         .show(ui, |ui| plan_steps(ui, plan));
         return;
     }
@@ -1954,7 +2058,9 @@ fn show_model_form(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut eg
 
     // ---- 工具开关 ----
     ui.separator();
-    ui.label(RichText::new("工具开关").strong());
+    ui.label(RichText::new("工具开关").strong()).on_hover_text(
+        "关掉的工具不会出现在请求里；删除日程与删除知识库文档即使是开着，也要你再确认一次。",
+    );
     // 按能力模块分组只是**渲染层**的事：数据结构保持扁平 9 个 bool，
     // 老档案因此零迁移（见 `doc/AI模块落地方案.md` §4.2）。
     // 分两行而不是五行：设置弹窗高度有限，多出来的行会把下面的预算/删除挤出可视区。
@@ -1976,28 +2082,40 @@ fn show_model_form(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut eg
         ui.checkbox(&mut draft.tools.music, "音乐");
         ui.checkbox(&mut draft.tools.memory, "记忆");
     });
-    ui.label(
-        RichText::new("关掉的工具不会出现在请求里；删除日程即使是开着，也要你再确认一次。")
-            .small()
-            .color(Color32::GRAY),
-    );
+    // 第三行：知识库（v0.5）。加之前确认过设置弹窗是 ScrollArea，
+    // 「保存/删除」不会被挤出可视区。
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("知识库").small().color(Color32::GRAY));
+        ui.checkbox(&mut draft.tools.kb_read, "检索与阅读");
+        ui.checkbox(&mut draft.tools.kb_write, "写入与修改");
+        ui.checkbox(&mut draft.tools.kb_delete, "发起删除");
+    });
+    // 能力位：PDF/PPT 的语块边界必须由模型判断，没有文档输入的模型导入会明确失败。
+    //
+    // 说明文字放悬停提示而不是常驻一行：设置弹窗高度有限，
+    // 多一行就把下面的「最长输出」与操作按钮挤出可视区。
+    ui.horizontal(|ui| {
+        ui.checkbox(
+            &mut draft.pdf_input,
+            "支持 PDF / 文档输入（PDF、PPT 导入需要）",
+        )
+        .on_hover_text("Anthropic 原生支持；多数 OpenAI 兼容端点不支持");
+    });
 
     // ---- 预算 ----
+    //
+    // 两项放**同一行**：设置弹窗高度有限，分两行会把下面的操作按钮
+    // 挤出可视区（ScrollArea 里被裁掉的部分在界面上根本画不出来）。
     ui.separator();
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label("最长输入");
         ui.add(
             egui::TextEdit::singleline(&mut draft.max_input)
                 .desired_width(84.0)
                 .hint_text("48000"),
         );
-        ui.label(
-            RichText::new("字符（历史+本次，超出从最早一轮丢）")
-                .small()
-                .color(Color32::GRAY),
-        );
-    });
-    ui.horizontal(|ui| {
+        ui.label(RichText::new("字符").small().color(Color32::GRAY));
+        ui.separator();
         ui.label("最长输出");
         ui.add(
             egui::TextEdit::singleline(&mut draft.max_output)
@@ -2394,6 +2512,7 @@ mod tests {
     #[test]
     fn draft_round_trips_through_to_model() {
         let draft = AiModelDraft {
+            pdf_input: false,
             id: "m4".to_string(),
             name: " 车间模型 ".to_string(),
             kind: AiProviderKind::OpenAiCompatible,
@@ -3003,12 +3122,14 @@ mod tests {
             step_id: Some(1),
             attempt: Some(2),
             cards: Vec::new(),
+            kb_refs: Vec::new(),
         }
     }
 
-    /// 四个区块按 思考 → 清单 → 工具 → 回答 排列，顺序只由 render_turn 定义。
+    /// 五个区块按 思考 → 清单 → 工具 → 检索到的邮件 → 回答 排列，
+    /// 顺序只由 render_turn 定义。
     #[test]
-    fn render_turn_orders_four_blocks() {
+    fn render_turn_orders_five_blocks() {
         let mut state = ready();
         let mut message = assistant_message(10, "这是最终回答");
         message.thinking = Some(ThinkingBlock {
@@ -3020,7 +3141,12 @@ mod tests {
             truncated: false,
         });
         message.plan = Some(one_step_plan("这次的目标"));
-        message.tool_trace = vec![sample_trace()];
+        let mut trace = sample_trace();
+        trace.cards = vec![MailCardRef {
+            message: MessageId(150),
+            reason: "主题命中".to_string(),
+        }];
+        message.tool_trace = vec![trace];
         state.ai.messages.push(message);
 
         let texts = main_texts(&mut state);
@@ -3033,21 +3159,62 @@ mod tests {
         let thinking = pos("思考过程");
         let plan = pos("任务清单");
         let tools = pos("工具调用");
+        let cards = pos("检索到的邮件");
         let answer = pos("这是最终回答");
         assert!(
-            thinking < plan && plan < tools && tools < answer,
-            "顺序应为 思考 < 清单 < 工具 < 回答，实得 {thinking}/{plan}/{tools}/{answer}：{texts:?}"
+            thinking < plan && plan < tools && tools < cards && cards < answer,
+            "顺序应为 思考 < 清单 < 工具 < 邮件 < 回答，实得 {thinking}/{plan}/{tools}/{cards}/{answer}：{texts:?}"
         );
     }
 
-    /// 没有的块不画：只有回答时，不该出现另外三个标题。
+    /// 同一封被两次检索命中只画一张卡片：合并后按 message 去重。
+    #[test]
+    fn mail_cards_dedupe_across_traces() {
+        let mut state = ready();
+        let mut message = assistant_message(14, "回答");
+        let mut first = sample_trace();
+        first.cards = vec![
+            MailCardRef {
+                message: MessageId(150),
+                reason: "主题命中".to_string(),
+            },
+            MailCardRef {
+                message: MessageId(151),
+                reason: "正文命中".to_string(),
+            },
+        ];
+        let mut second = sample_trace();
+        second.cards = vec![MailCardRef {
+            message: MessageId(150),
+            reason: "发件人命中".to_string(),
+        }];
+        message.tool_trace = vec![first, second];
+        state.ai.messages.push(message);
+
+        let texts = main_texts(&mut state);
+        // 两条 trace 共 3 张卡片，去重后 2 张。
+        assert!(
+            texts.iter().any(|t| t.contains("检索到的邮件（2）")),
+            "应合并去重成 2 张：{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("主题命中")),
+            "保留首次命中的理由：{texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("发件人命中")),
+            "重复命中的理由不该再出现：{texts:?}"
+        );
+    }
+
+    /// 没有的块不画：只有回答时，不该出现另外四个标题。
     #[test]
     fn missing_blocks_render_nothing() {
         let mut state = ready();
         state.ai.messages.push(assistant_message(11, "只有回答"));
         let texts = main_texts(&mut state);
         assert!(texts.iter().any(|t| t.contains("只有回答")));
-        for absent in ["思考过程", "任务清单", "工具调用"] {
+        for absent in ["思考过程", "任务清单", "工具调用", "检索到的邮件"] {
             assert!(
                 !texts.iter().any(|t| t.contains(absent)),
                 "不该出现 {absent}：{texts:?}"
@@ -3145,9 +3312,13 @@ mod tests {
         );
     }
 
-    /// 工具跑着的时候就要看到「执行中」，不能等完成事件。
+    /// 工具跑着的时候，**折叠标题**也要带「执行中」。
+    ///
+    /// 工具区 v0.5 起默认折叠，折叠态下正文根本不渲染（动机那行看不到），
+    /// 「还在跑」只能靠标题传达。`default_open` 的初值存在 egui 记忆里，
+    /// 文本收集法断言不到，所以这里只测标题。
     #[test]
-    fn live_tool_shows_while_running() {
+    fn live_tool_title_says_running() {
         let mut state = ready();
         state
             .ai
@@ -3160,10 +3331,9 @@ mod tests {
         });
         let texts = main_texts(&mut state);
         assert!(
-            texts.iter().any(|t| t.contains("执行中")),
-            "实时工具要有反馈：{texts:?}"
+            texts.iter().any(|t| t.contains("工具调用（1）· 执行中")),
+            "折叠标题要带执行中：{texts:?}"
         );
-        assert!(texts.iter().any(|t| t.contains("先查一下")));
     }
 
     /// 思考按段号分桶，流式状态下能显示出来。

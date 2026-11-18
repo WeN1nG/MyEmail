@@ -20,6 +20,16 @@ chrono = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
 url = { workspace = true }
+reqwest = { workspace = true }
+# 知识库：文档解析（docx/pptx/pdf 切页）与本机嵌入推理。
+# candle 推理是阻塞的，调用点必须在 `spawn_blocking` 里（见 knowledge/embed.rs）。
+encoding_rs = { workspace = true }
+zip = { workspace = true }
+quick-xml = { workspace = true }
+lopdf = { workspace = true }
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+tokenizers = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
@@ -32,3 +42,5 @@ keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust"] 
 
 [dev-dependencies]
 tempfile = "3"
+# 检索评测集要定位模型目录（%APPDATA%\MyEmail\models）。
+dirs = { workspace = true }

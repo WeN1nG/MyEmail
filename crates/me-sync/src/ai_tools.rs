@@ -169,6 +169,7 @@ pub(crate) fn intercepted_result(
             step_id: call_step_id(call),
             attempt: None,
             cards: Vec::new(),
+            kb_refs: Vec::new(),
         },
     }
 }
@@ -242,6 +243,7 @@ pub(crate) fn phase_rejected_result(
             step_id: None,
             attempt: None,
             cards: Vec::new(),
+            kb_refs: Vec::new(),
         },
     }
 }
@@ -419,6 +421,10 @@ const WEATHER_TIMEOUT: Duration = Duration::from_secs(20);
 const CALENDAR_TIMEOUT: Duration = Duration::from_secs(5);
 const MEMORY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAIL_READ_TIMEOUT: Duration = Duration::from_secs(3);
+/// 知识库检索：混合检索要跑 FTS + 一次本机嵌入（20~50 ms）+ KNN。
+const KB_TIMEOUT: Duration = Duration::from_secs(8);
+/// 知识库写入：要切块、写库、写 jsonl，还要做实体匹配。
+const KB_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 给一次工具执行套超时。超时按「工具错误结果」回报给模型（不是整轮失败），
 /// 模型可以换个说法或直接告诉用户稍后再试。
@@ -656,6 +662,9 @@ where
         // 用 per-call 的槽位而不是返回值：只有 email_search 产卡片，
         // 为它改所有工具的返回契约不值得。
         let cards_out: Arc<Mutex<Vec<me_core::MailCardRef>>> = Arc::new(Mutex::new(Vec::new()));
+        // 知识库语块引用同理：`kb_search` / `kb_read` 命中的语块要挂到 trace 上，
+        // 落库前用它校验回答里的 `[kb:N]` 锚点（决策 O-13）。
+        let kb_out: Arc<Mutex<Vec<me_core::ai::KbRef>>> = Arc::new(Mutex::new(Vec::new()));
         let outcome = if !budget.permissions.enabled(call.name) {
             // 本轮没下发这个工具，模型却调用了它：不执行，让它自己向用户解释。
             Err(CoreError::validation(format!(
@@ -854,6 +863,24 @@ where
                         Err(err) => Err(err),
                     }
                 }
+                AiToolName::KbSearch => {
+                    with_timeout(KB_TIMEOUT, "知识库检索", self.tool_kb_search(call, &kb_out)).await
+                }
+                AiToolName::KbRead => {
+                    with_timeout(KB_TIMEOUT, "读知识库文档", self.tool_kb_read(call, &kb_out)).await
+                }
+                AiToolName::KbList => {
+                    with_timeout(KB_TIMEOUT, "列知识库", self.tool_kb_list(call)).await
+                }
+                AiToolName::KbAdd => {
+                    with_timeout(KB_WRITE_TIMEOUT, "写入知识库", self.tool_kb_add(call)).await
+                }
+                AiToolName::KbUpdate => {
+                    with_timeout(KB_TIMEOUT, "修改知识库", self.tool_kb_update(call)).await
+                }
+                AiToolName::KbDelete => {
+                    with_timeout(KB_TIMEOUT, "请求删除", self.tool_kb_delete(call)).await
+                }
                 // 清单是纯内存操作，没有 IO，不套超时；也不占工具次数预算
                 // （由调用方用 `is_bookkeeping()` 判定）。
                 AiToolName::PlanUpdate => self.tool_plan_update(call, plan),
@@ -894,6 +921,10 @@ where
                         .lock()
                         .map(|mut slot| std::mem::take(&mut *slot))
                         .unwrap_or_default(),
+                    kb_refs: kb_out
+                        .lock()
+                        .map(|mut slot| std::mem::take(&mut *slot))
+                        .unwrap_or_default(),
                 },
             },
             Err(err) => {
@@ -921,6 +952,7 @@ where
                         step_id: call_step_id(call),
                         attempt: None,
                         cards: Vec::new(),
+                        kb_refs: Vec::new(),
                     },
                 }
             }
@@ -2830,6 +2862,163 @@ fn format_weather(
     }
     text.push_str("（数据来源：和风天气）");
     text
+}
+
+// ---------------------------------------------------------------------------
+// 知识库工具（v0.5）
+// ---------------------------------------------------------------------------
+
+/// 取必填字符串参数。
+fn arg_text(call: &AiToolCall, key: &str) -> Result<String, CoreError> {
+    call.arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CoreError::validation(format!("缺少 {key}")))
+}
+
+fn arg_optional_text(call: &AiToolCall, key: &str) -> Option<String> {
+    call.arguments
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn arg_usize(call: &AiToolCall, key: &str, default: usize) -> usize {
+    call.arguments
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize)
+        .unwrap_or(default)
+}
+
+impl<S, F, M> SyncService<S, F, M>
+where
+    S: StorePort + Clone,
+    F: me_core::port::ImapSessionFactory + 'static,
+    M: me_core::port::SmtpSender + 'static,
+{
+    async fn tool_kb_search(
+        &self,
+        call: &AiToolCall,
+        kb_out: &Arc<Mutex<Vec<me_core::ai::KbRef>>>,
+    ) -> Result<(String, String), CoreError> {
+        if !call.parse_ok {
+            return Err(CoreError::validation("参数不是合法 JSON"));
+        }
+        let query = arg_text(call, "query")?;
+        let limit = arg_usize(call, "limit", 8).clamp(1, 20);
+        let kind = arg_optional_text(call, "kind")
+            .and_then(|value| me_core::knowledge::KbKind::parse(&value));
+        let entity = arg_optional_text(call, "entity");
+        let (content, refs) = self
+            .knowledge_search_tool(&query, limit, kind, entity.as_deref())
+            .await?;
+        if let Ok(mut slot) = kb_out.lock() {
+            slot.extend(refs);
+        }
+        Ok((content, format!("知识库检索：{query}")))
+    }
+
+    async fn tool_kb_read(
+        &self,
+        call: &AiToolCall,
+        kb_out: &Arc<Mutex<Vec<me_core::ai::KbRef>>>,
+    ) -> Result<(String, String), CoreError> {
+        if !call.parse_ok {
+            return Err(CoreError::validation("参数不是合法 JSON"));
+        }
+        let doc = call
+            .arguments
+            .get("doc_id")
+            .and_then(|value| value.as_i64())
+            .map(me_core::knowledge::KnowledgeDocId)
+            .ok_or_else(|| CoreError::validation("缺少 doc_id"))?;
+        let from = arg_usize(call, "from", 0) as u32;
+        let count = arg_usize(
+            call,
+            "count",
+            SyncService::<S, F, M>::read_chunk_page() as usize,
+        ) as u32;
+        let (content, refs) = self.knowledge_read_tool(doc, from, count).await?;
+        if let Ok(mut slot) = kb_out.lock() {
+            slot.extend(refs);
+        }
+        Ok((content, format!("读知识库文档 {doc}")))
+    }
+
+    async fn tool_kb_list(&self, call: &AiToolCall) -> Result<(String, String), CoreError> {
+        if !call.parse_ok {
+            return Err(CoreError::validation("参数不是合法 JSON"));
+        }
+        let query = arg_optional_text(call, "query");
+        let status = arg_optional_text(call, "status")
+            .and_then(|value| me_core::knowledge::KbStatus::parse(&value));
+        let limit = arg_usize(call, "limit", 20) as u32;
+        let content = self
+            .knowledge_list_tool(query.as_deref(), status, limit)
+            .await?;
+        Ok((content, "列知识库文档".to_string()))
+    }
+
+    async fn tool_kb_add(&self, call: &AiToolCall) -> Result<(String, String), CoreError> {
+        if !call.parse_ok {
+            return Err(CoreError::validation("参数不是合法 JSON"));
+        }
+        let title = arg_text(call, "title")?;
+        let text = call
+            .arguments
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+            .ok_or_else(|| CoreError::validation("缺少 text"))?;
+        // me-sync 侧再校验一次长度：不能只靠模型遵守 schema。
+        let content = self.knowledge_add_tool(&title, &text).await?;
+        Ok((content, format!("写入知识库：{title}")))
+    }
+
+    async fn tool_kb_update(&self, call: &AiToolCall) -> Result<(String, String), CoreError> {
+        if !call.parse_ok {
+            return Err(CoreError::validation("参数不是合法 JSON"));
+        }
+        let doc = call
+            .arguments
+            .get("doc_id")
+            .and_then(|value| value.as_i64())
+            .map(me_core::knowledge::KnowledgeDocId)
+            .ok_or_else(|| CoreError::validation("缺少 doc_id"))?;
+        let title = arg_optional_text(call, "title");
+        let enabled = call
+            .arguments
+            .get("enabled")
+            .and_then(|value| value.as_bool());
+        if title.is_none() && enabled.is_none() {
+            return Err(CoreError::validation("至少要改标题或启用状态其中之一"));
+        }
+        let content = self
+            .knowledge_update_tool(doc, title.as_deref(), enabled)
+            .await?;
+        Ok((content, format!("修改知识库文档 {doc}")))
+    }
+
+    async fn tool_kb_delete(&self, call: &AiToolCall) -> Result<(String, String), CoreError> {
+        if !call.parse_ok {
+            return Err(CoreError::validation("参数不是合法 JSON"));
+        }
+        let doc = call
+            .arguments
+            .get("doc_id")
+            .and_then(|value| value.as_i64())
+            .map(me_core::knowledge::KnowledgeDocId)
+            .ok_or_else(|| CoreError::validation("缺少 doc_id"))?;
+        self.knowledge_delete_request(doc).await;
+        Ok((
+            format!("已向用户发出删除确认请求（文档 {doc}）。等用户确认后才会真正删除。"),
+            format!("请求删除知识库文档 {doc}"),
+        ))
+    }
 }
 
 #[cfg(test)]

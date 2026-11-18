@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -42,7 +42,7 @@ rand = "0.8.8"
 sha2 = "0.10.9"
 
 # --- 异步 ---
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "net", "io-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "time", "sync", "net", "io-util", "process"] }
 tokio-util = { version = "0.7.20", features = ["rt"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 
@@ -68,6 +68,22 @@ rusqlite = { version = "0.41.1", features = ["bundled"] }
 r2d2 = "0.8.10"
 flate2 = "1.1.10"
 dirs = "7.0.0"
+# 向量虚表：单文件 C 静态链接，用 sqlite3_auto_extension 注册，没有 DLL。
+sqlite-vec = "0.1.6"
+
+# --- 知识库：本地嵌入与文档解析（仅 me-sync）---
+# candle 只做 embedding 推理，不跑生成模型。**不要开 cuda / metal / accelerate / mkl**：
+# 那是另一套体积账（本机实测 candle+tokenizers = 4.47 MB）。
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+tokenizers = "0.23.2"
+# 老 txt 常见 GBK 编码：只用来在 UTF-8 失败时兜底解码，纯 Rust 无额外依赖。
+encoding_rs = "0.8.35"
+# docx / pptx 容器与 XML。zip 只开 deflate——docx/pptx 只用这一种压缩。
+zip = { version = "9.6.1", default-features = false, features = ["deflate"] }
+quick-xml = "0.42.0"
+# **只用来按页切 PDF**（不是提文本）。切完的每一批仍以 PDF 原文件形态交给模型。
+lopdf = "0.47.0"
 
 # --- 编排 / 应用 ---
 keyring = "3.6.3"
@@ -76,6 +92,8 @@ egui_extras = "0.32.3"
 rfd = "0.17.2"
 fs2 = "0.4.3"
 tracing-appender = "0.2.5"
+# 系统通知（仅 me-app）：Windows 后端是 tauri-winrt-notification，实测 +109 KB。
+notify-rust = "4.19.0"
 
 # --- 音频（仅 me-app）---
 # 只开播放与四种目标格式：默认特性还会带 mp4/aac/isomp4/noise/recording，

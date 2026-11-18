@@ -8,10 +8,13 @@ pub mod ai_plan;
 pub mod calendar;
 pub mod command;
 pub mod error;
+pub mod knowledge;
 pub mod model;
 pub mod music;
+pub mod notify;
 pub mod port;
 pub mod search_syntax;
+pub mod text;
 pub mod thread;
 pub mod weather;
 
@@ -21,12 +24,13 @@ pub use ai::{
     AiMemoryRepo, AiMessage, AiMessageId, AiMessageStatus, AiProvider, AiProviderConfig,
     AiProviderKind, AiRepo, AiRole, AiToolCall, AiToolName, AiToolPermissions, AiToolResult,
     AiToolSpec, AiToolStatus, AiToolTrace, AiTurnResult, AiWireMessage, CancelFlag, ChatBuildInput,
-    MAX_CONTEXT_REFS, MAX_CONTEXT_TOTAL_CHARS, MAX_CURRENT_CHARS, MAX_ENTITIES, MAX_ENTITY_CONTEXT,
-    MAX_INPUT_CHARS, MAX_MESSAGE_CHARS, MAX_TOOL_CALLS, MAX_TOOL_RESULT_CHARS, MAX_TOOL_ROUNDS,
-    MAX_USER_INPUT_CHARS, MailCardRef, MotiveSource, NewAiEntity, NewAiMessage, SYSTEM_PROMPT,
-    TOOL_SPECS, build_chat_request, escape_context, estimate_tokens, normalize_base_url,
-    normalize_entity_name, render_context_refs, render_entity_context, render_user_message,
-    select_entities, strip_control, tool_motive, tool_specs, trim_history, truncate_chars,
+    KbAnchor, KbCitationAudit, KbRef, MAX_CONTEXT_REFS, MAX_CONTEXT_TOTAL_CHARS, MAX_CURRENT_CHARS,
+    MAX_ENTITIES, MAX_ENTITY_CONTEXT, MAX_INPUT_CHARS, MAX_MESSAGE_CHARS, MAX_TOOL_CALLS,
+    MAX_TOOL_RESULT_CHARS, MAX_TOOL_ROUNDS, MAX_USER_INPUT_CHARS, MailCardRef, MotiveSource,
+    NewAiEntity, NewAiMessage, SYSTEM_PROMPT, TOOL_SPECS, align_kb_citations, build_chat_request,
+    escape_context, estimate_tokens, normalize_base_url, normalize_entity_name, parse_kb_anchors,
+    render_context_refs, render_entity_context, render_user_message, select_entities,
+    strip_control, strip_kb_anchors, tool_motive, tool_specs, trim_history, truncate_chars,
     validate_api_key, validate_config,
 };
 pub use ai_plan::{
@@ -41,7 +45,22 @@ pub use calendar::{
     RecurrenceWarning, due_reminders, expand_event, is_valid_timezone, recurrence_until,
     validate_draft,
 };
+pub use knowledge::{
+    BGE_QUERY_PREFIX, CHUNK_OVERLAP_CHARS, ChunkHit, DEFAULT_MAIL_CAPACITY, DocumentSplitRequest,
+    EMBED_DIM, EMBED_MODEL_ID, Embedder, KB_PDF_SPLIT_PROMPT, KB_TEXT_SPLIT_PROMPT, KbFilter,
+    KbKind, KbOrigin, KbSearchHit, KbStage, KbStatus, KnowledgeChunk, KnowledgeChunkId,
+    KnowledgeDoc, KnowledgeDocId, KnowledgeRepo, KnowledgeSettings, KnowledgeStats,
+    MAX_CHUNK_CHARS, MAX_KB_TEXT_CHARS, MAX_KB_TITLE_CHARS, MAX_SPLIT_CHUNKS, MIN_MAIL_BODY_CHARS,
+    MailSeed, NewChunk, NewKnowledgeDoc, OTHER_MAX_BYTES, PDF_MAX_BATCH_PAGES, PDF_MAX_LOCAL_BYTES,
+    PDF_MAX_RAW_BYTES, PDF_MAX_REQUEST_BYTES, PPTX_TEXT_BATCH_CHARS, PdfBatch, RAG_CANDIDATES,
+    RAG_MAX_CONTEXT_CHARS, RAG_TOP_K, RRF_K, RetrievalMode, ScoredHit, SkipReason, SplitChunk,
+    SplitInput, SplitOutcome, TARGET_CHUNK_CHARS, estimate_pdf_tokens, estimate_split_cost_usd,
+    fold_for_fts, is_meaningful, match_entities, parse_split_response, plan_pdf_batches,
+    reference_price_per_mtok, render_rag_context, rrf_fuse, shift_locator, split_structured,
+    split_text_batches,
+};
 pub use music::{MusicAction, MusicOp, MusicOrder, MusicOutcome, MusicQueue};
+pub use notify::{NotificationKind, NotificationPrefs};
 pub use weather::{
     CurrentWeather, DEFAULT_API_HOST, DailyForecast, HOST_HINT, HourlyForecast,
     MAX_WEATHER_LOCATIONS, PATH_7D, PATH_24H, PATH_CITY_LOOKUP, PATH_CITY_LOOKUP_LEGACY, PATH_NOW,
@@ -85,7 +104,11 @@ pub use thread::{ThreadRow, thread_key, thread_root, thread_rows};
 /// 草稿列表、AI 会话/实体列表都不再退化成临时 B 树排序或全表扫描。
 /// v7 是 v0.4 的唯一 DDL 级变更：新增 `contacts` / `saved_searches` 两张表，
 /// 给 `messages` 补 `in_reply_to` / `references` 两列。
-pub const SCHEMA_VERSION: u32 = 8;
+/// v8 给 `ai_messages` 补 `thinking`（分段思考 JSON）。
+/// v9 是 v0.5 的**纯建表**：`kb_documents` / `kb_chunks` / `kb_chunks_fts` /
+/// `kb_doc_entities`（外加独立文件里的 `kbvec.vec_chunks` 虚表），
+/// **不 ALTER 任何既有表**，所以回滚就是删表。
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// 应用显示名。
 pub const APP_NAME: &str = "MyEmail";
@@ -174,4 +197,21 @@ pub mod settings_key {
     /// **预留键，v0.3 未接线**，与 [`FEATURE_CALENDAR`] 同状态：无读取方、
     /// 无设置入口，改它不会关掉 AI 页。接线工作见 `doc/v3收尾项清单.md` D4。
     pub const FEATURE_AI: &str = "feature_ai";
+
+    // ---- 知识库（v0.5）----
+    /// 邮件自动入库的容量：只索引最新前 N 封；`0` = 关闭；缺失按默认 200。
+    pub const KB_MAIL_CAPACITY: &str = "kb_mail_capacity";
+    /// PDF/PPT 需要大模型分析的**一次性总确认**（含费用与隐私告知）。
+    /// 写 `1` 表示已确认；设置页的「重新显示提示」会删掉这个键。
+    pub const KB_LLM_ACK: &str = "kb_llm_ack";
+    /// 用户点了「暂不启用语义检索」；下次进知识库不再弹引导卡。
+    pub const KB_EMBED_DECLINED: &str = "kb_embed_declined";
+    /// 已就绪的嵌入模型 id（`bge-small-zh-v1.5`）。**空或缺失 = 只能用关键词检索**。
+    pub const KB_EMBED_MODEL: &str = "kb_embed_model";
+    /// 嵌入模型下载地址（默认 ModelScope 直链，允许改成内网镜像）。
+    pub const KB_EMBED_MODEL_URL: &str = "kb_embed_model_url";
+    /// 模型文件的 sha256（下载后校验，失败即删文件）。
+    pub const KB_EMBED_MODEL_SHA256: &str = "kb_embed_model_sha256";
+    /// 老格式（`.doc` / `.ppt`）转换后端探测结果：`soffice` / `office` / `none`。
+    pub const KB_CONVERTER: &str = "kb_converter";
 }

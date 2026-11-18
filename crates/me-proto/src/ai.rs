@@ -886,6 +886,14 @@ fn apply_openai(
 // ---------------------------------------------------------------------------
 
 impl AiProvider for HttpAiProvider {
+    fn split_document(
+        &self,
+        request: me_core::knowledge::DocumentSplitRequest,
+    ) -> AiFuture<Result<me_core::knowledge::SplitOutcome, CoreError>> {
+        let client = self.client.clone();
+        Box::pin(async move { split_turn(client, request).await })
+    }
+
     fn stream_chat(
         &self,
         request: AiChatRequest,
@@ -894,6 +902,204 @@ impl AiProvider for HttpAiProvider {
     ) -> AiFuture<Result<AiTurnResult, CoreError>> {
         let client = self.client.clone();
         Box::pin(async move { stream_turn(client, request, sink, cancel).await })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 文档拆分（PDF / PPTX → 语块）
+// ---------------------------------------------------------------------------
+
+/// 文档拆分比对话慢得多：100 页扫描件要读十几秒，还要吐几千个 token。
+const SPLIT_TIMEOUT: Duration = Duration::from_secs(600);
+/// 单批输出上限。语块 JSON 比对话长，4096 会被截断成废串。
+const SPLIT_MAX_OUTPUT_TOKENS: u32 = 8192;
+
+async fn split_turn(
+    client: reqwest::Client,
+    request: me_core::knowledge::DocumentSplitRequest,
+) -> Result<me_core::knowledge::SplitOutcome, CoreError> {
+    let url = endpoint(&request.config)?;
+    let prompt = match &request.input {
+        me_core::knowledge::SplitInput::Pdf { .. } => me_core::knowledge::KB_PDF_SPLIT_PROMPT,
+        me_core::knowledge::SplitInput::Text { .. } => me_core::knowledge::KB_TEXT_SPLIT_PROMPT,
+    };
+    let body = match request.config.kind {
+        AiProviderKind::Anthropic => anthropic_split_body(&request, prompt)?,
+        AiProviderKind::OpenAiCompatible => openai_split_body(&request, prompt),
+    };
+
+    let mut builder = client
+        .post(&url)
+        .header("content-type", "application/json")
+        // 失败重试没有意义：PDF 单批很贵，重试等于重复付费。
+        .timeout(SPLIT_TIMEOUT);
+    match request.config.kind {
+        AiProviderKind::Anthropic => {
+            let credential = request.credential.as_ref().ok_or_else(|| {
+                CoreError::ai(
+                    AiErrorKind::Config,
+                    None::<String>,
+                    "尚未配置 Anthropic API Key",
+                )
+            })?;
+            builder = builder
+                .header("x-api-key", credential.expose())
+                .header("anthropic-version", ANTHROPIC_VERSION);
+        }
+        AiProviderKind::OpenAiCompatible => {
+            if let Some(credential) = request.credential.as_ref() {
+                builder =
+                    builder.header("authorization", format!("Bearer {}", credential.expose()));
+            }
+        }
+    }
+
+    // 与 `stream_turn` 一致：reqwest 没开 `json` feature，自己序列化。
+    let payload_bytes = serde_json::to_vec(&body).map_err(|_| {
+        CoreError::ai(
+            AiErrorKind::Protocol,
+            None::<String>,
+            "拆分请求体无法序列化",
+        )
+    })?;
+    let response = builder
+        .body(payload_bytes)
+        .send()
+        .await
+        .map_err(map_transport)?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| CoreError::network(true, format!("读取模型响应失败: {e}")))?;
+    if !status.is_success() {
+        return Err(map_status(status.as_u16(), &bytes));
+    }
+    let payload: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        CoreError::ai(
+            AiErrorKind::Protocol,
+            None::<String>,
+            "模型响应不是合法 JSON",
+        )
+    })?;
+
+    let (text, truncated) = split_text_of(request.config.kind, &payload);
+    let chunks =
+        me_core::knowledge::parse_split_response(&text, request.max_chunks).map_err(|snippet| {
+            CoreError::ai(
+                AiErrorKind::Protocol,
+                None::<String>,
+                format!("模型没有返回可解析的语块 JSON：{snippet}"),
+            )
+        })?;
+    Ok(me_core::knowledge::SplitOutcome { chunks, truncated })
+}
+
+fn anthropic_split_body(
+    request: &me_core::knowledge::DocumentSplitRequest,
+    prompt: &str,
+) -> Result<Value, CoreError> {
+    let mut content: Vec<Value> = Vec::new();
+    match &request.input {
+        me_core::knowledge::SplitInput::Pdf { bytes, .. } => {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            content.push(json!({
+                "type": "document",
+                "source": {"type": "base64", "media_type": "application/pdf", "data": data},
+            }));
+        }
+        me_core::knowledge::SplitInput::Text { text, part, total } => {
+            content.push(json!({
+                "type": "text",
+                "text": format!("[第 {part}/{total} 批]\n{text}"),
+            }));
+        }
+    }
+    content.push(json!({"type": "text", "text": prompt}));
+    Ok(json!({
+        "model": request.model,
+        "max_tokens": SPLIT_MAX_OUTPUT_TOKENS,
+        "messages": [{"role": "user", "content": content}],
+    }))
+}
+
+fn openai_split_body(request: &me_core::knowledge::DocumentSplitRequest, prompt: &str) -> Value {
+    let mut content: Vec<Value> = Vec::new();
+    match &request.input {
+        me_core::knowledge::SplitInput::Pdf { bytes, .. } => {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+            content.push(json!({
+                "type": "file",
+                "file": {
+                    "filename": "part.pdf",
+                    "file_data": format!("data:application/pdf;base64,{data}"),
+                },
+            }));
+        }
+        me_core::knowledge::SplitInput::Text { text, part, total } => {
+            content
+                .push(json!({"type": "text", "text": format!("[第 {part}/{total} 批]\n{text}")}));
+        }
+    }
+    content.push(json!({"type": "text", "text": prompt}));
+    json!({
+        "model": request.model,
+        "max_tokens": SPLIT_MAX_OUTPUT_TOKENS,
+        "messages": [{"role": "user", "content": content}],
+    })
+}
+
+/// 取正文与截断迹象。
+///
+/// `truncated` 只表示「模型侧被 max_tokens 截断」：它意味着 JSON 很可能不完整，
+/// 上层据此决定「不重试也别假装成功」。
+fn split_text_of(kind: AiProviderKind, payload: &Value) -> (String, bool) {
+    match kind {
+        AiProviderKind::Anthropic => {
+            let mut text = String::new();
+            if let Some(blocks) = payload.get("content").and_then(|value| value.as_array()) {
+                for block in blocks {
+                    if block.get("type").and_then(|value| value.as_str()) == Some("text")
+                        && let Some(chunk) = block.get("text").and_then(|value| value.as_str())
+                    {
+                        text.push_str(chunk);
+                    }
+                }
+            }
+            let truncated =
+                payload.get("stop_reason").and_then(|value| value.as_str()) == Some("max_tokens");
+            (text, truncated)
+        }
+        AiProviderKind::OpenAiCompatible => {
+            let choice = payload
+                .get("choices")
+                .and_then(|value| value.as_array())
+                .and_then(|items| items.first());
+            let mut text = String::new();
+            if let Some(content) = choice
+                .and_then(|item| item.get("message"))
+                .and_then(|message| message.get("content"))
+            {
+                match content {
+                    Value::String(body) => text.push_str(body),
+                    Value::Array(parts) => {
+                        for part in parts {
+                            if let Some(chunk) = part.get("text").and_then(|value| value.as_str()) {
+                                text.push_str(chunk);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let truncated = choice
+                .and_then(|item| item.get("finish_reason"))
+                .and_then(|value| value.as_str())
+                == Some("length");
+            (text, truncated)
+        }
     }
 }
 

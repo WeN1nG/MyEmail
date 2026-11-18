@@ -6,6 +6,7 @@ pub mod calendar;
 pub mod compose;
 pub mod dialogs;
 pub mod html;
+pub mod knowledge;
 pub mod mailbox;
 pub mod music;
 pub mod reader;
@@ -36,6 +37,7 @@ pub fn top_bar(state: &mut UiState, commands: &mut Vec<Command>, ctx: &egui::Con
                 Page::Calendar,
                 Page::Weather,
                 Page::Music,
+                Page::Knowledge,
                 Page::Accounts,
                 Page::Settings,
             ] {
@@ -297,6 +299,9 @@ pub fn switch_page(state: &mut UiState, page: Page) {
     if page == Page::Weather {
         state.weather.dirty = true;
     }
+    if page == Page::Knowledge {
+        state.knowledge.dirty = true;
+    }
     if page == Page::AiChat {
         state.ai_conversations_dirty = true;
         state.ai_messages_dirty = true;
@@ -526,6 +531,7 @@ mod tests {
             Page::Calendar,
             Page::Weather,
             Page::Music,
+            Page::Knowledge,
             Page::Accounts,
             Page::Settings,
         ];

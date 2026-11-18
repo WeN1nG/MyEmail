@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::error::CoreError;
+use crate::error::{AiErrorKind, CoreError};
 use crate::model::{MessageId, format_local_datetime};
 
 // ---------------------------------------------------------------------------
@@ -316,6 +316,15 @@ pub struct AiModel {
     /// **日志仍然脱敏**：本结构手写了 `Debug`（见下），`api_key` 只报有无。
     #[serde(default)]
     pub api_key: String,
+    /// 该模型是否能直接吃 PDF / 文档输入。
+    ///
+    /// PDF 与 PPTX 的语块边界必须由模型判断（决策 O-18/O-19），所以没有这个能力的
+    /// 模型**导入时会明确失败**，而不是悄悄降级成本地切分。
+    ///
+    /// `#[serde(default)]` 是必须的：老档案里没有这个键，没有默认值时整份
+    /// `meta.ai_models` 会解析失败，进而静默清空用户的模型配置（`tools` 踩过同一个坑）。
+    #[serde(default)]
+    pub pdf_input: bool,
 }
 
 /// 手写 `Debug`：`AiModel` 会被整份 emit 给 UI、也可能出现在日志与
@@ -331,6 +340,7 @@ impl std::fmt::Debug for AiModel {
             .field("max_input_chars", &self.max_input_chars)
             .field("max_output_tokens", &self.max_output_tokens)
             .field("tools", &self.tools)
+            .field("pdf_input", &self.pdf_input)
             .field(
                 "api_key",
                 &if self.has_key() {
@@ -361,6 +371,9 @@ impl AiModel {
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             tools: AiToolPermissions::default(),
             api_key: String::new(),
+            // Anthropic 系列原生支持 PDF / 文档输入；OpenAI 兼容端点大多不支持，
+            // 默认关掉，由用户在档案里手动勾（勾了也只是「允许尝试」）。
+            pdf_input: matches!(kind, AiProviderKind::Anthropic),
         }
     }
 
@@ -595,12 +608,34 @@ pub enum AiToolName {
     PlanSubmit,
     /// 显式的豁免通道：把「这件事不需要清单」从隐式行为变成一条可审计的记录。
     AnswerDirectly,
+    // ---- 知识库（v0.5）----
+    /// 混合检索（FTS + 向量，RRF 融合）。**只读**。
+    KbSearch,
+    /// 读某份文档的一段语块（分页）。**只读**。
+    KbRead,
+    /// 列文档（标题/状态筛选）。**只读**。
+    KbList,
+    /// 写入一段文本。**只收文本，不收路径**（否则模型能读任意本地文件）。
+    KbAdd,
+    /// 改标题 / 启用状态。
+    KbUpdate,
+    /// **不直接删**：只发待确认事件，等用户点「确认删除」。
+    KbDelete,
 }
 
 impl AiToolName {
     /// 是不是「邮件类」工具：它们的回执里带 `cards`，也就是可对账的 id 集合。
     pub fn is_email(self) -> bool {
         matches!(self, AiToolName::EmailSearch | AiToolName::MailRead)
+    }
+
+    /// 是否是知识库工具。**只读三个算**（`kb_search` / `kb_read` / `kb_list`）：
+    /// 写工具不产生可引用的语块，不该给它们开引用通道。
+    pub fn is_kb_read(self) -> bool {
+        matches!(
+            self,
+            AiToolName::KbSearch | AiToolName::KbRead | AiToolName::KbList
+        )
     }
 
     pub fn as_str(self) -> &'static str {
@@ -621,6 +656,12 @@ impl AiToolName {
             AiToolName::PlanUpdate => "plan_update",
             AiToolName::PlanSubmit => "plan_submit",
             AiToolName::AnswerDirectly => "answer_directly",
+            AiToolName::KbSearch => "kb_search",
+            AiToolName::KbRead => "kb_read",
+            AiToolName::KbList => "kb_list",
+            AiToolName::KbAdd => "kb_add",
+            AiToolName::KbUpdate => "kb_update",
+            AiToolName::KbDelete => "kb_delete",
         }
     }
 
@@ -642,6 +683,12 @@ impl AiToolName {
             "plan_update" => Some(AiToolName::PlanUpdate),
             "plan_submit" => Some(AiToolName::PlanSubmit),
             "answer_directly" => Some(AiToolName::AnswerDirectly),
+            "kb_search" => Some(AiToolName::KbSearch),
+            "kb_read" => Some(AiToolName::KbRead),
+            "kb_list" => Some(AiToolName::KbList),
+            "kb_add" => Some(AiToolName::KbAdd),
+            "kb_update" => Some(AiToolName::KbUpdate),
+            "kb_delete" => Some(AiToolName::KbDelete),
             _ => None,
         }
     }
@@ -665,6 +712,12 @@ impl AiToolName {
             AiToolName::PlanUpdate => "更新清单",
             AiToolName::PlanSubmit => "提交计划",
             AiToolName::AnswerDirectly => "直接回答",
+            AiToolName::KbSearch => "检索知识库",
+            AiToolName::KbRead => "读知识库文档",
+            AiToolName::KbList => "列知识库",
+            AiToolName::KbAdd => "写入知识库",
+            AiToolName::KbUpdate => "修改知识库",
+            AiToolName::KbDelete => "删除知识库文档",
         }
     }
 
@@ -687,6 +740,9 @@ impl AiToolName {
                 | AiToolName::MemoryUpsert
                 | AiToolName::MusicSearch
                 | AiToolName::MusicState
+                | AiToolName::KbSearch
+                | AiToolName::KbRead
+                | AiToolName::KbList
                 | AiToolName::PlanUpdate
                 | AiToolName::PlanSubmit
                 | AiToolName::AnswerDirectly
@@ -716,6 +772,9 @@ impl AiToolName {
                 | AiToolName::MemoryUpsert
                 | AiToolName::MusicPlay
                 | AiToolName::MusicControl
+                | AiToolName::KbAdd
+                | AiToolName::KbUpdate
+                | AiToolName::KbDelete
         )
     }
 }
@@ -838,6 +897,12 @@ pub struct AiToolTrace {
     /// 老数据没有这个键，读成空数组。
     #[serde(default)]
     pub cards: Vec<MailCardRef>,
+    /// 这一轮真的检索到的知识库语块（决策 O-13）。
+    ///
+    /// 用来校验回答里的 `[kb:…]` 锚点：模型引用没检索过的文档时，
+    /// 那个锚点会被当成编造处理。老数据没有这个键，读成空数组。
+    #[serde(default)]
+    pub kb_refs: Vec<KbRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1081,6 +1146,24 @@ pub struct MailCardRef {
     pub message: MessageId,
     /// 命中了哪个字段，由 `tool_email_search` 依据筛选条件生成，不额外调模型。
     pub reason: String,
+}
+
+/// 知识库语块引用：模型这一轮**真的**检索到过的语块。
+///
+/// 与 [`MailCardRef`] 同一个思路——只存最小载荷，标题与序号在这里就够了：
+/// 渲染「标题 · 第 N 块」不需要正文。
+///
+/// 存在的理由是**校验**：`[kb:12]` 这种锚点如果模型凭空写一个，
+/// 用户点进去看到的是别人的文档或空页面。落库前拿本轮的 `kb_refs`
+/// 对一遍，对不上就当没引用过（决策 O-13，与邮件锚点同一原则）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KbRef {
+    /// 知识库文档 id。
+    pub doc: i64,
+    /// 文档标题（渲染成 chip 文案用）。
+    pub title: String,
+    /// 语块序号（渲染成「第 N 块」用）。
+    pub ord: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1436,6 +1519,12 @@ pub struct AiToolPermissions {
     /// 音乐四个工具（`music_search` / `music_play` / `music_state` / `music_control`）。
     pub music: bool,
     pub memory: bool,
+    /// 知识库只读（`kb_search` / `kb_read` / `kb_list`）。
+    pub kb_read: bool,
+    /// 知识库写入（`kb_add` / `kb_update`）。
+    pub kb_write: bool,
+    /// 允许模型**发起**删除请求；真删仍要用户在卡片上确认。
+    pub kb_delete: bool,
 }
 
 impl Default for AiToolPermissions {
@@ -1451,6 +1540,9 @@ impl Default for AiToolPermissions {
             calendar_delete: true,
             music: true,
             memory: true,
+            kb_read: true,
+            kb_write: true,
+            kb_delete: true,
         }
     }
 }
@@ -1470,6 +1562,9 @@ impl AiToolPermissions {
             | AiToolName::MusicPlay
             | AiToolName::MusicState
             | AiToolName::MusicControl => self.music,
+            AiToolName::KbSearch | AiToolName::KbRead | AiToolName::KbList => self.kb_read,
+            AiToolName::KbAdd | AiToolName::KbUpdate => self.kb_write,
+            AiToolName::KbDelete => self.kb_delete,
             // 清单是引擎机制，不归用户开关管：关掉它模型就没法把多步需求说清楚。
             AiToolName::PlanUpdate | AiToolName::PlanSubmit | AiToolName::AnswerDirectly => true,
         }
@@ -1730,6 +1825,184 @@ pub fn strip_mail_ids(text: &str) -> String {
     }
     out.push_str(&text[cursor..]);
     out
+}
+
+/// 知识库锚点：`[kb:12]` 或 `[kb:12:3]`（文档 12 的第 3 块）。
+///
+/// 两种形态都认：只写文档 id 是模型的常态（它看到的是整份文档），
+/// 带块号是它读过某一段时写的精确引用。渲染层都换成 chip。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KbAnchor {
+    /// 知识库文档 id。
+    pub doc: i64,
+    /// 语块序号。`None` = 引用的是整份文档。
+    pub ord: Option<u32>,
+}
+
+/// 摘掉 `[kb:…]` 锚点，并按出现顺序返回解析出来的锚点。
+///
+/// 两种形态都认：
+/// - `[kb:12]` —— 引用整份文档（模型看到的是整份文档时的常态）；
+/// - `[kb:12:3]` —— 引用文档 12 的第 3 块（读过某一段时的精确引用）。
+///
+/// 与 `[id=…]` 同一套理由：锚点是给模型写引用用的，**落库保留原文**，
+/// 只在渲染这一层换成「标题 · 第 N 块」的 chip。
+///
+/// 重复引用只留第一次（`Vec` 按出现顺序去重），渲染时一个 chip 就够。
+pub fn parse_kb_anchors(text: &str) -> (String, Vec<KbAnchor>) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut anchors: Vec<KbAnchor> = Vec::new();
+    let mut cursor = 0usize;
+    let mut index = 0usize;
+    while index + 4 <= bytes.len() {
+        if &bytes[index..index + 4] == b"[kb:" {
+            let mut end = index + 4;
+            let mut digits = String::new();
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                digits.push(bytes[end] as char);
+                end += 1;
+            }
+            if !digits.is_empty() {
+                // 可选的 `:块号`。
+                let mut ord = None;
+                let mut after_ord = end;
+                if end < bytes.len() && bytes[end] == b':' {
+                    let mut ord_digits = String::new();
+                    let mut cursor_ord = end + 1;
+                    while cursor_ord < bytes.len() && bytes[cursor_ord].is_ascii_digit() {
+                        ord_digits.push(bytes[cursor_ord] as char);
+                        cursor_ord += 1;
+                    }
+                    if !ord_digits.is_empty() {
+                        ord = ord_digits.parse::<u32>().ok();
+                        after_ord = cursor_ord;
+                    }
+                }
+                let closed = after_ord < bytes.len() && bytes[after_ord] == b']';
+                if closed && let Ok(id) = digits.parse::<i64>() {
+                    out.push_str(&text[cursor..index]);
+                    cursor = after_ord + 1;
+                    let anchor = KbAnchor { doc: id, ord };
+                    if !anchors.contains(&anchor) {
+                        anchors.push(anchor);
+                    }
+                    index = after_ord + 1;
+                    continue;
+                }
+            }
+        }
+        // 按字符边界前进（中文是多字节）。
+        index += text[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+    if cursor == 0 {
+        return (text.to_string(), anchors);
+    }
+    out.push_str(&text[cursor..]);
+    (out, anchors)
+}
+
+/// 摘掉 `[kb:…]` 锚点，只返回引用到的文档 id（按出现顺序去重）。
+///
+/// 给不想关心块号的地方用（例如统计「引用了几份文档」）。
+pub fn strip_kb_anchors(text: &str) -> (String, Vec<i64>) {
+    let (out, anchors) = parse_kb_anchors(text);
+    let mut ids: Vec<i64> = Vec::new();
+    for anchor in anchors {
+        if !ids.contains(&anchor.doc) {
+            ids.push(anchor.doc);
+        }
+    }
+    (out, ids)
+}
+
+/// 知识库引用的对账结果（只统计，不判断质量）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KbCitationAudit {
+    /// 能在本轮检索结果里找到的引用条数。
+    pub cited: usize,
+    /// 带了文档 id 但本轮没检索到它的条数（编造或记错）。
+    pub unknown: usize,
+}
+
+/// 知识库引用对账：把**没检索过**的锚点摘掉。
+///
+/// 与 [`align_email_citations`] 同一原则：**没调过检索工具就别凭空引用**。
+/// 判据是「本轮真的检索到的文档集合」——`kb_refs` 里有这个 id 才算数。
+///
+/// 处理方式比邮件**轻**：邮件锚点错了要标「未核实」，因为邮件行本身就是
+/// 用户要读的内容，删了就没了；知识库锚点只是引用标记，摘掉之后正文照旧，
+/// 读者不会察觉少了什么，但也不会被带到一个不存在的文档上。
+///
+/// `refs` 为空（这轮没调检索工具）时**原样返回**：正文里的 `[kb:12]`
+/// 可能只是模型在描述知识库里有什么，不是引用——删它反而丢了信息。
+pub fn align_kb_citations(content: &str, refs: &[KbRef]) -> (String, KbCitationAudit) {
+    if refs.is_empty() {
+        return (content.to_string(), KbCitationAudit::default());
+    }
+    let allowed: std::collections::HashSet<i64> = refs.iter().map(|item| item.doc).collect();
+    let mut audit = KbCitationAudit::default();
+    let mut out = String::with_capacity(content.len());
+    let bytes = content.as_bytes();
+    let mut cursor = 0usize;
+    let mut index = 0usize;
+    while index + 4 <= bytes.len() {
+        if &bytes[index..index + 4] == b"[kb:" {
+            let mut end = index + 4;
+            let mut digits = String::new();
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                digits.push(bytes[end] as char);
+                end += 1;
+            }
+            if !digits.is_empty() {
+                let mut ord = None;
+                let mut after_ord = end;
+                if end < bytes.len() && bytes[end] == b':' {
+                    let mut ord_digits = String::new();
+                    let mut cursor_ord = end + 1;
+                    while cursor_ord < bytes.len() && bytes[cursor_ord].is_ascii_digit() {
+                        ord_digits.push(bytes[cursor_ord] as char);
+                        cursor_ord += 1;
+                    }
+                    if !ord_digits.is_empty() {
+                        ord = ord_digits.parse::<u32>().ok();
+                        after_ord = cursor_ord;
+                    }
+                }
+                let closed = after_ord < bytes.len() && bytes[after_ord] == b']';
+                if closed && let Ok(id) = digits.parse::<i64>() {
+                    if allowed.contains(&id) {
+                        out.push_str(&content[cursor..index]);
+                        out.push_str(&content[index..after_ord + 1]);
+                        cursor = after_ord + 1;
+                        audit.cited += 1;
+                    } else {
+                        // 编造的锚点：直接摘掉，不留痕迹。
+                        out.push_str(&content[cursor..index]);
+                        cursor = after_ord + 1;
+                        audit.unknown += 1;
+                    }
+                    index = after_ord + 1;
+                    continue;
+                }
+                let _ = ord;
+            }
+        }
+        index += content[index..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+    if cursor == 0 {
+        return (content.to_string(), audit);
+    }
+    out.push_str(&content[cursor..]);
+    (out, audit)
 }
 
 /// 邮件引用与工具回执的对账结果（只统计，不判断质量）。
@@ -2319,13 +2592,7 @@ pub fn estimate_tokens(text: &str) -> u32 {
 }
 
 fn is_cjk(ch: char) -> bool {
-    matches!(ch as u32,
-        0x3000..=0x303F
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF
-        | 0xF900..=0xFAFF
-        | 0xFF00..=0xFFEF
-        | 0x20000..=0x2FA1F)
+    crate::text::is_cjk(ch)
 }
 
 // ---------------------------------------------------------------------------
@@ -2408,8 +2675,13 @@ unread_only / flagged_only / has_attachment / days 任意一个即可（只给�
         },
         AiToolSpec {
             name: AiToolName::WeatherGet,
-            description: "查询和风天气：当前天气、最多 24 小时与 7 天预报。\
-`location` 与 `location_id` 都不传时按默认关注地点查（用户只说「天气怎么样」时就这样调）。\
+            // 第一句是「用途表」里显示的那句，必须自成一体：
+            // 模型在计划阶段只看得到这一句，得从它就知道「要天气数据就调这个」。
+            // 「不传 location 就用默认关注地点」也必须在这句里——
+            // 2026-11-18 的事故里，模型以为要先查地点才知道查哪，
+            // 于是把计划第 3 步写成了 `weather_locations`（列地点）。
+            description: "查天气数据（当前天气 + 24 小时 + 7 天预报）用这个，不传地点就按默认关注地点查。\n\
+`location` 与 `location_id` 可以都不传；用户只说「天气怎么样」时就这样调。\n\
 地点的收敛顺序由引擎负责：已关注地点里只有一个匹配就用它；匹配到多个时优先取默认关注点；\
 不在关注列表里的城市名，按同名城市解析（「北京」不会因为还有海淀、朝阳就变成歧义）。\
 只有**真的分不清**（例如「朝阳」既是北京朝阳也是辽宁朝阳）时，工具才返回候选并要求用户确认——\
@@ -2427,9 +2699,8 @@ unread_only / flagged_only / has_attachment / days 任意一个即可（只给�
         },
         AiToolSpec {
             name: AiToolName::WeatherLocations,
-            description: "列出用户已经在天气页关注的城市的 id 与名称（只读本地配置，不联网）。\
-用户问「我关注了哪些城市」「我的地点」时使用；要天气数据本身请用 weather_get。\
-它只做列举、不做城市名解析——用户问天气时直接调 weather_get。",
+            description: "只列出已关注地点 id 与名称，**要天气数据请用 weather_get**，它不取天气。\
+用户问「我关注了哪些城市」「我的地点」时用它；用户问天气时直接调 weather_get。",
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -2658,7 +2929,8 @@ unread_only / flagged_only / has_attachment / days 任意一个即可（只给�
                                 },
                                 "tool": {
                                     "type": "string",
-                                    "description": "kind=tool 时必填，如 email_search / mail_read / calendar_list"
+                                    "description": "kind=tool 时必填。\
+可用的工具名与用途见下方「每个工具是干什么的」那张表"
                                 },
                                 "args": {
                                     "type": "object",
@@ -2702,6 +2974,106 @@ unread_only / flagged_only / has_attachment / days 任意一个即可（只给�
                     }
                 },
                 "required": ["reason"],
+                "additionalProperties": false
+            }),
+        },
+        // ---- 知识库（v0.5）----
+        AiToolSpec {
+            name: AiToolName::KbSearch,
+            description: "在本地知识库里混合检索（关键词 + 语义，RRF 融合）。\
+返回带 [kb:文档id] 锚点的语块，引用时用这些锚点。\
+知识库是本机数据：导入的文档、自动入库的邮件、你之前写入的笔记。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["md", "txt", "docx", "pdf", "pptx", "mail"],
+                        "description": "只看某一类文档（可选）"
+                    },
+                    "entity": {
+                        "type": "string",
+                        "maxLength": 60,
+                        "description": "只看涉及某个实体的文档（可选，仅作说明用途）"
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        AiToolSpec {
+            name: AiToolName::KbRead,
+            description: "读某份知识库文档的一段语块（分页）。\
+用在检索命中之后看上下文，或用户点名要看某份文档时。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "integer", "minimum": 1},
+                    "from": {"type": "integer", "minimum": 0, "default": 0},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3}
+                },
+                "required": ["doc_id"],
+                "additionalProperties": false
+            }),
+        },
+        AiToolSpec {
+            name: AiToolName::KbList,
+            description: "列出知识库里的文档（可按标题关键字与状态筛选）。\
+用来回答「我导入了什么」「哪些还没索引好」。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "maxLength": 100},
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "extracted", "chunked", "embedded", "skipped", "failed"]
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}
+                },
+                "additionalProperties": false
+            }),
+        },
+        AiToolSpec {
+            name: AiToolName::KbAdd,
+            description: "把一段文本写进知识库（成为一份新文档，来源标为 AI 写入）。\
+**只接受文本**，不接受文件路径；单次最多 8000 字，更长请分成几条。\
+用于用户口述要点、粘贴资料、让你记住某段结论。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "text": {"type": "string", "minLength": 1, "maxLength": 8000}
+                },
+                "required": ["title", "text"],
+                "additionalProperties": false
+            }),
+        },
+        AiToolSpec {
+            name: AiToolName::KbUpdate,
+            description: "改知识库文档的标题或启用状态（停用后不再参与检索）。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "integer", "minimum": 1},
+                    "title": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "enabled": {"type": "boolean"}
+                },
+                "required": ["doc_id"],
+                "additionalProperties": false
+            }),
+        },
+        AiToolSpec {
+            name: AiToolName::KbDelete,
+            description: "请求删除一份知识库文档。**不会立即删除**：\
+会弹一张确认卡，用户点了确认才真删，你随后会拿到结果。",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "integer", "minimum": 1}
+                },
+                "required": ["doc_id"],
                 "additionalProperties": false
             }),
         },
@@ -2954,6 +3326,13 @@ fn coerce_plan_step_args(plan: &mut Value, fixed: &mut Vec<CoercedArg>) {
 /// 它们是引擎机制，不是用户可以关掉的能力。
 pub fn plan_phase_tool_specs(permissions: &AiToolPermissions) -> Vec<AiToolSpec> {
     let reference = tool_argument_reference(permissions);
+    // 工具用途表：让 PLAN 阶段的模型知道「哪个工具是干什么的」。
+    //
+    // 2026-11-18 的真实事故：模型在计划第 3 步选了 `weather_locations`
+    // （列地点）而不是 `weather_get`（取天气），因为它只看得到参数名白名单，
+    // 看不到两者的区别——`weather_locations` 没有参数，看着"简单安全"。
+    // 结果整轮把「天气详情」写成「查询受限」，而天气接口一直是好的。
+    let purposes = tool_purpose_reference(permissions);
     TOOL_SPECS
         .iter()
         .filter(|spec| {
@@ -2966,10 +3345,55 @@ pub fn plan_phase_tool_specs(permissions: &AiToolPermissions) -> Vec<AiToolSpec>
         .map(|mut spec| {
             if spec.name == AiToolName::PlanSubmit {
                 spec.input_schema = with_arg_reference(spec.input_schema, &reference);
+                spec.input_schema = with_purpose_reference(spec.input_schema, &purposes);
             }
             spec
         })
         .collect()
+}
+
+/// 各业务工具的**用途**（给 PLAN 阶段的模型看）。
+///
+/// 与 [`tool_argument_reference`] 配套：那份表说「参数叫什么」，这份说
+/// 「这个工具是干什么的」。两份都缺模型就会选错工具——
+/// 2026-11-18 的事故里，模型把「查天气」写成 `weather_locations`（列地点），
+/// 因为只看得到 `weather_locations` 没有参数、而 `weather_get` 有一堆。
+///
+/// **从 `TOOL_SPECS` 现算，不手抄**：手抄的清单必然和 schema 漂移。
+/// 每条只取描述的第一句（[`first_sentence`]），别把整段契约塞进来——
+/// 那会让计划阶段变成操作手册，正是 `system_prompt_has_no_single_scenario_playbook`
+/// 要防的事。
+pub fn tool_purpose_reference(permissions: &AiToolPermissions) -> String {
+    let mut out = String::new();
+    for spec in TOOL_SPECS.iter() {
+        if spec.name.is_bookkeeping() || !permissions.enabled(spec.name) {
+            continue;
+        }
+        out.push_str(&format!(
+            "- {}：{}\n",
+            spec.name.as_str(),
+            first_sentence(spec.description)
+        ));
+    }
+    out
+}
+
+/// 把工具用途表塞进 `plan_submit` 的 `tool` 字段说明里。
+///
+/// 放 `tool` 而不是 `args`：模型是在写 `tool` 那一步决定「用哪个工具」的，
+/// 用途表就该出现在它做这个决定的地方。放 `args` 里它会以为那是参数约束。
+fn with_purpose_reference(mut schema: Value, reference: &str) -> Value {
+    let Some(slot) = schema.pointer_mut("/properties/steps/items/properties/tool/description")
+    else {
+        return schema;
+    };
+    let Some(text) = slot.as_str().map(str::to_owned) else {
+        return schema;
+    };
+    *slot = Value::String(format!(
+        "{text}\n\n每个工具是干什么的（选工具时对照这张表，别只凭名字猜）：\n{reference}"
+    ));
+    schema
 }
 
 /// 各业务工具的参数白名单（给 PLAN 阶段的模型看）。
@@ -3197,6 +3621,27 @@ pub trait AiProvider: Send + Sync {
         sink: AiDeltaSink,
         cancel: CancelFlag,
     ) -> AiFuture<Result<AiTurnResult, CoreError>>;
+
+    /// 把一份 PDF / PPTX 文本交给模型，让它读完并切成语块。**非流式、一次请求**。
+    ///
+    /// 与 `stream_chat` 分开是刻意的：split 不走历史、不走工具循环、不进
+    /// `AiWireMessage`。复用对话通道会把 `trim_history` 与字符预算全带歪，
+    /// 还可能触发工具循环——三条都是隐性污染，排查起来极难。
+    ///
+    /// 默认返回「不支持」：没有文档输入能力的服务商不必实现，
+    /// 上层的报错文案统一在这里定调（不是降级，是明确失败）。
+    fn split_document(
+        &self,
+        _request: crate::knowledge::DocumentSplitRequest,
+    ) -> AiFuture<Result<crate::knowledge::SplitOutcome, CoreError>> {
+        Box::pin(async {
+            Err(CoreError::ai(
+                AiErrorKind::Config,
+                None::<String>,
+                "当前大模型不具备文档识别能力，无法导入知识库，请更换多模态模型",
+            ))
+        })
+    }
 }
 
 /// 会话与消息仓储。同步接口（`me-store` 不依赖 tokio）。
@@ -4121,6 +4566,27 @@ mod tests {
         assert_eq!(request.tools.len(), TOOL_SPECS.len());
     }
 
+    /// 把计划阶段模型看到的 `plan_submit` schema 打出来，供人工通读。
+    ///
+    ///     cargo test -p me-core dump_plan_phase_schema -- --ignored --nocapture
+    ///
+    /// 与 `dump_system_prompt` 配套：那个看**执行期**的系统提示，
+    /// 这个看**计划期**模型真正拿到手的工具信息。
+    ///
+    /// 2026-11-18 的事故就是在这里没看出来：计划阶段模型看得见
+    /// `weather_locations`（列地点）却分不清 `weather_get`（取天气），
+    /// 因为当时下发的只有参数名白名单、没有工具用途。
+    #[test]
+    #[ignore]
+    fn dump_plan_phase_schema() {
+        let specs = plan_phase_tool_specs(&AiToolPermissions::default());
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == AiToolName::PlanSubmit)
+            .expect("plan_submit");
+        println!("{}", spec.input_schema);
+    }
+
     /// 把组装好的系统提示打出来，供人工通读（默认忽略）。
     ///
     ///     cargo test -p me-core dump_system_prompt -- --ignored --nocapture
@@ -4212,6 +4678,99 @@ mod tests {
         assert!(capability_catalog(&[]).is_empty());
     }
 
+    /// 计划阶段必须让模型看得见「每个工具是干什么的」。
+    ///
+    /// 2026-11-18 的真实事故：模型在计划第 3 步选了 `weather_locations`
+    /// （列地点）而不是 `weather_get`（取天气），结果整轮把「天气详情」
+    /// 写成「查询受限」，而天气接口一直是好的。
+    ///
+    /// 根因是计划阶段只看得见**参数名白名单**：`weather_locations` 没有
+    /// 参数、看着"简单安全"，`weather_get` 有一堆。两者的区别只在描述里，
+    /// 而描述当时没下发给模型。
+    #[test]
+    fn plan_phase_tells_the_model_what_each_tool_is_for() {
+        let specs = plan_phase_tool_specs(&AiToolPermissions::default());
+        let plan_submit = specs
+            .iter()
+            .find(|spec| spec.name == AiToolName::PlanSubmit)
+            .expect("计划阶段必须有 plan_submit");
+        let schema = plan_submit.input_schema.to_string();
+
+        // 取天气的工具必须在场，且说得清它是"取数据"而不是"列清单"。
+        assert!(
+            schema.contains("weather_get"),
+            "计划阶段要能看见 weather_get：{schema}"
+        );
+        assert!(
+            schema.contains("取天气") || schema.contains("查询和风天气"),
+            "weather_get 的用途要说清是取天气数据：{schema}"
+        );
+        // 列地点的工具也在场——它和取天气是两件事，模型得能分辨。
+        assert!(
+            schema.contains("weather_locations"),
+            "计划阶段要能看见 weather_locations：{schema}"
+        );
+
+        // 用途表挂在 tool 字段上：模型写 tool 那一步正是它做选择的地方。
+        let tool_desc = plan_submit
+            .input_schema
+            .pointer("/properties/steps/items/properties/tool/description")
+            .and_then(Value::as_str)
+            .expect("plan_submit 要有 tool 字段说明");
+        assert!(
+            tool_desc.contains("每个工具是干什么的"),
+            "用途表要挂在 tool 字段上：{tool_desc}"
+        );
+
+        // 参数表仍然在 args 上：两张表分工不同，不能互相取代。
+        let args_desc = plan_submit
+            .input_schema
+            .pointer("/properties/steps/items/properties/args/description")
+            .and_then(Value::as_str)
+            .expect("plan_submit 要有 args 字段说明");
+        assert!(
+            args_desc.contains("参数名只能从下面这张表里选"),
+            "args 上要保留参数名白名单：{args_desc}"
+        );
+    }
+
+    /// 用途表只列**开着的**业务工具，且不把记账工具算成能力。
+    #[test]
+    fn tool_purpose_reference_lists_only_enabled_business_tools() {
+        let all = tool_purpose_reference(&AiToolPermissions::default());
+        assert!(all.contains("weather_get"), "{all}");
+        assert!(all.contains("kb_search"), "{all}");
+        assert!(!all.contains("plan_submit"), "{all}");
+        assert!(!all.contains("plan_update"), "{all}");
+
+        // 关掉知识库，就不该再出现在用途表里。
+        let restricted = tool_purpose_reference(&AiToolPermissions {
+            kb_read: false,
+            kb_write: false,
+            kb_delete: false,
+            ..AiToolPermissions::default()
+        });
+        assert!(!restricted.contains("kb_search"), "{restricted}");
+        assert!(restricted.contains("weather_get"), "{restricted}");
+    }
+
+    /// 用途表每条只写一句，不把整段契约塞进去。
+    #[test]
+    fn tool_purpose_reference_entries_are_one_short_line() {
+        let table = tool_purpose_reference(&AiToolPermissions::default());
+        for line in table.lines().filter(|line| line.starts_with("- ")) {
+            assert!(
+                line.chars().count() <= 90,
+                "用途表条目过长，会把计划阶段撑成操作手册：{line}"
+            );
+            assert_eq!(
+                line.matches('。').count(),
+                1,
+                "一条用途只该有一句话：{line}"
+            );
+        }
+    }
+
     /// 索引里每条只写一句「这是什么」，不能把整段契约塞进去。
     #[test]
     fn capability_catalog_entries_are_one_short_line() {
@@ -4277,6 +4836,9 @@ mod tests {
                     | AiToolName::MemoryUpsert
                     | AiToolName::MusicSearch
                     | AiToolName::MusicState
+                    | AiToolName::KbSearch
+                    | AiToolName::KbRead
+                    | AiToolName::KbList
                     | AiToolName::PlanUpdate
                     | AiToolName::PlanSubmit
                     | AiToolName::AnswerDirectly
@@ -4363,6 +4925,9 @@ mod tests {
             calendar_delete: false,
             music: false,
             memory: false,
+            kb_read: false,
+            kb_write: false,
+            kb_delete: false,
         };
         let specs = tool_specs(&all_off);
         // 三个引擎机制工具不受开关控制：没有它们模型既写不下计划、也说不了「不需要计划」。
@@ -4417,6 +4982,68 @@ mod tests {
     fn estimate_tokens_counts_cjk_heavier() {
         assert_eq!(estimate_tokens("你好世界"), 4);
         assert_eq!(estimate_tokens("abcd"), 1);
+    }
+
+    #[test]
+    fn kb_anchors_are_stripped_and_collected() {
+        let (text, ids) = strip_kb_anchors("付款周期见 [kb:3]，另见 [kb:3] 与 [kb:12]。");
+        assert_eq!(text, "付款周期见 ，另见  与 。");
+        assert_eq!(ids, vec![3, 12], "重复引用只留一次");
+    }
+
+    #[test]
+    fn kb_anchor_strip_is_noop_without_anchor() {
+        let (text, ids) = strip_kb_anchors("没有锚点的一段中文。");
+        assert_eq!(text, "没有锚点的一段中文。");
+        assert!(ids.is_empty());
+    }
+
+    /// 带块号的锚点：`[kb:12:3]` = 文档 12 的第 3 块。
+    #[test]
+    fn kb_anchor_with_chunk_ordinal_is_parsed() {
+        let (text, anchors) = parse_kb_anchors("见 [kb:12:3] 与 [kb:12]。");
+        assert_eq!(text, "见  与 。");
+        assert_eq!(
+            anchors,
+            vec![
+                KbAnchor {
+                    doc: 12,
+                    ord: Some(3)
+                },
+                KbAnchor { doc: 12, ord: None }
+            ]
+        );
+    }
+
+    /// 坏锚点（没有右括号 / 没有数字）不该被误摘，也不该被误认。
+    #[test]
+    fn malformed_kb_anchor_is_left_alone() {
+        let (text, anchors) = parse_kb_anchors("见 [kb:] 与 [kb:abc] 与 [kb:12。");
+        assert_eq!(text, "见 [kb:] 与 [kb:abc] 与 [kb:12。");
+        assert!(anchors.is_empty());
+    }
+
+    /// 对账：检索过的文档保留锚点，没检索过的摘掉。
+    #[test]
+    fn align_kb_citations_keeps_known_and_drops_unknown() {
+        let refs = vec![KbRef {
+            doc: 12,
+            title: "采购合同.docx".to_string(),
+            ord: 3,
+        }];
+        let (out, audit) = align_kb_citations("见 [kb:12] 与 [kb:99]。", &refs);
+        assert_eq!(out, "见 [kb:12] 与 。", "没检索过的锚点要摘掉：{out}");
+        assert_eq!(audit.cited, 1);
+        assert_eq!(audit.unknown, 1);
+    }
+
+    /// 这一轮没调检索工具 → 正文原样返回（模型可能只是在描述知识库）。
+    #[test]
+    fn align_kb_citations_is_noop_without_refs() {
+        let content = "知识库里有一份 [kb:12]。";
+        let (out, audit) = align_kb_citations(content, &[]);
+        assert_eq!(out, content);
+        assert_eq!(audit, KbCitationAudit::default());
     }
 
     #[test]
@@ -4684,6 +5311,7 @@ mod tests {
             step_id: None,
             attempt: None,
             cards: Vec::new(),
+            kb_refs: Vec::new(),
         };
         let traces = vec![
             // 同类失败两次（步号不同也算同类）→ 一条教训。
@@ -4735,6 +5363,7 @@ mod tests {
             motive_source: MotiveSource::Model,
             step_id: None,
             attempt: None,
+            kb_refs: Vec::new(),
             cards: ids
                 .iter()
                 .map(|id| MailCardRef {

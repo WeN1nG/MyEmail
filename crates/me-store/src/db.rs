@@ -5,12 +5,12 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 
 use me_core::CoreError;
 use me_core::port::ReadOnlyRepo;
 use r2d2::Pool;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::cache::CachePaths;
 use crate::{migrations, storage};
@@ -21,8 +21,128 @@ const WAL_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
 /// 只读连接池上限。写连接永远只有一个。
 const READ_POOL_SIZE: u32 = 4;
 
+/// 向量维度的建表值。**建表时固定**，换模型必须整库重建（决策 O-10）。
+const VEC_DIM: usize = me_core::EMBED_DIM;
+
+static VEC_INIT: Once = Once::new();
+
 type SqlitePool = Pool<SqliteConnectionManager>;
 pub(crate) type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
+
+/// 注册 sqlite-vec 扩展。**必须在任何 `Connection` 打开之前**调用，且只调一次。
+///
+/// `sqlite3_auto_extension` 是**进程级全局**的：忘了注册 → `no such module: vec0`；
+/// 每个连接都调 → 每次开连接跑两遍 init。
+pub fn register_sqlite_vec() {
+    VEC_INIT.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut i8,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> i32,
+        >(
+            sqlite_vec::sqlite3_vec_init as *const ()
+        )));
+    });
+}
+
+/// 把向量库挂到连接上（`kbvec`）。
+///
+/// 写连接与只读池里的每个连接都要挂：只读侧虽然不做 KNN，但
+/// `delete_doc_deep` 与自检都要能引用 `kbvec.vec_chunks`，
+/// 而池里的连接是复用的，不能指望「只有写连接需要」。
+fn attach_kbvec(conn: &Connection, kb: &Path) -> rusqlite::Result<()> {
+    conn.execute(
+        "ATTACH DATABASE ?1 AS kbvec",
+        params![kb.to_string_lossy().as_ref()],
+    )?;
+    // 独立库也要 WAL 与超时：不设的话写入时机一错就 SQLITE_BUSY，
+    // 而且表现是「偶发失败」，最难排查。
+    conn.execute_batch("PRAGMA kbvec.journal_mode = WAL; PRAGMA kbvec.busy_timeout = 5000;")
+}
+
+/// 向量库坏了就直接换掉：**重命名坏文件 + 重建空库**，不试图修复。
+///
+/// 修复一个 100 MB 级的虚表文件既没有可靠手段（`vec0` 的内部结构不是公开契约），
+/// 也没有必要：向量是可重算的派生数据。换掉之后 `embedded` 标记会被自检重置，
+/// 块会重新向量化。
+fn quarantine_bad_kb_file(kb: &Path) {
+    if !kb.exists() {
+        return;
+    }
+    let verdict = Connection::open(kb)
+        .and_then(|conn| conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)));
+    let bad = match verdict {
+        Ok(text) => !text.eq_ignore_ascii_case("ok"),
+        // 打不开（写坏了 / 不是数据库）也算坏。
+        Err(_) => true,
+    };
+    if !bad {
+        return;
+    }
+    let mut target = kb.as_os_str().to_owned();
+    target.push(format!(".bad-{}", me_core::now_unix()));
+    let target = PathBuf::from(target);
+    match fs::rename(kb, &target) {
+        Ok(()) => tracing::warn!(
+            renamed = %target.display(),
+            "向量库损坏，已改名保留现场并重建空库"
+        ),
+        Err(err) => tracing::error!(error = %err, "向量库损坏且改名失败，本次跳过语义检索"),
+    }
+}
+
+/// 确保向量表存在，并清掉「标了完成但没向量」的孤儿块。
+///
+/// 反向自检是双库写入顺序（先写向量、再标完成）的兜底：WAL 跨 ATTACH 库提交不原子，
+/// 崩溃时可能只落了「完成」标记，那种块**永远不会被重跑**。
+fn ensure_vector_store(conn: &Connection) -> Result<(), CoreError> {
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS kbvec.vec_chunks USING vec0(
+             chunk_id INTEGER PRIMARY KEY,
+             embedding float[{VEC_DIM}] distance_metric=cosine
+         );"
+    ))
+    .map_err(|e| storage(format!("创建向量表失败: {e}")))?;
+
+    let reset = reset_orphan_embeddings(conn)?;
+    if reset > 0 {
+        tracing::warn!(
+            reset,
+            "向量库自检：{} 个块标了已完成但没有向量，已重置为待向量化",
+            reset
+        );
+    }
+    Ok(())
+}
+
+/// 把「标了 embedded=1 但向量库里没有向量」的块重置成 0。返回重置条数。
+pub(crate) fn reset_orphan_embeddings(conn: &Connection) -> Result<u64, CoreError> {
+    // 表还不存在时（刚建库）这条语句会报错，按 0 处理即可。
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM kbvec.sqlite_master \
+             WHERE type = 'table' AND name = 'vec_chunks')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return Ok(0);
+    }
+    conn.execute(
+        "UPDATE kb_chunks SET embedded = 0
+          WHERE embedded = 1
+            AND NOT EXISTS (
+              SELECT 1 FROM kbvec.vec_chunks v WHERE v.chunk_id = kb_chunks.id
+            )",
+        [],
+    )
+    .map(|rows| rows as u64)
+    .map_err(|e| storage(format!("向量库自检失败: {e}")))
+}
 
 /// 只读连接池的连接工厂。
 ///
@@ -39,6 +159,7 @@ pub(crate) type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 #[derive(Debug)]
 pub(crate) struct SqliteConnectionManager {
     path: PathBuf,
+    kb_path: PathBuf,
 }
 
 impl r2d2::ManageConnection for SqliteConnectionManager {
@@ -48,6 +169,7 @@ impl r2d2::ManageConnection for SqliteConnectionManager {
     fn connect(&self) -> Result<Connection, rusqlite::Error> {
         let conn = Connection::open_with_flags(&self.path, OpenFlags::default())?;
         apply_pragmas(&conn)?;
+        attach_kbvec(&conn, &self.kb_path)?;
         Ok(conn)
     }
 
@@ -105,19 +227,30 @@ pub struct ReadOnlyStore {
 impl Store {
     /// 打开（或创建）存储。完成 schema 初始化、PRAGMA 与完整性检查。
     pub fn open(root: impl AsRef<Path>) -> Result<Store, CoreError> {
+        // 必须先注册扩展，再打开**任何**连接：`sqlite3_auto_extension` 只对
+        // 之后打开的连接生效，顺序反了就是 `no such module: vec0`。
+        register_sqlite_vec();
+
         let paths = CachePaths::new(root.as_ref().to_path_buf())
             .map_err(|e| storage(format!("创建缓存目录失败: {e}")))?;
+
+        // 向量库是**可丢弃物**：坏了就换掉，不试图修复（见 quarantine_bad_kb_file）。
+        let kb_path = paths.kb_db_file();
+        quarantine_bad_kb_file(&kb_path);
 
         let conn = Connection::open(paths.db_file())
             .map_err(|e| storage(format!("打开数据库失败: {e}")))?;
         apply_pragmas(&conn).map_err(|e| storage(format!("设置 PRAGMA 失败: {e}")))?;
         quick_check(&conn)?;
-        // v1 库会在这里备份并迁移到 v2；新库直接建 v2。
+        // v1 库会在这里备份并迁移；新库直接建到最新版本。
         let conn = migrations::ensure_schema(conn, &paths.db_file())?;
+        attach_kbvec(&conn, &kb_path).map_err(|e| storage(format!("挂载向量库失败: {e}")))?;
+        ensure_vector_store(&conn)?;
         maybe_checkpoint_wal(&conn, &paths)?;
 
         let manager = SqliteConnectionManager {
             path: paths.db_file(),
+            kb_path,
         };
         let pool = Pool::builder()
             .max_size(READ_POOL_SIZE)
@@ -370,6 +503,38 @@ impl ReadOnlyRepo for ReadOnlyStore {
 
     fn count_ai_entities_readonly(&self) -> Result<u32, CoreError> {
         crate::ai::count_entities_readonly(self)
+    }
+
+    fn list_knowledge_readonly(
+        &self,
+        filter: &me_core::knowledge::KbFilter,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<me_core::knowledge::KnowledgeDoc>, CoreError> {
+        crate::knowledge::list_readonly(self, filter, limit, offset)
+    }
+
+    fn knowledge_doc_readonly(
+        &self,
+        id: me_core::knowledge::KnowledgeDocId,
+    ) -> Result<Option<me_core::knowledge::KnowledgeDoc>, CoreError> {
+        crate::knowledge::get_readonly(self, id)
+    }
+
+    fn knowledge_chunks_readonly(
+        &self,
+        id: me_core::knowledge::KnowledgeDocId,
+        from: u32,
+        count: u32,
+    ) -> Result<Vec<me_core::knowledge::KnowledgeChunk>, CoreError> {
+        crate::knowledge::chunks_readonly(self, id, from, count)
+    }
+
+    fn knowledge_entity_names_readonly(
+        &self,
+        id: me_core::knowledge::KnowledgeDocId,
+    ) -> Result<Vec<String>, CoreError> {
+        crate::knowledge::doc_entity_names(self, id)
     }
 }
 

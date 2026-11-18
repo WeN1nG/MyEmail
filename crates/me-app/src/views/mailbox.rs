@@ -94,222 +94,235 @@ pub fn show(state: &mut UiState, commands: &mut Vec<Command>, ui: &mut egui::Ui)
     if state.messages.is_empty() {
         no_messages(state, ui);
     } else {
-        let table_height = (ui.available_height() - 40.0).max(120.0);
-        // **聚合模式多一列「账户」**——多账户时否则无法分辨邮件来自谁。
-        // 列宽用 `Column::initial(...)`，遵守 D40（宽度交给布局算）。
-        let unified = state.unified_inbox;
-        let mut table = TableBuilder::new(ui)
-            .max_scroll_height(table_height)
-            // 默认是 Sense::hover()，行不会产生点击事件；必须显式启用点击。
-            .sense(egui::Sense::click())
-            .striped(true)
-            .resizable(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::exact(28.0)) // 未读
-            .column(Column::exact(26.0)) // 星标
-            .column(Column::initial(150.0).at_least(80.0).clip(true));
-        if unified {
-            table = table.column(Column::initial(130.0).at_least(80.0).clip(true));
-        }
-        table = table
-            .column(Column::remainder().at_least(200.0).clip(true))
-            .column(Column::initial(130.0).at_least(100.0))
-            .column(Column::exact(30.0)); // 附件
-        table
-            .header(22.0, |mut header| {
-                header.col(|ui| {
-                    ui.label("");
-                });
-                header.col(|ui| {
-                    ui.label("");
-                });
-                header.col(|ui| {
-                    ui.strong("发件人");
-                });
-                if unified {
+        // 邮件行是「点开」的东西，不是「读」的东西：egui 的 `Label` 默认可选
+        // （`style.interaction.selectable_labels`），后果是悬停时光标变 IBeam、
+        // 拖拽变成文本选择，把「按下—微动—松开」的点击吃掉。
+        //
+        // **只在列表作用域内关**，不用 `ctx.style_mut()`：那是全局的，会把
+        // 「一个体验问题」换成「阅读页正文无法复制」三个更严重的问题。
+        // 必须设在 `TableBuilder::new` 之前——它只对之后创建的 Label 生效。
+        ui.scope(|ui| {
+            ui.style_mut().interaction.selectable_labels = false;
+            let table_height = (ui.available_height() - 40.0).max(120.0);
+            // **聚合模式多一列「账户」**——多账户时否则无法分辨邮件来自谁。
+            // 列宽用 `Column::initial(...)`，遵守 D40（宽度交给布局算）。
+            let unified = state.unified_inbox;
+            let mut table = TableBuilder::new(ui)
+                .max_scroll_height(table_height)
+                // 默认是 Sense::hover()，行不会产生点击事件；必须显式启用点击。
+                .sense(egui::Sense::click())
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::exact(28.0)) // 未读
+                .column(Column::exact(26.0)) // 星标
+                .column(Column::initial(150.0).at_least(80.0).clip(true));
+            if unified {
+                table = table.column(Column::initial(130.0).at_least(80.0).clip(true));
+            }
+            table = table
+                .column(Column::remainder().at_least(200.0).clip(true))
+                .column(Column::initial(130.0).at_least(100.0))
+                .column(Column::exact(30.0)); // 附件
+            table
+                .header(22.0, |mut header| {
                     header.col(|ui| {
-                        ui.strong("账户");
+                        ui.label("");
                     });
-                }
-                header.col(|ui| {
-                    ui.strong("主题");
-                });
-                header.col(|ui| {
-                    ui.strong("时间");
-                });
-                header.col(|ui| {
-                    ui.label("");
-                });
-            })
-            .body(|body| {
-                // **画几行、画哪几封走 `thread_rows()`**：折叠版与「关闭折叠」
-                // 共用这条路径（关闭时它返回恒等映射），不在渲染里分叉。
-                let rows = state.thread_rows();
-                body.rows(26.0, rows.len(), |mut row| {
-                    let row_index = row.index();
-                    let Some(view) = rows.get(row_index).copied() else {
-                        return;
-                    };
-                    let index = view.index;
-                    let Some(message) = state.messages.get(index) else {
-                        return;
-                    };
-                    let id = message.id;
-                    let thread_key = me_core::thread_key(message);
-                    let unread = !message.flags.is_seen();
-                    let starred = message.flags.is_flagged();
-                    let mut star_clicked = false;
-                    let mut thread_clicked = false;
-
-                    // 高亮：**在多选集合内**或**等于单选值**。
-                    // 只看单选值的话，多选时看不出选了哪些。
-                    row.set_selected(
-                        state.selected_messages.contains(&id) || state.selected_message == Some(id),
-                    );
-
-                    row.col(|ui| {
-                        if unread {
-                            ui.label(
-                                RichText::new("●")
-                                    .color(Color32::from_rgb(60, 140, 220))
-                                    .small(),
-                            );
-                        }
+                    header.col(|ui| {
+                        ui.label("");
                     });
-                    row.col(|ui| {
-                        let button = egui::Button::new(
-                            RichText::new(if starred { "★" } else { "☆" }).color(if starred {
-                                Color32::from_rgb(220, 170, 40)
-                            } else {
-                                Color32::GRAY
-                            }),
-                        )
-                        .frame(false)
-                        .small();
-                        if ui.add(button).clicked() {
-                            toggle_star = Some(id);
-                            star_clicked = true;
-                        }
-                    });
-                    row.col(|ui| {
-                        let from = message
-                            .from
-                            .as_ref()
-                            .map(|a| {
-                                a.name
-                                    .clone()
-                                    .filter(|n| !n.trim().is_empty())
-                                    .unwrap_or_else(|| a.addr.clone())
-                            })
-                            .unwrap_or_else(|| "(未知)".to_string());
-                        let text = if unread {
-                            RichText::new(from).strong()
-                        } else {
-                            RichText::new(from)
-                        };
-                        ui.label(text);
+                    header.col(|ui| {
+                        ui.strong("发件人");
                     });
                     if unified {
-                        row.col(|ui| {
-                            // 显示账户邮箱——多账户时否则无法分辨来源。
-                            let email = state
-                                .account(message.account)
-                                .map(|a| a.email.clone())
-                                .unwrap_or_else(|| "(未知账户)".to_string());
-                            ui.label(RichText::new(email).small());
+                        header.col(|ui| {
+                            ui.strong("账户");
                         });
                     }
-                    row.col(|ui| {
-                        // 线程标记：首行画 `▸ 3` / `▾ 3`（只有一封时不画），
-                        // 展开后的后续行缩进 + `↳`——不新增列，避免挤压主题宽度。
-                        if view.group_len > 1 && view.depth == 0 {
-                            let marker = if state.thread_expanded(&thread_key) {
-                                format!("▾ {}", view.group_len)
-                            } else {
-                                format!("▸ {}", view.group_len)
-                            };
-                            let button = egui::Button::new(
-                                RichText::new(marker)
-                                    .small()
-                                    .color(Color32::from_rgb(90, 130, 200)),
-                            )
-                            .frame(false);
-                            if ui.add(button).clicked() {
-                                thread_toggle = Some(thread_key.clone());
-                                thread_clicked = true;
-                            }
-                            ui.add_space(3.0);
-                        } else if view.depth > 0 {
-                            ui.add_space(12.0);
-                            ui.label(RichText::new("↳").small().color(Color32::GRAY));
-                            ui.add_space(3.0);
-                        }
-                        let subject = message.display_subject();
-                        let mut text = if unread {
-                            RichText::new(subject).strong()
-                        } else {
-                            RichText::new(subject)
+                    header.col(|ui| {
+                        ui.strong("主题");
+                    });
+                    header.col(|ui| {
+                        ui.strong("时间");
+                    });
+                    header.col(|ui| {
+                        ui.label("");
+                    });
+                })
+                .body(|body| {
+                    // **画几行、画哪几封走 `thread_rows()`**：折叠版与「关闭折叠」
+                    // 共用这条路径（关闭时它返回恒等映射），不在渲染里分叉。
+                    let rows = state.thread_rows();
+                    body.rows(26.0, rows.len(), |mut row| {
+                        let row_index = row.index();
+                        let Some(view) = rows.get(row_index).copied() else {
+                            return;
                         };
-                        if unread {
-                            text = text.color(ui.visuals().strong_text_color());
-                        }
-                        ui.label(text);
-                        let preview = state
-                            .messages
-                            .get(index)
-                            .map(|m| m.snippet.as_deref().filter(|s| !s.is_empty()).unwrap_or(""))
-                            .unwrap_or("");
-                        if !preview.is_empty() {
-                            ui.label(
-                                RichText::new(format!("— {preview}"))
-                                    .small()
-                                    .color(Color32::GRAY),
-                            );
-                        }
-                    });
-                    row.col(|ui| {
-                        ui.label(RichText::new(crate::views::message_date(message)).small());
-                    });
-                    row.col(|ui| {
-                        if message.has_attachment {
-                            ui.label(RichText::new("📎").small());
-                        }
-                    });
+                        let index = view.index;
+                        let Some(message) = state.messages.get(index) else {
+                            return;
+                        };
+                        let id = message.id;
+                        let thread_key = me_core::thread_key(message);
+                        let unread = !message.flags.is_seen();
+                        let starred = message.flags.is_flagged();
+                        let mut star_clicked = false;
+                        let mut thread_clicked = false;
 
-                    if row.response().clicked() && !star_clicked && !thread_clicked {
-                        // **多选交互**：`Ctrl` 切换集合、`Shift` 选区间、
-                        // 裸点击清集合并设单选（同时打开阅读窗）。
-                        if modifiers.ctrl {
-                            state.toggle_selected(id);
-                        } else if modifiers.shift {
-                            // 区间按**可见顺序**算：折叠时列表里看不到的行不该被选进来。
-                            let ordered: Vec<MessageId> = rows
-                                .iter()
-                                .filter_map(|view| state.messages.get(view.index))
-                                .map(|message| message.id)
-                                .collect();
-                            state.select_range(id, &ordered);
-                        } else {
-                            state.select_only(id);
-                            open = Some(id);
+                        // 高亮：**在多选集合内**或**等于单选值**。
+                        // 只看单选值的话，多选时看不出选了哪些。
+                        row.set_selected(
+                            state.selected_messages.contains(&id)
+                                || state.selected_message == Some(id),
+                        );
+
+                        row.col(|ui| {
+                            if unread {
+                                ui.label(
+                                    RichText::new("●")
+                                        .color(Color32::from_rgb(60, 140, 220))
+                                        .small(),
+                                );
+                            }
+                        });
+                        row.col(|ui| {
+                            let button = egui::Button::new(
+                                RichText::new(if starred { "★" } else { "☆" }).color(if starred {
+                                    Color32::from_rgb(220, 170, 40)
+                                } else {
+                                    Color32::GRAY
+                                }),
+                            )
+                            .frame(false)
+                            .small();
+                            if ui.add(button).clicked() {
+                                toggle_star = Some(id);
+                                star_clicked = true;
+                            }
+                        });
+                        row.col(|ui| {
+                            let from = message
+                                .from
+                                .as_ref()
+                                .map(|a| {
+                                    a.name
+                                        .clone()
+                                        .filter(|n| !n.trim().is_empty())
+                                        .unwrap_or_else(|| a.addr.clone())
+                                })
+                                .unwrap_or_else(|| "(未知)".to_string());
+                            let text = if unread {
+                                RichText::new(from).strong()
+                            } else {
+                                RichText::new(from)
+                            };
+                            ui.label(text);
+                        });
+                        if unified {
+                            row.col(|ui| {
+                                // 显示账户邮箱——多账户时否则无法分辨来源。
+                                let email = state
+                                    .account(message.account)
+                                    .map(|a| a.email.clone())
+                                    .unwrap_or_else(|| "(未知账户)".to_string());
+                                ui.label(RichText::new(email).small());
+                            });
                         }
-                    }
-                    row.response().context_menu(|ui| {
-                        if ui.button("标记为已读/未读").clicked() {
-                            toggle_read = Some(id);
-                            ui.close();
+                        row.col(|ui| {
+                            // 线程标记：首行画 `▸ 3` / `▾ 3`（只有一封时不画），
+                            // 展开后的后续行缩进 + `↳`——不新增列，避免挤压主题宽度。
+                            if view.group_len > 1 && view.depth == 0 {
+                                let marker = if state.thread_expanded(&thread_key) {
+                                    format!("▾ {}", view.group_len)
+                                } else {
+                                    format!("▸ {}", view.group_len)
+                                };
+                                let button = egui::Button::new(
+                                    RichText::new(marker)
+                                        .small()
+                                        .color(Color32::from_rgb(90, 130, 200)),
+                                )
+                                .frame(false);
+                                if ui.add(button).clicked() {
+                                    thread_toggle = Some(thread_key.clone());
+                                    thread_clicked = true;
+                                }
+                                ui.add_space(3.0);
+                            } else if view.depth > 0 {
+                                ui.add_space(12.0);
+                                ui.label(RichText::new("↳").small().color(Color32::GRAY));
+                                ui.add_space(3.0);
+                            }
+                            let subject = message.display_subject();
+                            let mut text = if unread {
+                                RichText::new(subject).strong()
+                            } else {
+                                RichText::new(subject)
+                            };
+                            if unread {
+                                text = text.color(ui.visuals().strong_text_color());
+                            }
+                            ui.label(text);
+                            let preview = state
+                                .messages
+                                .get(index)
+                                .map(|m| {
+                                    m.snippet.as_deref().filter(|s| !s.is_empty()).unwrap_or("")
+                                })
+                                .unwrap_or("");
+                            if !preview.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("— {preview}"))
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
+                            }
+                        });
+                        row.col(|ui| {
+                            ui.label(RichText::new(crate::views::message_date(message)).small());
+                        });
+                        row.col(|ui| {
+                            if message.has_attachment {
+                                ui.label(RichText::new("📎").small());
+                            }
+                        });
+
+                        if row.response().clicked() && !star_clicked && !thread_clicked {
+                            // **多选交互**：`Ctrl` 切换集合、`Shift` 选区间、
+                            // 裸点击清集合并设单选（同时打开阅读窗）。
+                            if modifiers.ctrl {
+                                state.toggle_selected(id);
+                            } else if modifiers.shift {
+                                // 区间按**可见顺序**算：折叠时列表里看不到的行不该被选进来。
+                                let ordered: Vec<MessageId> = rows
+                                    .iter()
+                                    .filter_map(|view| state.messages.get(view.index))
+                                    .map(|message| message.id)
+                                    .collect();
+                                state.select_range(id, &ordered);
+                            } else {
+                                state.select_only(id);
+                                open = Some(id);
+                            }
                         }
-                        if ui.button("切换星标").clicked() {
-                            toggle_star = Some(id);
-                            ui.close();
-                        }
-                        if ui.button("移入废件箱").clicked() {
-                            move_trash = Some(id);
-                            ui.close();
-                        }
+                        row.response().context_menu(|ui| {
+                            if ui.button("标记为已读/未读").clicked() {
+                                toggle_read = Some(id);
+                                ui.close();
+                            }
+                            if ui.button("切换星标").clicked() {
+                                toggle_star = Some(id);
+                                ui.close();
+                            }
+                            if ui.button("移入废件箱").clicked() {
+                                move_trash = Some(id);
+                                ui.close();
+                            }
+                        });
                     });
                 });
-            });
+        });
     }
 
     if !state.search.active && state.messages_has_more && ui.button("加载更多").clicked() {

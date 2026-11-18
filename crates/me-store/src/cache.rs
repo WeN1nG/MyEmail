@@ -20,7 +20,8 @@ pub const ATTACHMENT_MARKER: &str = ".myemail-attachments";
 
 /// 缓存根目录与各子目录的路径解析器。
 ///
-/// `new` 会确保 `bodies/ raw/ attach/ drafts/ logs/` 存在。
+/// `new` 会确保 `bodies/ raw/ attach/ drafts/ logs/ kb/{chunks,staging,tmp}/` 存在。
+/// `models/` **懒建**：不启用语义检索的用户不该看到一个空目录。
 #[derive(Debug, Clone)]
 pub struct CachePaths {
     root: PathBuf,
@@ -29,6 +30,9 @@ pub struct CachePaths {
     attach: PathBuf,
     drafts: PathBuf,
     logs: PathBuf,
+    kb_chunks: PathBuf,
+    kb_staging: PathBuf,
+    kb_tmp: PathBuf,
 }
 
 impl CachePaths {
@@ -38,7 +42,20 @@ impl CachePaths {
         let attach = root.join("attach");
         let drafts = root.join("drafts");
         let logs = root.join("logs");
-        for dir in [&bodies, &raw, &attach, &drafts, &logs] {
+        let kb = root.join("kb");
+        let kb_chunks = kb.join("chunks");
+        let kb_staging = kb.join("staging");
+        let kb_tmp = kb.join("tmp");
+        for dir in [
+            &bodies,
+            &raw,
+            &attach,
+            &drafts,
+            &logs,
+            &kb_chunks,
+            &kb_staging,
+            &kb_tmp,
+        ] {
             fs::create_dir_all(dir)?;
         }
         Ok(CachePaths {
@@ -48,6 +65,9 @@ impl CachePaths {
             attach,
             drafts,
             logs,
+            kb_chunks,
+            kb_staging,
+            kb_tmp,
         })
     }
 
@@ -77,6 +97,44 @@ impl CachePaths {
 
     pub fn logs_dir(&self) -> &Path {
         &self.logs
+    }
+
+    /// 向量库文件。**独立于主库**：删掉它等于删索引，主库与备份完全不动。
+    pub fn kb_db_file(&self) -> PathBuf {
+        self.root.join("kb.sqlite")
+    }
+
+    pub fn kb_chunks_dir(&self) -> &Path {
+        &self.kb_chunks
+    }
+
+    /// 语块导出物（`file` / `ai` 来源才写；邮件正文已在库里，不重复落盘）。
+    pub fn kb_chunk_file(&self, doc_id: i64) -> PathBuf {
+        self.kb_chunks.join(format!("{doc_id}.jsonl"))
+    }
+
+    pub fn kb_staging_dir(&self) -> &Path {
+        &self.kb_staging
+    }
+
+    /// 写入中间态：先写这里 + `sync_all`，再 `rename` 到最终位置（原子替换）。
+    pub fn kb_staging_file(&self, doc_id: i64) -> PathBuf {
+        self.kb_staging.join(format!("{doc_id}.jsonl.tmp"))
+    }
+
+    /// 外部转换器（soffice / Office COM）与 PDF 切页的临时目录，用完即删。
+    pub fn kb_tmp_dir(&self) -> &Path {
+        &self.kb_tmp
+    }
+
+    /// 外置嵌入模型根目录（懒建）。
+    pub fn models_dir(&self) -> PathBuf {
+        self.root.join("models")
+    }
+
+    /// 具体模型的目录（`models/bge-small-zh-v1.5/`）。
+    pub fn model_dir(&self, model_id: &str) -> PathBuf {
+        self.models_dir().join(model_id)
     }
 
     pub fn body_path(&self, id: MessageId) -> PathBuf {
@@ -141,15 +199,8 @@ fn is_safe_char(c: char) -> bool {
 }
 
 fn is_cjk(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x3400..=0x4DBF      // CJK 扩展 A
-            | 0x4E00..=0x9FFF // CJK 基本区
-            | 0xF900..=0xFAFF // CJK 兼容表意文字
-            | 0x3040..=0x30FF // 平假名 / 片假名
-            | 0xAC00..=0xD7AF // 韩文音节
-            | 0x20000..=0x2FA1F // CJK 扩展 B~F 与兼容补充
-    )
+    // 判定统一在 me_core::text：三处各写一份时，表现是「搜索结果对不上」而不是报错。
+    me_core::text::is_cjk(c)
 }
 
 // ---------------------------------------------------------------------------
