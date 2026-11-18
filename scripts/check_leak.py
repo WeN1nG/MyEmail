@@ -64,6 +64,44 @@ SECRET_PATTERNS = [
 ]
 
 
+# 数据库内容比对的最小长度（字节）。短串没有身份信息：`ww`、`test` 这类在
+# 任何二进制里都能命中，报出来只会把发布门槛变成噪音。
+MIN_DB_VALUE_BYTES = 6
+
+_SOURCE_HAYSTACK = None
+
+
+def source_haystack():
+    """所有会编译进二进制的源码/资源文本，拼成一个大 bytes（惰性、只算一次）。
+
+    用途：数据库里存的串如果在源码里本来就有（`(无主题)` 这种界面兜底文案会被
+    一起存进消息主题），那么「exe 里有它」证明不了泄露，必须排除。
+    """
+    global _SOURCE_HAYSTACK
+    if _SOURCE_HAYSTACK is not None:
+        return _SOURCE_HAYSTACK
+    chunks = []
+    for root, dirs, names in os.walk(ROOT):
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in ('target', 'dist', '.git', '.workbuddy', '.review')
+        ]
+        rel_root = os.path.relpath(root, ROOT).replace('\\', '/')
+        if not (rel_root.startswith(('crates', 'assets')) or rel_root == '.'):
+            continue
+        for name in names:
+            if not name.endswith(('.rs', '.toml', '.json', '.css', '.html')):
+                continue
+            try:
+                with open(os.path.join(root, name), 'rb') as handle:
+                    chunks.append(handle.read())
+            except OSError:
+                pass
+    _SOURCE_HAYSTACK = b'\n'.join(chunks)
+    return _SOURCE_HAYSTACK
+
+
 def latest_dist():
     base = os.path.join(ROOT, 'dist')
     if not os.path.isdir(base):
@@ -160,9 +198,25 @@ def check_exe(report, exe):
             except Exception:
                 pass
         con.close()
-        leaked = [value for value in values if value.encode('utf-8', 'ignore') in data]
+        leaked, skipped = [], 0
+        for value in values:
+            raw = value.encode('utf-8', 'ignore')
+            # 太短的串没有身份信息：`ww`、`test` 这种在二进制里到处都是，命中不说明任何事。
+            if len(raw) < MIN_DB_VALUE_BYTES:
+                skipped += 1
+                continue
+            if raw not in data:
+                continue
+            # 源码里本来就有的串必然也在 exe 里（`(无主题)` 这类界面兜底文案同时被
+            # 存进了数据库），此时「exe 里有」证明不了泄露。
+            if raw in source_haystack():
+                skipped += 1
+                continue
+            leaked.append(value)
         if leaked:
             report.fail(f'含数据库里的真实内容 {len(leaked)} 项，示例：{leaked[0][:30]}')
+        elif skipped:
+            print(f'  （跳过 {skipped} 项：源码里本就有的通用串 / 短于 {MIN_DB_VALUE_BYTES} 字节）')
 
     if report.bad == before:
         report.ok(f'无本机标识、无凭据、无绝对路径（{len(data) / 1024 / 1024:.1f} MB 已扫描）')

@@ -17,6 +17,7 @@
 """
 
 import argparse
+import fnmatch as _fnmatch
 import os
 import shutil
 import subprocess
@@ -34,6 +35,11 @@ EXCLUDE_SUFFIXES = ('.exe', '.pdb', '.dll')
 # （这是为了不遗漏新建源码），所以这类本地笔记要在这里点名排除。
 EXCLUDE_NAMES = ('优化清单.md',)
 
+# **调试探针**：会真的弹通知 / 改数据的实验脚本，不是产品源码。
+# 留在仓库里（排查时有用），但不该进发布包——用户解压后 `cargo run` 它
+# 会弹一条莫名其妙的通知。
+EXCLUDE_PATTERNS = ('crates/*/examples/notify_probe.rs',)
+
 
 def tracked_files():
     """git 跟踪 + 未忽略的新文件；NUL 分隔避免中文路径转义。"""
@@ -50,6 +56,8 @@ def tracked_files():
         if rel.startswith(EXCLUDE_PREFIXES) or rel.lower().endswith(EXCLUDE_SUFFIXES):
             continue
         if rel in EXCLUDE_NAMES:
+            continue
+        if any(_fnmatch.fnmatch(rel, pattern) for pattern in EXCLUDE_PATTERNS):
             continue
         if not os.path.exists(os.path.join(ROOT, rel)):
             continue  # 已删除但仍在索引里的条目
